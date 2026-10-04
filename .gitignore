@@ -1,5 +1,5 @@
 dist/
-/flywheel-template
+/card-auth-saga
 
 # Beads / Dolt files (added by bd init)
 .dolt/

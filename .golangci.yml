@@ -1,0 +1,17 @@
+version: "2"
+
+linters:
+  default: standard
+  settings:
+    errcheck:
+      # ponytail: Close on response bodies and Fprint to sockets/test fakes
+      # have no actionable error path. Lesson learned in the router repo.
+      exclude-functions:
+        - (io.Closer).Close
+        - fmt.Fprint
+        - fmt.Fprintf
+  exclusions:
+    rules:
+      # ponytail: unchecked writes in httptest fakes are noise, not bugs
+      - path: _test\.go
+        linters: [errcheck]
