@@ -12,7 +12,7 @@ Go project built inside the personal agentic flywheel: Intent → Build → Vali
 
 - Ponytail active: the laziest solution that works. stdlib first.
 - No new dependency without an ADR justifying it.
-- Test-first; table-driven tests (see `main_test.go` for the shape).
+- Test-first; table-driven tests (see `workflow_test.go` for the shape).
 - Deliberate shortcuts get a `// ponytail:` comment naming the ceiling and the upgrade path.
 - Pre-commit (lefthook) runs gofmt, go vet, `go test -short` — keep the whole hook under 10s.
 
