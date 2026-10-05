@@ -11,16 +11,15 @@ func TestAuthorizeWorkflow(t *testing.T) {
 		name        string
 		heldAlready int64 // existing holds on card-1 before this auth
 		req         AuthRequest
-		wantErr     bool
-		wantOK      bool
-		wantHolds   int64 // card-1 holds balance afterwards
+		want        string // approve, decline, or error
+		wantHolds   int64  // card-1 holds balance afterwards
 	}{
-		{"within limit", 0, AuthRequest{"card-1", 40_000, "shop"}, false, true, 40_000},
-		{"exactly the limit", 0, AuthRequest{"card-1", 100_000, "shop"}, false, true, 100_000},
-		{"over limit", 0, AuthRequest{"card-1", 100_001, "shop"}, false, false, 0},
-		{"over limit after earlier hold", 70_000, AuthRequest{"card-1", 40_000, "shop"}, false, false, 70_000},
-		{"unknown card", 0, AuthRequest{"card-x", 100, "shop"}, false, false, 0},
-		{"non-positive amount", 0, AuthRequest{"card-1", 0, "shop"}, true, false, 0},
+		{"within limit", 0, AuthRequest{"card-1", 40_000, "shop"}, "approve", 40_000},
+		{"exactly the limit", 0, AuthRequest{"card-1", 100_000, "shop"}, "approve", 100_000},
+		{"over limit", 0, AuthRequest{"card-1", 100_001, "shop"}, "decline", 0},
+		{"over limit after earlier hold", 70_000, AuthRequest{"card-1", 40_000, "shop"}, "decline", 70_000},
+		{"unknown card", 0, AuthRequest{"card-x", 100, "shop"}, "decline", 0},
+		{"non-positive amount", 0, AuthRequest{"card-1", 0, "shop"}, "error", 0},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -39,17 +38,16 @@ func TestAuthorizeWorkflow(t *testing.T) {
 			if !env.IsWorkflowCompleted() {
 				t.Fatal("workflow did not complete")
 			}
-			if err := env.GetWorkflowError(); (err != nil) != tt.wantErr {
-				t.Fatalf("workflow err = %v, wantErr %v", err, tt.wantErr)
-			}
-			if !tt.wantErr {
+			got := "error"
+			if env.GetWorkflowError() == nil {
 				var res AuthResult
 				if err := env.GetWorkflowResult(&res); err != nil {
 					t.Fatal(err)
 				}
-				if res.Approved != tt.wantOK {
-					t.Errorf("Approved = %v, want %v (reason %q)", res.Approved, tt.wantOK, res.Reason)
-				}
+				got = map[bool]string{true: "approve", false: "decline"}[res.Approved]
+			}
+			if got != tt.want {
+				t.Errorf("outcome = %s, want %s (err %v)", got, tt.want, env.GetWorkflowError())
 			}
 			if got := l.Balance(holdsAccount("card-1")); got != tt.wantHolds {
 				t.Errorf("holds = %d, want %d", got, tt.wantHolds)
