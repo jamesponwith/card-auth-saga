@@ -19,7 +19,6 @@ type AuthRequest struct {
 
 type AuthResult struct {
 	Approved bool
-	HoldKey  string
 	Reason   string // why it was declined
 }
 
@@ -40,11 +39,10 @@ func AuthorizeWorkflow(ctx workflow.Context, req AuthRequest) (AuthResult, error
 		return AuthResult{Reason: "insufficient open-to-buy"}, nil
 	}
 
-	var key string
-	if err := workflow.ExecuteActivity(ctx, a.PlaceHold, req).Get(ctx, &key); err != nil {
+	if err := workflow.ExecuteActivity(ctx, a.PlaceHold, req).Get(ctx, nil); err != nil {
 		return AuthResult{}, err
 	}
-	return AuthResult{Approved: true, HoldKey: key}, nil
+	return AuthResult{Approved: true}, nil
 }
 
 // Activities do the I/O the workflow can't: every ledger read and write.
@@ -66,11 +64,10 @@ func (a *Activities) CheckLimit(_ context.Context, req AuthRequest) (bool, error
 	return a.Ledger.Balance(holdsAccount(req.CardID))+req.Amount <= limit, nil
 }
 
-// PlaceHold moves the amount from open-to-buy into holds. The idempotency key
-// is the workflow ID, so a retried activity posts once.
-func (a *Activities) PlaceHold(ctx context.Context, req AuthRequest) (string, error) {
-	key := activity.GetInfo(ctx).WorkflowExecution.ID + ":hold"
-	return key, a.Ledger.Post(key,
+// PlaceHold moves the amount from open-to-buy into holds, keyed by
+// "<workflow ID>:hold" so a retried activity posts once.
+func (a *Activities) PlaceHold(ctx context.Context, req AuthRequest) error {
+	return a.Ledger.Post(activity.GetInfo(ctx).WorkflowExecution.ID+":hold",
 		Entry{holdsAccount(req.CardID), req.Amount},
 		Entry{openToBuyAccount(req.CardID), -req.Amount},
 	)

@@ -26,10 +26,8 @@ func TestAuthorizeWorkflow(t *testing.T) {
 			var s testsuite.WorkflowTestSuite
 			env := s.NewTestWorkflowEnvironment()
 			l := NewLedger()
-			if tt.heldAlready > 0 {
-				if err := l.Post("seed", Entry{holdsAccount("card-1"), tt.heldAlready}, Entry{openToBuyAccount("card-1"), -tt.heldAlready}); err != nil {
-					t.Fatal(err)
-				}
+			if err := l.Post("seed", Entry{holdsAccount("card-1"), tt.heldAlready}, Entry{openToBuyAccount("card-1"), -tt.heldAlready}); err != nil {
+				t.Fatal(err)
 			}
 			env.RegisterActivity(&Activities{Ledger: l, Limits: map[string]int64{"card-1": 100_000}})
 

@@ -8,21 +8,20 @@ import (
 func TestLedgerPost(t *testing.T) {
 	tests := []struct {
 		name    string
-		key     string
 		entries []Entry
 		wantErr error
 		wantA   int64 // balance of "a" afterwards
 	}{
-		{"balanced", "k1", []Entry{{"a", 500}, {"b", -500}}, nil, 500},
-		{"unbalanced", "k1", []Entry{{"a", 500}, {"b", -400}}, ErrUnbalanced, 0},
-		{"single leg", "k1", []Entry{{"a", 0}}, ErrUnbalanced, 0},
-		{"no legs", "k1", nil, ErrUnbalanced, 0},
-		{"three legs", "k1", []Entry{{"a", 300}, {"b", -100}, {"c", -200}}, nil, 300},
+		{"balanced", []Entry{{"a", 500}, {"b", -500}}, nil, 500},
+		{"unbalanced", []Entry{{"a", 500}, {"b", -400}}, ErrUnbalanced, 0},
+		{"single leg", []Entry{{"a", 0}}, ErrUnbalanced, 0},
+		{"no legs", nil, ErrUnbalanced, 0},
+		{"three legs", []Entry{{"a", 300}, {"b", -100}, {"c", -200}}, nil, 300},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			l := NewLedger()
-			if err := l.Post(tt.key, tt.entries...); !errors.Is(err, tt.wantErr) {
+			if err := l.Post("k", tt.entries...); !errors.Is(err, tt.wantErr) {
 				t.Fatalf("Post err = %v, want %v", err, tt.wantErr)
 			}
 			if got := l.Balance("a"); got != tt.wantA {
