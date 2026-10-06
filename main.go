@@ -19,7 +19,7 @@ func main() {
 		if err != nil {
 			log.Fatalln("open ledger:", err)
 		}
-		defer l.Close()
+		defer func() { _ = l.Close() }()
 		ledger = l
 	}
 

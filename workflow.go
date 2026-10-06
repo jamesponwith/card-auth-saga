@@ -1,6 +1,7 @@
 package main
 
 import (
+	"cmp"
 	"context"
 	"time"
 
@@ -60,13 +61,6 @@ func holdsAccount(card string) string     { return "card:" + card + ":holds" }
 func postedAccount(card string) string    { return "card:" + card + ":posted" }
 func openToBuyAccount(card string) string { return "card:" + card + ":open-to-buy" }
 
-func orDefault(d, def time.Duration) time.Duration {
-	if d == 0 {
-		return def
-	}
-	return d
-}
-
 // AuthorizeWorkflow places a hold if the card's limit allows it, then waits for
 // a capture, a reversal, or expiry. After a capture it accepts refunds until
 // the refund window closes or the capture is fully refunded.
@@ -105,7 +99,7 @@ func AuthorizeWorkflow(ctx workflow.Context, req AuthRequest) (AuthResult, error
 // awaitCapture waits for a valid capture, a reversal, or the hold to expire.
 // It returns the captured amount (0 if the hold was released) and the status.
 func awaitCapture(ctx workflow.Context, a *Activities, req AuthRequest) (int64, string, error) {
-	expiry := workflow.NewTimer(ctx, orDefault(req.HoldFor, DefaultHoldFor))
+	expiry := workflow.NewTimer(ctx, cmp.Or(req.HoldFor, DefaultHoldFor))
 	captures := workflow.GetSignalChannel(ctx, CaptureSignal)
 	reversals := workflow.GetSignalChannel(ctx, ReverseSignal)
 
@@ -140,7 +134,7 @@ func awaitCapture(ctx workflow.Context, a *Activities, req AuthRequest) (int64, 
 // acceptRefunds posts refunds until the window closes or the capture is fully
 // refunded, and returns the total refunded.
 func acceptRefunds(ctx workflow.Context, a *Activities, req AuthRequest, captured int64) (int64, error) {
-	window := workflow.NewTimer(ctx, orDefault(req.RefundWindow, DefaultRefundWindow))
+	window := workflow.NewTimer(ctx, cmp.Or(req.RefundWindow, DefaultRefundWindow))
 	refunds := workflow.GetSignalChannel(ctx, RefundSignal)
 	seen := map[string]bool{}
 	var refunded int64

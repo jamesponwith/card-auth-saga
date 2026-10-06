@@ -26,8 +26,7 @@ var schema = []string{
 		idem_key VARCHAR(191) NOT NULL,
 		account  VARCHAR(191) NOT NULL,
 		amount   BIGINT NOT NULL,
-		FOREIGN KEY (idem_key) REFERENCES postings (idem_key),
-		INDEX (account)
+		FOREIGN KEY (idem_key) REFERENCES postings (idem_key)
 	)`,
 }
 
@@ -44,14 +43,12 @@ func OpenMySQL(ctx context.Context, dsn string) (*MySQLLedger, error) {
 		return nil, err
 	}
 	if err := db.PingContext(ctx); err != nil {
-		db.Close()
-		return nil, err
+		return nil, errors.Join(err, db.Close())
 	}
 	// ponytail: CREATE IF NOT EXISTS on boot; switch to versioned migrations at the first ALTER.
 	for _, stmt := range schema {
 		if _, err := db.ExecContext(ctx, stmt); err != nil {
-			db.Close()
-			return nil, fmt.Errorf("migrate: %w", err)
+			return nil, errors.Join(fmt.Errorf("migrate: %w", err), db.Close())
 		}
 	}
 	return &MySQLLedger{db: db}, nil
@@ -85,7 +82,7 @@ func (l *MySQLLedger) PostWithin(ctx context.Context, key string, capped []strin
 	if err != nil {
 		return false, err
 	}
-	defer tx.Rollback() // no-op after Commit
+	defer func() { _ = tx.Rollback() }() // no-op after Commit
 
 	// Claim the key first. A concurrent poster of the same key blocks here
 	// until we commit, then gets a duplicate key and reports success.
@@ -106,12 +103,11 @@ func (l *MySQLLedger) PostWithin(ctx context.Context, key string, capped []strin
 		var id string
 		var b int64
 		if err := rows.Scan(&id, &b); err != nil {
-			rows.Close()
-			return false, err
+			return false, errors.Join(err, rows.Close())
 		}
 		balances[id] = b
 	}
-	rows.Close()
+	// Next returning false closed rows, freeing the connection for the writes below.
 	if err := rows.Err(); err != nil {
 		return false, err
 	}
