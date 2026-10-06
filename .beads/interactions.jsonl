@@ -2,3 +2,7 @@
 {"id":"int-56bc2eec","kind":"field_change","created_at":"2026-10-06T00:42:00.78599Z","actor":"jamesponwith","issue_id":"cas-il4","extra":{"field":"status","new_value":"closed","old_value":"open","reason":"Closed"}}
 {"id":"int-60ce18a4","kind":"field_change","created_at":"2026-10-06T01:09:25.427073Z","actor":"jamesponwith","issue_id":"cas-tqt","extra":{"field":"status","new_value":"closed","old_value":"open","reason":"Closed"}}
 {"id":"int-709b3874","kind":"field_change","created_at":"2026-10-06T01:26:18.852374Z","actor":"jamesponwith","issue_id":"cas-6jt","extra":{"field":"status","new_value":"closed","old_value":"open","reason":"Closed"}}
+{"id":"int-cae1f3c5","kind":"field_change","created_at":"2026-10-06T01:38:52.304217Z","actor":"jamesponwith","issue_id":"cas-aki","extra":{"field":"status","new_value":"closed","old_value":"open","reason":"Closed"}}
+{"id":"int-06214e43","kind":"field_change","created_at":"2026-10-06T01:39:07.058238Z","actor":"jamesponwith","issue_id":"cas-il4","extra":{"field":"status","new_value":"closed","old_value":"open","reason":"Closed"}}
+{"id":"int-8d972941","kind":"field_change","created_at":"2026-10-06T01:39:07.534294Z","actor":"jamesponwith","issue_id":"cas-tqt","extra":{"field":"status","new_value":"closed","old_value":"open","reason":"Closed"}}
+{"id":"int-c48050b0","kind":"field_change","created_at":"2026-10-06T01:39:08.03531Z","actor":"jamesponwith","issue_id":"cas-6jt","extra":{"field":"status","new_value":"closed","old_value":"open","reason":"Closed"}}
