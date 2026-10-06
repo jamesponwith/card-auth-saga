@@ -20,6 +20,9 @@ const (
 	DefaultRewardRate   = 1                   // points per $1 when the merchant has no partner rate
 )
 
+// activityTimeout bounds one activity attempt. A var so the timeout drill can shrink it.
+var activityTimeout = 10 * time.Second
+
 // Workflow outcomes.
 const (
 	StatusDeclined = "declined"
@@ -75,7 +78,7 @@ func pointsFor(cents, rate int64) int64 { return cents * rate / 100 }
 // the refund window closes or the capture is fully refunded.
 func AuthorizeWorkflow(ctx workflow.Context, req AuthRequest) (AuthResult, error) {
 	ctx = workflow.WithActivityOptions(ctx, workflow.ActivityOptions{
-		StartToCloseTimeout: 10 * time.Second,
+		StartToCloseTimeout: activityTimeout,
 		// Bounded so a ledger that keeps failing surfaces here, where the saga
 		// can compensate, instead of retrying forever.
 		RetryPolicy: &temporal.RetryPolicy{MaximumAttempts: 5},

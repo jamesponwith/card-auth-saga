@@ -53,8 +53,10 @@ Limit check: `holds + posted + amount ≤ limit`, evaluated in the same transact
 
 ## Success criteria
 
-- Ledger sums to zero after every test and every drill.
-- A workflow survives a worker kill mid-hold and completes correctly on restart.
-- Duplicate `capture` signals post exactly once.
-- Workflow replay test passes (determinism checked with the SDK replayer).
-- `go test -short ./...` stays under 10s; PR gate green.
+All met as of M5. Evidence in `workflow_test.go`, `ledger_test.go`, and `drill_test.go`:
+
+- [x] Ledger sums to zero after every test and every drill.
+- [x] A workflow survives a worker kill mid-hold and completes correctly on restart.
+- [x] Duplicate `capture` signals post exactly once (and duplicate refund IDs).
+- [x] Workflow replay test passes (determinism checked with the SDK replayer, against committed golden histories).
+- [x] `go test -short ./...` stays under 10s; PR gate green.

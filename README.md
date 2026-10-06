@@ -5,7 +5,8 @@ to a double-entry MySQL ledger with rewards accrual. Built inside the
 [agentic flywheel](https://github.com/jamesponwith/agentic-flywheel):
 Intent → Build → Validate → Release → Learn.
 
-Start with [SPEC.md](SPEC.md). Decisions live in [docs/adr/](docs/adr/).
+Start with [SPEC.md](SPEC.md) for the design and [docs/writeup.md](docs/writeup.md) for what it
+took to keep the money straight. Decisions live in [docs/adr/](docs/adr/).
 
 ## Run
 
@@ -38,3 +39,14 @@ amount) for 30 days, then returns e.g. `{"Status":"captured","Captured":25000,"R
 Points accrue at the merchant's partner rate at settlement and are clawed back on refund (SPEC.md).
 Before capture, `--name reverse` voids the hold; with no signal it expires after 7 days
 (`"HoldFor"`/`"RefundWindow"` in nanoseconds shorten either).
+
+## Failure drills
+
+```sh
+go test -run TestDrills -v .   # downloads + starts a Temporal dev server; add CAS_MYSQL_DSN for MySQL
+```
+
+Three drills against a real server: worker killed mid-hold, duplicate capture/refund signals, and
+activities that commit then time out. Each asserts exact balances, then replays the recorded history.
+`CAS_UPDATE_GOLDEN=1` re-records `testdata/history-*.json`, which `go test -short` replays on every
+commit to catch nondeterministic workflow changes.
