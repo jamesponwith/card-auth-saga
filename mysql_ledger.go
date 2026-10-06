@@ -71,15 +71,13 @@ func (l *MySQLLedger) PostWithin(ctx context.Context, key string, capped []strin
 	ids := accountIDs(capped, entries)
 	marks := strings.TrimSuffix(strings.Repeat("?,", len(ids)), ",")
 	args := make([]any, len(ids))
-	values := make([]string, len(ids))
 	for i, id := range ids {
 		args[i] = id
-		values[i] = "(?)"
 	}
 	// Create missing accounts outside the transaction: INSERT IGNORE on an
 	// existing row takes a shared lock, and upgrading it to FOR UPDATE inside
 	// the transaction would deadlock two concurrent holds on one card.
-	if _, err := l.db.ExecContext(ctx, `INSERT IGNORE INTO accounts (id) VALUES `+strings.Join(values, ","), args...); err != nil {
+	if _, err := l.db.ExecContext(ctx, `INSERT IGNORE INTO accounts (id) VALUES `+strings.TrimSuffix(strings.Repeat("(?),", len(ids)), ","), args...); err != nil {
 		return false, err
 	}
 

@@ -11,10 +11,7 @@ import (
 	"time"
 )
 
-var (
-	runID   = time.Now().UnixNano()
-	acctSeq atomic.Int64
-)
+var runID = time.Now().UnixNano()
 
 // forEachLedger runs the contract against the in-memory ledger and, when
 // CAS_MYSQL_DSN is set and -short is off, against MySQL. Each run gets a name
@@ -33,7 +30,7 @@ func forEachLedger(t *testing.T, test func(t *testing.T, l Ledger, n func(string
 			t.Fatal(err)
 		}
 		t.Cleanup(func() { l.Close() })
-		prefix := fmt.Sprintf("t%d-%d:", runID, acctSeq.Add(1))
+		prefix := fmt.Sprintf("%s-%d:", t.Name(), runID)
 		test(t, l, func(s string) string { return prefix + s })
 	})
 }
@@ -153,13 +150,12 @@ func TestLedgerPostWithinConcurrent(t *testing.T) {
 		const tries, each, limit = 20, 10, 100
 		var wg sync.WaitGroup
 		var accepted atomic.Int64
-		errs := make(chan error, tries)
 		for i := range tries {
 			wg.Go(func() {
 				ok, err := l.PostWithin(context.Background(), n(fmt.Sprintf("hold-%d", i)),
 					[]string{n("h")}, limit, Entry{n("h"), each}, Entry{n("otb"), -each})
 				if err != nil {
-					errs <- err
+					t.Error(err)
 				}
 				if ok {
 					accepted.Add(1)
@@ -167,10 +163,6 @@ func TestLedgerPostWithinConcurrent(t *testing.T) {
 			})
 		}
 		wg.Wait()
-		close(errs)
-		for err := range errs {
-			t.Error(err)
-		}
 		if got := accepted.Load(); got != limit/each {
 			t.Errorf("accepted %d holds, want %d", got, limit/each)
 		}

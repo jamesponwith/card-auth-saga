@@ -3,7 +3,7 @@ package main
 import (
 	"context"
 	"errors"
-	"sort"
+	"slices"
 	"sync"
 )
 
@@ -39,37 +39,23 @@ func balanced(entries []Entry) bool {
 // accountIDs returns the distinct accounts touched, sorted so every
 // transaction locks rows in the same order and can't deadlock another.
 func accountIDs(capped []string, entries []Entry) []string {
-	seen := map[string]bool{}
-	var ids []string
-	for _, id := range capped {
-		if !seen[id] {
-			seen[id] = true
-			ids = append(ids, id)
-		}
-	}
+	ids := slices.Clone(capped)
 	for _, e := range entries {
-		if !seen[e.Account] {
-			seen[e.Account] = true
-			ids = append(ids, e.Account)
-		}
+		ids = append(ids, e.Account)
 	}
-	sort.Strings(ids)
-	return ids
+	slices.Sort(ids)
+	return slices.Compact(ids)
 }
 
-// within reports whether the capped accounts stay at or under limit once the
-// entries are applied to the current balances.
+// within reports whether the capped accounts (distinct ids) stay at or under
+// limit once the entries are applied to the current balances.
 func within(balances map[string]int64, capped []string, limit int64, entries []Entry) bool {
-	isCapped := map[string]bool{}
 	var used int64
 	for _, id := range capped {
-		if !isCapped[id] {
-			isCapped[id] = true
-			used += balances[id]
-		}
+		used += balances[id]
 	}
 	for _, e := range entries {
-		if isCapped[e.Account] {
+		if slices.Contains(capped, e.Account) {
 			used += e.Amount
 		}
 	}
