@@ -23,6 +23,17 @@ Each card has three accounts; every posting sums to zero.
 | Release (expiry, reversal, failed capture) | −A | | +A |
 | Refund R ≤ captured − refunded | | −R | +R |
 
+Rewards are points, not cents, and balance against the brand partner that funds them:
+
+| Step | card points | partner points-issued |
+|------|------------:|----------------------:|
+| Settle C at rate r | +⌊C·r/100⌋ | −⌊C·r/100⌋ |
+| Refund R (remaining L → L−R) | −(⌊L·r/100⌋ − ⌊(L−R)·r/100⌋) | +same |
+
+The rate (points per $1, default 1) is read once at settlement and reused for every refund, and
+clawback is computed from the remaining spend rather than the refund alone, so a full refund always
+returns the card to exactly 0 points.
+
 Limit check: `holds + posted + amount ≤ limit`, evaluated in the same transaction as the hold (row locks on the card's accounts), so concurrent auths can't oversubscribe a card.
 
 ## Non-goals

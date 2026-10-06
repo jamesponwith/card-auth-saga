@@ -17,6 +17,7 @@ const (
 	RefundSignal        = "refund"
 	DefaultHoldFor      = 7 * 24 * time.Hour  // how long an uncaptured hold lives
 	DefaultRefundWindow = 30 * 24 * time.Hour // how long after capture refunds are accepted
+	DefaultRewardRate   = 1                   // points per $1 when the merchant has no partner rate
 )
 
 // Workflow outcomes.
@@ -52,6 +53,7 @@ type AuthResult struct {
 	Status   string
 	Captured int64 // cents posted to the card
 	Refunded int64 // cents refunded after capture
+	Points   int64 // rewards points the card keeps after any clawback
 }
 
 // Card accounts. A hold moves money from open-to-buy into holds; a capture
@@ -60,6 +62,13 @@ type AuthResult struct {
 func holdsAccount(card string) string     { return "card:" + card + ":holds" }
 func postedAccount(card string) string    { return "card:" + card + ":posted" }
 func openToBuyAccount(card string) string { return "card:" + card + ":open-to-buy" }
+
+// Rewards accounts, in points. The brand partner funds the points it issues.
+func pointsAccount(card string) string            { return "card:" + card + ":points" }
+func partnerPointsAccount(merchant string) string { return "partner:" + merchant + ":points-issued" }
+
+// pointsFor is the reward for an amount at a rate (points per $1), rounded down.
+func pointsFor(cents, rate int64) int64 { return cents * rate / 100 }
 
 // AuthorizeWorkflow places a hold if the card's limit allows it, then waits for
 // a capture, a reversal, or expiry. After a capture it accepts refunds until
@@ -85,11 +94,23 @@ func AuthorizeWorkflow(ctx workflow.Context, req AuthRequest) (AuthResult, error
 	if err != nil || captured == 0 {
 		return AuthResult{Status: status}, err
 	}
-	refunded, err := acceptRefunds(ctx, a, req, captured)
+
+	// Rewards never undo money movement, so their activities retry until the
+	// ledger takes them. The rate is fixed at settlement and reused for refunds.
+	rctx := workflow.WithRetryPolicy(ctx, temporal.RetryPolicy{})
+	var rate int64
+	if err := workflow.ExecuteActivity(rctx, a.RewardRate, req.Merchant).Get(ctx, &rate); err != nil {
+		return AuthResult{}, err
+	}
+	if err := workflow.ExecuteActivity(rctx, a.AdjustRewards, req, PointsChange{"rewards", rate, 0, captured}).Get(ctx, nil); err != nil {
+		return AuthResult{}, err
+	}
+
+	refunded, err := acceptRefunds(ctx, rctx, a, req, captured, rate)
 	if err != nil {
 		return AuthResult{}, err
 	}
-	res := AuthResult{Status: StatusCaptured, Captured: captured, Refunded: refunded}
+	res := AuthResult{Status: StatusCaptured, Captured: captured, Refunded: refunded, Points: pointsFor(captured-refunded, rate)}
 	if refunded == captured {
 		res.Status = StatusRefunded
 	}
@@ -131,9 +152,9 @@ func awaitCapture(ctx workflow.Context, a *Activities, req AuthRequest) (int64, 
 	}
 }
 
-// acceptRefunds posts refunds until the window closes or the capture is fully
-// refunded, and returns the total refunded.
-func acceptRefunds(ctx workflow.Context, a *Activities, req AuthRequest, captured int64) (int64, error) {
+// acceptRefunds posts refunds, clawing back their rewards, until the window
+// closes or the capture is fully refunded, and returns the total refunded.
+func acceptRefunds(ctx, rctx workflow.Context, a *Activities, req AuthRequest, captured, rate int64) (int64, error) {
 	window := workflow.NewTimer(ctx, cmp.Or(req.RefundWindow, DefaultRefundWindow))
 	refunds := workflow.GetSignalChannel(ctx, RefundSignal)
 	seen := map[string]bool{}
@@ -157,6 +178,12 @@ func acceptRefunds(ctx workflow.Context, a *Activities, req AuthRequest, capture
 		if err := workflow.ExecuteActivity(ctx, a.RefundCapture, req, r).Get(ctx, nil); err != nil {
 			return refunded, err
 		}
+		// Claw back by what the remaining spend is now worth, not by the
+		// refund's own (rounded) points, so a full refund lands on exactly 0.
+		left := captured - refunded
+		if err := workflow.ExecuteActivity(rctx, a.AdjustRewards, req, PointsChange{"rewards:refund:" + r.ID, rate, left, left - r.Amount}).Get(ctx, nil); err != nil {
+			return refunded, err
+		}
 		seen[r.ID] = true
 		refunded += r.Amount
 	}
@@ -168,6 +195,7 @@ func acceptRefunds(ctx workflow.Context, a *Activities, req AuthRequest, capture
 type Activities struct {
 	Ledger Ledger
 	Limits map[string]int64 // card ID → credit limit, cents
+	Rates  map[string]int64 // merchant → partner reward rate, points per $1
 }
 
 func stepKey(ctx context.Context, step string) string {
@@ -215,5 +243,31 @@ func (a *Activities) RefundCapture(ctx context.Context, req AuthRequest, r Refun
 	return a.Ledger.Post(ctx, stepKey(ctx, "refund:"+r.ID),
 		Entry{postedAccount(req.CardID), -r.Amount},
 		Entry{openToBuyAccount(req.CardID), r.Amount},
+	)
+}
+
+// RewardRate is the merchant's partner rate, read once per settlement so the
+// rate is recorded in workflow history and reused for every clawback.
+func (a *Activities) RewardRate(_ context.Context, merchant string) (int64, error) {
+	return cmp.Or(a.Rates[merchant], DefaultRewardRate), nil
+}
+
+// PointsChange moves a card's points from what Before cents earned to what
+// After cents earn at Rate. Step names the idempotency key.
+type PointsChange struct {
+	Step          string
+	Rate          int64
+	Before, After int64 // cents
+}
+
+// AdjustRewards posts the points difference between the partner and the card.
+func (a *Activities) AdjustRewards(ctx context.Context, req AuthRequest, c PointsChange) error {
+	points := pointsFor(c.After, c.Rate) - pointsFor(c.Before, c.Rate)
+	if points == 0 {
+		return nil
+	}
+	return a.Ledger.Post(ctx, stepKey(ctx, c.Step),
+		Entry{pointsAccount(req.CardID), points},
+		Entry{partnerPointsAccount(req.Merchant), -points},
 	)
 }

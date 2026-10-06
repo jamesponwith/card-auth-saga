@@ -31,8 +31,12 @@ func main() {
 
 	w := worker.New(c, TaskQueue, worker.Options{})
 	w.RegisterWorkflow(AuthorizeWorkflow)
-	// ponytail: hard-coded demo limits until cards get their own table.
-	w.RegisterActivity(&Activities{Ledger: ledger, Limits: map[string]int64{"card-1": 100_000}})
+	// ponytail: hard-coded demo limits and partner rates until they get their own tables.
+	w.RegisterActivity(&Activities{
+		Ledger: ledger,
+		Limits: map[string]int64{"card-1": 100_000},
+		Rates:  map[string]int64{"shell": 3, "booking": 5},
+	})
 	if err := w.Run(worker.InterruptCh()); err != nil {
 		log.Fatalln(err)
 	}

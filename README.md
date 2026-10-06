@@ -34,6 +34,7 @@ temporal workflow signal --workflow-id auth-1 --name refund --input '{"ID":"r1",
 ```
 
 After a capture the workflow accepts `refund` signals (deduplicated by `ID`, capped at the captured
-amount) for 30 days, then returns e.g. `{"Status":"captured","Captured":25000,"Refunded":5000}`.
+amount) for 30 days, then returns e.g. `{"Status":"captured","Captured":25000,"Refunded":5000,"Points":200}`.
+Points accrue at the merchant's partner rate at settlement and are clawed back on refund (SPEC.md).
 Before capture, `--name reverse` voids the hold; with no signal it expires after 7 days
 (`"HoldFor"`/`"RefundWindow"` in nanoseconds shorten either).
