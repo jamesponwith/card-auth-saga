@@ -5,6 +5,9 @@ to a double-entry MySQL ledger with rewards accrual. Built inside the
 [agentic flywheel](https://github.com/jamesponwith/agentic-flywheel):
 Intent → Build → Validate → Release → Learn.
 
+![A $400 hold, a $250 capture that survives a crash after its write without double-posting, rewards
+earned and clawed back on a $50 refund, a resent refund ignored, and the ledger balancing to zero](docs/demo.gif)
+
 Start with [SPEC.md](SPEC.md) for the design and [docs/writeup.md](docs/writeup.md) for what it
 took to keep the money straight. Decisions live in [docs/adr/](docs/adr/).
 
