@@ -1,17 +1,26 @@
-// Package main is a placeholder that keeps the pipeline green from first clone
-// and demonstrates the house test style. Replace it with your project.
+// Command card-auth-saga runs the Temporal worker for the card authorization
+// saga against a local server (`temporal server start-dev`).
 package main
 
-import "fmt"
+import (
+	"log"
 
-// Greet exists so main_test.go has something table-driven to test.
-func Greet(name string) string {
-	if name == "" {
-		name = "world"
-	}
-	return "hello, " + name
-}
+	"go.temporal.io/sdk/client"
+	"go.temporal.io/sdk/worker"
+)
 
 func main() {
-	fmt.Println(Greet(""))
+	c, err := client.Dial(client.Options{}) // localhost:7233
+	if err != nil {
+		log.Fatalln("dial temporal:", err)
+	}
+	defer c.Close()
+
+	w := worker.New(c, TaskQueue, worker.Options{})
+	w.RegisterWorkflow(AuthorizeWorkflow)
+	// ponytail: hard-coded demo limits and a process-local ledger until M3 moves both to MySQL.
+	w.RegisterActivity(&Activities{Ledger: NewLedger(), Limits: map[string]int64{"card-1": 100_000}})
+	if err := w.Run(worker.InterruptCh()); err != nil {
+		log.Fatalln(err)
+	}
 }
