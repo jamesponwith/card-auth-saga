@@ -20,9 +20,10 @@ Each card has three accounts; every posting sums to zero.
 |------|------:|-------:|------------:|
 | Hold A | +A | | −A |
 | Capture C ≤ A | −A | +C | +(A−C) |
-| Release (expiry) | −A | | +A |
+| Release (expiry, reversal, failed capture) | −A | | +A |
+| Refund R ≤ captured − refunded | | −R | +R |
 
-Limit check: `holds + posted + amount ≤ limit`.
+Limit check: `holds + posted + amount ≤ limit`, evaluated in the same transaction as the hold (row locks on the card's accounts), so concurrent auths can't oversubscribe a card.
 
 ## Non-goals
 

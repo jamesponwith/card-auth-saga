@@ -1,4 +1,4 @@
-# Validate: no green, no merge. M1 = lint + unit; component suite lands in M2.
+# Validate: no green, no merge. lint + unit (runs the ledger contract against a MySQL service too).
 # AI review runs locally in the pre-push hook (see lefthook.yml + docs/adr/0002), not here.
 name: pr
 
@@ -17,9 +17,21 @@ jobs:
 
   unit:
     runs-on: ubuntu-latest
+    services:
+      mysql:
+        image: mysql:8.4
+        env:
+          MYSQL_ROOT_PASSWORD: cas
+          MYSQL_DATABASE: cas
+        ports: ["3306:3306"]
+        options: >-
+          --health-cmd "mysqladmin ping -h127.0.0.1 -uroot -pcas"
+          --health-interval 5s --health-timeout 5s --health-retries 20
+    env:
+      CAS_MYSQL_DSN: root:cas@tcp(127.0.0.1:3306)/cas
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
-      - run: go test ./...
+      - run: go test -race ./...
