@@ -72,7 +72,7 @@ func TestDrills(t *testing.T) {
 		old := activityTimeout
 		activityTimeout = time.Second
 		t.Cleanup(func() { activityTimeout = old })
-		slow := &slowFirstLedger{delay: 2 * time.Second} // applies the write, then misses the deadline
+		slow := &slowFirstLedger{delay: 2 * time.Second, seen: map[string]bool{}} // applies the write, then misses the deadline
 		d := newDrill(t, c, "timeout", slow)
 		d.startWorker()
 		run := d.start(AuthRequest{Amount: 40_000, RefundWindow: time.Second})
@@ -249,14 +249,9 @@ func (s *slowFirstLedger) first(key string) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.calls++
-	if s.seen == nil {
-		s.seen = map[string]bool{}
-	}
-	if s.seen[key] {
-		return false
-	}
+	was := s.seen[key]
 	s.seen[key] = true
-	return true
+	return !was
 }
 
 func (s *slowFirstLedger) Post(ctx context.Context, key string, entries ...Entry) error {
