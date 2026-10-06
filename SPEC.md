@@ -12,6 +12,18 @@
 4. **Rewards accrual** — points accrue on settlement per a partner rule table, and are clawed back on refund.
 5. **Failure drills** — kill the worker mid-hold, duplicate signals, activity timeouts; the ledger must stay balanced and the workflow must finish.
 
+## Ledger accounts
+
+Each card has three accounts; every posting sums to zero.
+
+| Step | holds | posted | open-to-buy |
+|------|------:|-------:|------------:|
+| Hold A | +A | | −A |
+| Capture C ≤ A | −A | +C | +(A−C) |
+| Release (expiry) | −A | | +A |
+
+Limit check: `holds + posted + amount ≤ limit`.
+
 ## Non-goals
 
 - Real card networks (ISO 8583), PCI scope, or real money.
