@@ -1,0 +1,22 @@
+{
+  "change_failure_rate": {
+    "incidents": 0,
+    "rate": 0,
+    "releases": 0
+  },
+  "deploy_frequency": {
+    "per_week": 0,
+    "releases_last_30d": 0,
+    "releases_total": 0
+  },
+  "generated_at": "2026-10-12T13:35:52Z",
+  "lead_time_hours": {
+    "median": 0,
+    "samples": 0
+  },
+  "mttr_hours": {
+    "median": 0,
+    "samples": 0
+  },
+  "repo": "jamesponwith/card-auth-saga"
+}
