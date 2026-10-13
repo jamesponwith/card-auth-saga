@@ -55,5 +55,5 @@
 # - github.token    → use GITHUB_TOKEN env var instead
 
 export.git-add: false
-
-sync.remote: "git+https://github.com/jamesponwith/card-auth-saga.git"
+sync:
+    remote: "git+https://github.com/jamesponwith/card-auth-saga.git"
