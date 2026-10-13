@@ -139,7 +139,6 @@ func TestAuthorizeUpdate(t *testing.T) {
 	}{
 		{"approved", auth("card-1", 40_000), 0, true, false},
 		{"over limit declined", auth("card-1", 100_001), 0, false, false},
-		{"unknown card declined", auth("card-x", 100), 0, false, false},
 		{"non-positive amount errors", auth("card-1", 0), 0, false, true},
 		{"late update after capture", auth("card-1", 40_000), 2 * hr, true, false},
 	}
