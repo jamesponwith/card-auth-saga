@@ -36,6 +36,18 @@ returns the card to exactly 0 points.
 
 Limit check: `holds + posted + amount ≤ limit`, evaluated in the same transaction as the hold (row locks on the card's accounts), so concurrent auths can't oversubscribe a card.
 
+## Synchronous decision (M6)
+
+A network needs approve/decline in ~100ms, but the workflow's result arrives days later. The caller
+sends an `authorize` Update with **Update-with-Start** (conflict policy `USE_EXISTING`, workflow ID =
+auth ID). The update returns `true`/`false` as soon as the hold is placed or declined; the workflow
+carries on with the hold.
+
+- A retried request with the same auth ID attaches to the running workflow and gets the same answer.
+  No second hold is placed.
+- If `PlaceHold` fails (bad amount), the update returns that error rather than hanging.
+- The update has no arguments and no side effects, so old histories without it still replay.
+
 ## Non-goals
 
 - Real card networks (ISO 8583), PCI scope, or real money.
@@ -50,6 +62,7 @@ Limit check: `holds + posted + amount ≤ limit`, evaluated in the same transact
 - **M3**: MySQL ledger (transactions + unique idempotency keys); reversals and refunds as compensations.
 - **M4**: Rewards accrual and refund clawback.
 - **M5**: Failure drills + writeup (README demo, blog post) → resume Open Source line.
+- **M6**: Synchronous approve/decline via Update-with-Start.
 
 ## Success criteria
 

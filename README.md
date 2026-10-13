@@ -31,11 +31,16 @@ Drive a hold by hand (worker in one terminal, CLI in another):
 
 ```sh
 go run .                       # worker on task queue card-auth
-temporal workflow start --task-queue card-auth --type AuthorizeWorkflow \
+temporal workflow execute-update-with-start --update-name authorize \
+  --task-queue card-auth --type AuthorizeWorkflow --id-conflict-policy UseExisting \
   --workflow-id auth-1 --input '{"CardID":"card-1","Amount":40000,"Merchant":"shop"}'
 temporal workflow signal --workflow-id auth-1 --name capture --input '{"Amount":25000}'
 temporal workflow signal --workflow-id auth-1 --name refund --input '{"ID":"r1","Amount":5000}'
 ```
+
+The first command answers `true` (approved) or `false` (declined) as soon as the hold is decided, and the
+workflow keeps running. Running it again on the same `--workflow-id`, as a network retry would, returns
+the same answer without placing a second hold (SPEC.md, M6).
 
 After a capture the workflow accepts `refund` signals (deduplicated by `ID`, capped at the captured
 amount) for 30 days, then returns e.g. `{"Status":"captured","Captured":25000,"Refunded":5000,"Points":200}`.
@@ -49,7 +54,7 @@ Before capture, `--name reverse` voids the hold; with no signal it expires after
 go test -run TestDrills -v .   # downloads + starts a Temporal dev server; add CAS_MYSQL_DSN for MySQL
 ```
 
-Three drills against a real server: worker killed mid-hold, duplicate capture/refund signals, and
-activities that commit then time out. Each asserts exact balances, then replays the recorded history.
+Five drills against a real server: worker killed mid-hold, duplicate capture/refund signals,
+activities that commit then time out, and Update-with-Start approved (sent twice) and declined. Each asserts exact balances, then replays the recorded history.
 `CAS_UPDATE_GOLDEN=1` re-records `testdata/history-*.json`, which `go test -short` replays on every
 commit to catch nondeterministic workflow changes.
