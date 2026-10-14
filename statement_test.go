@@ -2,8 +2,6 @@ package main
 
 import (
 	"errors"
-	"fmt"
-	"maps"
 	"testing"
 	"time"
 
@@ -52,28 +50,11 @@ func TestStatementCycle(t *testing.T) {
 				t.Fatal(err)
 			}
 			env.RegisterActivity(&Activities{Ledger: l})
-			got := make([]string, len(tt.steps))
-			for i, st := range tt.steps {
-				env.RegisterDelayedCallback(func() {
-					env.UpdateWorkflow(st.name, fmt.Sprint(i), &testsuite.TestUpdateCallback{
-						OnReject: func(error) { got[i] = "rejected" },
-						OnComplete: func(_ any, err error) {
-							got[i] = "ok"
-							if err != nil {
-								got[i] = "error"
-							}
-						},
-					}, st.payload)
-				}, st.at)
-			}
+			got := sendSteps(env, tt.steps)
 
 			env.ExecuteWorkflow(StatementWorkflow, StatementTerms{CardID: "card-1"}, tt.last)
 
-			for i, st := range tt.steps {
-				if got[i] != st.want {
-					t.Errorf("step %d: %q, want %q", i, got[i], st.want)
-				}
-			}
+			checkSteps(t, tt.steps, got)
 			terms, next := continuedAs(t, env)
 			if terms.CardID != "card-1" {
 				t.Errorf("terms not carried: %+v", terms)
@@ -101,28 +82,15 @@ func TestStatementCloseWithPaymentsInFlight(t *testing.T) {
 	env.RegisterActivity(a)
 	// Payments and interest each take two days to post.
 	env.OnActivity(a.PostToCard, mock.Anything, mock.Anything, mock.Anything, mock.Anything).After(2 * day).Return(a.PostToCard)
-	outcome := map[string]string{}
-	send := func(at time.Duration, id string) {
-		env.RegisterDelayedCallback(func() {
-			env.UpdateWorkflow(PayUpdate, id, &testsuite.TestUpdateCallback{
-				OnReject: func(error) { outcome[id] = "rejected" },
-				OnComplete: func(_ any, err error) {
-					outcome[id] = "ok"
-					if err != nil {
-						outcome[id] = "error"
-					}
-				},
-			}, Payment{ID: id, Amount: 1_000})
-		}, at)
+	steps := []step{
+		upd(pay(29*day, "in-flight", 1_000), "ok"),       // still posting at the day-30 close
+		upd(pay(31*day, "mid-close", 1_000), "rejected"), // arrives while interest posts
 	}
-	send(29*day, "in-flight") // still posting at the day-30 close
-	send(31*day, "mid-close") // arrives while interest posts
+	got := sendSteps(env, steps)
 
 	env.ExecuteWorkflow(StatementWorkflow, StatementTerms{CardID: "card-1"}, Statement{N: 1, Balance: 50_000, MinDue: 2_500})
 
-	if want := map[string]string{"in-flight": "ok", "mid-close": "rejected"}; !maps.Equal(outcome, want) {
-		t.Errorf("payments = %v, want %v", outcome, want)
-	}
+	checkSteps(t, steps, got)
 	_, next := continuedAs(t, env)
 	if next.Interest != 1_020 { // on 49,000: the in-flight payment counts
 		t.Errorf("interest = %d, want 1020", next.Interest)
