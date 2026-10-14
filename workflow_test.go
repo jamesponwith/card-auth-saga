@@ -2,7 +2,9 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -10,6 +12,9 @@ import (
 	"go.temporal.io/sdk/temporal"
 	"go.temporal.io/sdk/testsuite"
 )
+
+// card1 is the config most tests run with: card-1 has a $1,000 limit.
+func card1() StaticConfig { return StaticConfig{Limits: map[string]int64{"card-1": 100_000}} }
 
 func auth(card string, amount int64) AuthRequest {
 	return AuthRequest{CardID: card, Amount: amount, Merchant: "shop"}
@@ -94,7 +99,7 @@ func TestAuthorizeWorkflow(t *testing.T) {
 			); err != nil {
 				t.Fatal(err)
 			}
-			env.RegisterActivity(&Activities{Ledger: l, Limits: map[string]int64{"card-1": 100_000}})
+			env.RegisterActivity(&Activities{Ledger: l, Config: card1()})
 			for _, sig := range tt.signals {
 				env.RegisterDelayedCallback(func() { env.SignalWorkflow(sig.name, sig.payload) }, sig.at)
 			}
@@ -157,7 +162,7 @@ func TestAuthorizeUpdate(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			var s testsuite.WorkflowTestSuite
 			env := s.NewTestWorkflowEnvironment()
-			env.RegisterActivity(&Activities{Ledger: NewMemLedger(), Limits: map[string]int64{"card-1": 100_000}})
+			env.RegisterActivity(&Activities{Ledger: NewMemLedger(), Config: card1()})
 			env.RegisterDelayedCallback(func() { env.SignalWorkflow(CaptureSignal, Capture{Amount: 40_000}) }, hr)
 			var calls int
 			var got any
@@ -282,7 +287,7 @@ func TestMoneyUpdates(t *testing.T) {
 			var s testsuite.WorkflowTestSuite
 			env := s.NewTestWorkflowEnvironment()
 			l := NewMemLedger()
-			env.RegisterActivity(&Activities{Ledger: l, Limits: map[string]int64{"card-1": 100_000}})
+			env.RegisterActivity(&Activities{Ledger: l, Config: card1()})
 			got := sendSteps(env, tt.steps)
 
 			env.ExecuteWorkflow(AuthorizeWorkflow, auth("card-1", 40_000))
@@ -337,7 +342,7 @@ func TestVelocityCheck(t *testing.T) {
 			}
 			var s testsuite.WorkflowTestSuite
 			env := s.NewTestWorkflowEnvironment()
-			env.RegisterActivity(&Activities{Ledger: l, Limits: map[string]int64{"card-1": 100_000}})
+			env.RegisterActivity(&Activities{Ledger: l, Config: card1()})
 
 			env.ExecuteWorkflow(AuthorizeWorkflow, auth("card-1", 100))
 
@@ -352,13 +357,105 @@ func TestVelocityCheck(t *testing.T) {
 	}
 }
 
+// Rewards come from the partner's configured rate; a merchant without one
+// earns the default, and a configured 0 means no points.
+func TestRewardRateFromConfig(t *testing.T) {
+	tests := []struct {
+		name  string
+		rates map[string]int64
+		want  int64 // points for a $400 capture at "shop"
+	}{
+		{"no partner row earns the default", nil, 400},
+		{"partner rate", map[string]int64{"shop": 3}, 1_200},
+		{"a rate of zero earns nothing", map[string]int64{"shop": 0}, 0},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var s testsuite.WorkflowTestSuite
+			env := s.NewTestWorkflowEnvironment()
+			env.RegisterActivity(&Activities{Ledger: NewMemLedger(), Config: StaticConfig{Limits: card1().Limits, Rates: tt.rates}})
+			env.RegisterDelayedCallback(func() { env.SignalWorkflow(CaptureSignal, Capture{Amount: 40_000}) }, hr)
+
+			env.ExecuteWorkflow(AuthorizeWorkflow, auth("card-1", 40_000))
+
+			var res AuthResult
+			if err := env.GetWorkflowResult(&res); err != nil {
+				t.Fatal(err)
+			}
+			if res.Points != tt.want {
+				t.Errorf("points = %d, want %d", res.Points, tt.want)
+			}
+		})
+	}
+}
+
+// brokenConfig is a config store that's down.
+type brokenConfig struct{}
+
+func (brokenConfig) CreditLimit(context.Context, string) (int64, bool, error) {
+	return 0, false, errors.New("config store down")
+}
+func (brokenConfig) RewardRate(context.Context, string) (int64, bool, error) {
+	return 0, false, errors.New("config store down")
+}
+
+// A config store outage must fail the auth, not decline the card as unknown.
+func TestConfigOutageIsNotADecline(t *testing.T) {
+	var s testsuite.WorkflowTestSuite
+	env := s.NewTestWorkflowEnvironment()
+	env.RegisterActivity(&Activities{Ledger: NewMemLedger(), Config: brokenConfig{}})
+
+	env.ExecuteWorkflow(AuthorizeWorkflow, auth("card-1", 100))
+
+	if err := env.GetWorkflowError(); err == nil || !strings.Contains(err.Error(), "config store down") {
+		var res AuthResult
+		_ = env.GetWorkflowResult(&res)
+		t.Errorf("workflow = %+v, %v; want the config error", res, err)
+	}
+}
+
+// flakyRates fails its first reward-rate reads, then answers 3 points per $1.
+type flakyRates struct {
+	StaticConfig
+	fails *int
+}
+
+func (c flakyRates) RewardRate(ctx context.Context, merchant string) (int64, bool, error) {
+	if *c.fails > 0 {
+		*c.fails--
+		return 0, false, errors.New("config store down")
+	}
+	return 3, true, nil
+}
+
+// A rate read that fails must be retried, not replaced by the default: the
+// rate is fixed at settlement, so a wrong one would stick for every refund.
+func TestRewardRateOutageRetries(t *testing.T) {
+	var s testsuite.WorkflowTestSuite
+	env := s.NewTestWorkflowEnvironment()
+	fails := 2
+	env.RegisterActivity(&Activities{Ledger: NewMemLedger(), Config: flakyRates{card1(), &fails}})
+	env.RegisterDelayedCallback(func() { env.SignalWorkflow(CaptureSignal, Capture{Amount: 40_000}) }, hr)
+
+	env.ExecuteWorkflow(AuthorizeWorkflow, auth("card-1", 40_000))
+
+	var res AuthResult
+	if err := env.GetWorkflowResult(&res); err != nil {
+		t.Fatal(err)
+	}
+	if res.Points != 1_200 {
+		t.Errorf("points = %d, want 1200 (3x on $400, after the store recovers)", res.Points)
+	}
+}
+
 // A partner rate change after settlement must not change what a refund claws
 // back, or a full refund would leave the card with negative points.
 func TestRewardRateFixedAtSettlement(t *testing.T) {
 	var s testsuite.WorkflowTestSuite
 	env := s.NewTestWorkflowEnvironment()
 	l := NewMemLedger()
-	a := &Activities{Ledger: l, Limits: map[string]int64{"card-1": 100_000}, Rates: map[string]int64{"shell": 3}}
+	rates := map[string]int64{"shell": 3}
+	a := &Activities{Ledger: l, Config: StaticConfig{Limits: card1().Limits, Rates: rates}}
 	env.RegisterActivity(a)
 	req := AuthRequest{CardID: "card-1", Amount: 10_000, Merchant: "shell"}
 	env.RegisterDelayedCallback(func() { env.SignalWorkflow(CaptureSignal, Capture{Amount: 10_000}) }, hr)
@@ -366,7 +463,7 @@ func TestRewardRateFixedAtSettlement(t *testing.T) {
 		if got := balance(t, l, pointsAccount("card-1")); got != 300 {
 			t.Errorf("points after capture = %d, want 300 (3x on $100)", got)
 		}
-		a.Rates["shell"] = 10
+		rates["shell"] = 10
 	}, 90*time.Minute)
 	env.RegisterDelayedCallback(func() { env.SignalWorkflow(RefundSignal, Refund{ID: "r1", Amount: 10_000}) }, 2*hr)
 
@@ -388,7 +485,7 @@ func TestFailedCaptureReleasesHold(t *testing.T) {
 	var s testsuite.WorkflowTestSuite
 	env := s.NewTestWorkflowEnvironment()
 	l := NewMemLedger()
-	a := &Activities{Ledger: l, Limits: map[string]int64{"card-1": 100_000}}
+	a := &Activities{Ledger: l, Config: card1()}
 	env.RegisterActivity(a)
 	env.OnActivity(a.Settle, mock.Anything, mock.Anything, mock.Anything).
 		Return(func(ctx context.Context, req AuthRequest, st Settlement) error {
@@ -455,7 +552,7 @@ func TestActivityRetryPostsOnce(t *testing.T) {
 			var s testsuite.WorkflowTestSuite
 			env := s.NewTestActivityEnvironment()
 			l := NewMemLedger()
-			a := &Activities{Ledger: l, Limits: map[string]int64{"card-1": 100_000}}
+			a := &Activities{Ledger: l, Config: card1()}
 			env.RegisterActivity(a)
 			for range 2 {
 				if err := tt.run(env, a); err != nil {

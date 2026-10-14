@@ -23,9 +23,21 @@ MySQL ledger (ADR 0004) — integration tests and a durable worker:
 
 ```sh
 docker run -d --name cas-mysql -e MYSQL_ROOT_PASSWORD=cas -e MYSQL_DATABASE=cas -p 3307:3306 mysql:8.4
+#   no Docker? brew install mysql@8.4, then run mysqld from any datadir on port 3307
 export CAS_MYSQL_DSN='root:cas@tcp(127.0.0.1:3307)/cas'
-go test ./...                  # adds the ledger contract against MySQL (incl. the concurrent-hold race)
+go test ./...                  # adds the ledger contract, migrations and config against MySQL
 ```
+
+With MySQL, card limits and partner reward rates live in the `cards` and `partners` tables (SPEC.md,
+M11). The schema migrates itself on boot (ADR 0005). Before the first auth, set them up:
+
+```sh
+go run . set-limit card-1 100000   # $1,000.00
+go run . set-rate shell 3          # 3 points per $1 at shell
+```
+
+Without MySQL, the worker uses a fixed demo config: `card-1` has a $1,000 limit, `shell` earns 3
+points per $1 and `booking` earns 5.
 
 Drive a hold by hand (worker in one terminal, CLI in another):
 

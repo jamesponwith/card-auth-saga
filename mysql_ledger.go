@@ -4,7 +4,6 @@ import (
 	"context"
 	"database/sql"
 	"errors"
-	"fmt"
 	"strings"
 	"time"
 
@@ -13,38 +12,14 @@ import (
 
 const mysqlDupKey = 1062
 
-var schema = []string{
-	`CREATE TABLE IF NOT EXISTS accounts (
-		id      VARCHAR(191) PRIMARY KEY,
-		balance BIGINT NOT NULL DEFAULT 0
-	)`,
-	`CREATE TABLE IF NOT EXISTS postings (
-		idem_key   VARCHAR(191) PRIMARY KEY,
-		created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
-	)`,
-	`CREATE TABLE IF NOT EXISTS entries (
-		id       BIGINT AUTO_INCREMENT PRIMARY KEY,
-		idem_key VARCHAR(191) NOT NULL,
-		account  VARCHAR(191) NOT NULL,
-		amount   BIGINT NOT NULL,
-		FOREIGN KEY (idem_key) REFERENCES postings (idem_key)
-	)`,
-	`CREATE TABLE IF NOT EXISTS attempts (
-		card    VARCHAR(191) NOT NULL,
-		auth_id VARCHAR(191) NOT NULL,
-		at_us   BIGINT NOT NULL, -- unix microseconds; no DATETIME/timezone parsing
-		PRIMARY KEY (card, auth_id),
-		INDEX (card, at_us)
-	)`,
-}
-
 // MySQLLedger keeps balances in `accounts` and the append-only history in
-// `postings` + `entries`. Each posting is one transaction (ADR 0004).
+// `postings` + `entries`. Each posting is one transaction (ADR 0004). It also
+// serves Config from `cards` and `partners`.
 type MySQLLedger struct {
 	db *sql.DB
 }
 
-// OpenMySQL connects and creates the schema if it's missing.
+// OpenMySQL connects and brings the schema up to date (ADR 0005).
 func OpenMySQL(ctx context.Context, dsn string) (*MySQLLedger, error) {
 	db, err := sql.Open("mysql", dsn)
 	if err != nil {
@@ -53,11 +28,8 @@ func OpenMySQL(ctx context.Context, dsn string) (*MySQLLedger, error) {
 	if err := db.PingContext(ctx); err != nil {
 		return nil, errors.Join(err, db.Close())
 	}
-	// ponytail: CREATE IF NOT EXISTS on boot; switch to versioned migrations at the first ALTER.
-	for _, stmt := range schema {
-		if _, err := db.ExecContext(ctx, stmt); err != nil {
-			return nil, errors.Join(fmt.Errorf("migrate: %w", err), db.Close())
-		}
+	if err := migrate(ctx, db); err != nil {
+		return nil, errors.Join(err, db.Close())
 	}
 	return &MySQLLedger{db: db}, nil
 }
@@ -152,4 +124,37 @@ func (l *MySQLLedger) Balance(ctx context.Context, account string) (int64, error
 		return 0, nil
 	}
 	return b, err
+}
+
+func (l *MySQLLedger) CreditLimit(ctx context.Context, card string) (int64, bool, error) {
+	return l.lookup(ctx, `SELECT credit_limit FROM cards WHERE id = ?`, card)
+}
+
+func (l *MySQLLedger) RewardRate(ctx context.Context, merchant string) (int64, bool, error) {
+	return l.lookup(ctx, `SELECT points_per_dollar FROM partners WHERE merchant = ?`, merchant)
+}
+
+func (l *MySQLLedger) lookup(ctx context.Context, query, key string) (int64, bool, error) {
+	var v int64
+	err := l.db.QueryRowContext(ctx, query, key).Scan(&v)
+	if errors.Is(err, sql.ErrNoRows) {
+		return 0, false, nil
+	}
+	return v, err == nil, err
+}
+
+// SetCreditLimit creates or updates a card. A negative limit fails the
+// table's CHECK constraint.
+func (l *MySQLLedger) SetCreditLimit(ctx context.Context, card string, limit int64) error {
+	_, err := l.db.ExecContext(ctx, `INSERT INTO cards (id, credit_limit) VALUES (?, ?) AS new
+		ON DUPLICATE KEY UPDATE credit_limit = new.credit_limit`, card, limit)
+	return err
+}
+
+// SetRewardRate creates or updates a partner's rate. A negative rate fails
+// the table's CHECK constraint.
+func (l *MySQLLedger) SetRewardRate(ctx context.Context, merchant string, rate int64) error {
+	_, err := l.db.ExecContext(ctx, `INSERT INTO partners (merchant, points_per_dollar) VALUES (?, ?) AS new
+		ON DUPLICATE KEY UPDATE points_per_dollar = new.points_per_dollar`, merchant, rate)
+	return err
 }

@@ -414,8 +414,7 @@ func (s *authState) refund(ctx workflow.Context, r Refund) error {
 // Each posting is keyed by "<workflow ID>:<step>", so a retried activity posts once.
 type Activities struct {
 	Ledger Ledger
-	Limits map[string]int64 // card ID → credit limit, cents
-	Rates  map[string]int64 // merchant → partner reward rate, points per $1
+	Config Config // credit limits and partner reward rates
 }
 
 func stepKey(ctx context.Context, step string) string {
@@ -429,7 +428,11 @@ func (a *Activities) PlaceHold(ctx context.Context, req AuthRequest) (bool, erro
 	if req.Amount <= 0 {
 		return false, temporal.NewNonRetryableApplicationError("amount must be positive", "InvalidAmount", nil)
 	}
-	if _, known := a.Limits[req.CardID]; !known {
+	limit, known, err := a.Config.CreditLimit(ctx, req.CardID)
+	if err != nil {
+		return false, err
+	}
+	if !known {
 		return false, temporal.NewNonRetryableApplicationError("unknown card", DeclineUnknownCard, nil)
 	}
 	// Velocity first: card testing makes many small auths, each under the limit.
@@ -440,18 +443,25 @@ func (a *Activities) PlaceHold(ctx context.Context, req AuthRequest) (bool, erro
 	if n > VelocityMax {
 		return false, temporal.NewNonRetryableApplicationError(fmt.Sprintf("%d auths in %v", n, VelocityWindow), DeclineVelocity, nil)
 	}
-	return a.hold(ctx, "hold", req.CardID, req.Amount)
+	return a.hold(ctx, "hold", req.CardID, req.Amount, limit)
 }
 
 // IncreaseHold raises an open hold under the same atomic limit check.
+// The limit is read now, so a raise or cut since the auth applies to it.
 func (a *Activities) IncreaseHold(ctx context.Context, req AuthRequest, i Increment) (bool, error) {
-	return a.hold(ctx, "hold:"+i.ID, req.CardID, i.Amount)
+	limit, _, err := a.Config.CreditLimit(ctx, req.CardID) // a card removed since has limit 0: declined
+	if err != nil {
+		return false, err
+	}
+	return a.hold(ctx, "hold:"+i.ID, req.CardID, i.Amount, limit)
 }
 
-func (a *Activities) hold(ctx context.Context, step, card string, amount int64) (bool, error) {
-	// An unknown card has limit 0, so PostWithin declines it.
+// hold posts amount into the card's holds if holds + posted stay within limit.
+// The limit is read just before; balances are checked under the ledger's row
+// locks, so a limit change racing an auth applies one value or the other.
+func (a *Activities) hold(ctx context.Context, step, card string, amount, limit int64) (bool, error) {
 	return a.Ledger.PostWithin(ctx, stepKey(ctx, step),
-		[]string{holdsAccount(card), postedAccount(card)}, a.Limits[card],
+		[]string{holdsAccount(card), postedAccount(card)}, limit,
 		Entry{holdsAccount(card), amount},
 		Entry{openToBuyAccount(card), -amount},
 	)
@@ -501,8 +511,12 @@ func (a *Activities) RefundCapture(ctx context.Context, req AuthRequest, r Refun
 
 // RewardRate is the merchant's partner rate, read once per settlement so the
 // rate is recorded in workflow history and reused for every clawback.
-func (a *Activities) RewardRate(_ context.Context, merchant string) (int64, error) {
-	return cmp.Or(a.Rates[merchant], DefaultRewardRate), nil
+func (a *Activities) RewardRate(ctx context.Context, merchant string) (int64, error) {
+	rate, ok, err := a.Config.RewardRate(ctx, merchant)
+	if !ok && err == nil { // a failed read retries rather than settling on the default
+		rate = DefaultRewardRate
+	}
+	return rate, err
 }
 
 // PointsChange moves a card's points from what Before cents earned to what
