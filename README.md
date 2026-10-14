@@ -61,15 +61,30 @@ Points accrue on the captured total at the merchant's partner rate at settlement
 Before capture, `--name reverse` voids the hold; with no signal it expires after 7 days
 (`"HoldFor"`/`"RefundWindow"` in nanoseconds shorten either).
 
+Run a card's monthly statement (SPEC.md, M9). `Cycle`/`Grace` are in nanoseconds; leave them out for
+30 and 25 days:
+
+```sh
+temporal workflow start --task-queue card-auth --type StatementWorkflow --workflow-id statement:card-1 \
+  --input '{"CardID":"card-1","Cycle":60000000000,"Grace":20000000000}' --input '{}'
+temporal workflow update execute --workflow-id statement:card-1 --name pay --input '{"ID":"p1","Amount":2500}'
+temporal workflow query --workflow-id statement:card-1 --name statement
+```
+
+Each cycle closes a statement (balance, minimum due), charges a $25 late fee if the minimum isn't
+paid by the due date, and charges interest at the next close on whatever is still unpaid. The
+workflow then continues as new, so its history covers one cycle. `temporal workflow show` lists
+each run.
+
 ## Failure drills
 
 ```sh
 go test -run TestDrills -v .   # downloads + starts a Temporal dev server; add CAS_MYSQL_DSN for MySQL
 ```
 
-Seven drills against a real server: worker killed mid-hold, duplicate capture/refund signals,
+Eight drills against a real server: worker killed mid-hold, duplicate capture/refund signals,
 activities that commit then time out, Update-with-Start approved (sent twice) and declined,
-updates that land mid-step (a refund during settlement, the window closing mid-refund), and
-increments with a split capture. Each asserts exact balances, then replays the recorded history.
+updates that land mid-step (a refund during settlement, the window closing mid-refund),
+increments with a split capture, and two statement cycles across ContinueAsNew. Each asserts exact balances, then replays the recorded history.
 `CAS_UPDATE_GOLDEN=1` re-records `testdata/history-*.json`, which `go test -short` replays on every
 commit to catch nondeterministic workflow changes.

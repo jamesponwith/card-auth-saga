@@ -82,6 +82,27 @@ after the first auth.
 - Workflows started before M8 keep single-capture behaviour. `workflow.GetVersion` tags new runs, and
   old runs reject partial captures and increments, so their histories still replay.
 
+## Statement cycle (M9)
+
+One `StatementWorkflow` per card (workflow ID `statement:<card>`) closes a statement every cycle
+(30 days by default):
+
+| Step | posted | open-to-buy |
+|------|-------:|------------:|
+| Payment P | −P | +P |
+| Late fee F, or interest I | +F / +I | −F / −I |
+
+- **Close:** the statement balance is the card's posted balance. The minimum due is the larger of
+  $25 and 2% of the balance, but never more than the balance. Payment is due 25 days after close.
+- **Late fee ($25):** charged at the due date if payments since close are below the minimum.
+- **Interest:** charged at the next close on the part of the statement still unpaid, at APR/12
+  (default 24.99%). A statement paid in full by its next close accrues no interest, which is the
+  grace period.
+- **Payments:** a `pay` update (`{ID, Amount}`). Each ID posts once in the ledger. While the statement
+  is closing, `pay` is rejected so the caller retries against the next cycle.
+- A `statement` query returns the current statement.
+- After each close, **ContinueAsNew** carries only the new statement forward, so history stays bounded.
+
 ## Non-goals
 
 - Real card networks (ISO 8583), PCI scope, or real money.
@@ -99,6 +120,7 @@ after the first auth.
 - **M6**: Synchronous approve/decline via Update-with-Start.
 - **M7**: Capture, reverse and refund as validated updates.
 - **M8**: Incremental auth and multiple captures.
+- **M9**: Monthly statement cycle (ContinueAsNew, query, late fee, interest).
 
 ## Success criteria
 

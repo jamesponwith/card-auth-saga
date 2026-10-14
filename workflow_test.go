@@ -196,6 +196,47 @@ type step struct {
 func upd(s signal, want string) step { return step{s, want} }
 func sig(s signal) step              { return step{s, ""} }
 
+// sendSteps schedules each step and returns the update outcomes, which fill in
+// as the workflow runs.
+func sendSteps(env *testsuite.TestWorkflowEnvironment, steps []step) []string {
+	got := make([]string, len(steps))
+	for i, st := range steps {
+		env.RegisterDelayedCallback(func() {
+			if st.want == "" {
+				env.SignalWorkflow(st.name, st.payload)
+				return
+			}
+			var args []any
+			if st.payload != nil {
+				args = append(args, st.payload)
+			}
+			env.UpdateWorkflow(st.name, fmt.Sprint(i), &testsuite.TestUpdateCallback{
+				OnReject: func(error) { got[i] = "rejected" },
+				OnComplete: func(r any, err error) {
+					switch {
+					case err != nil:
+						got[i] = "error"
+					case r == false:
+						got[i] = "declined"
+					default:
+						got[i] = "ok"
+					}
+				},
+			}, args...)
+		}, st.at)
+	}
+	return got
+}
+
+func checkSteps(t *testing.T, steps []step, got []string) {
+	t.Helper()
+	for i, st := range steps {
+		if got[i] != st.want {
+			t.Errorf("step %d (%s): %q, want %q", i, st.name, got[i], st.want)
+		}
+	}
+}
+
 // Updates tell the caller what happened to the money; validators reject bad
 // requests before they reach history, and concurrent requests can't overspend.
 func TestMoneyUpdates(t *testing.T) {
@@ -241,43 +282,14 @@ func TestMoneyUpdates(t *testing.T) {
 			env := s.NewTestWorkflowEnvironment()
 			l := NewMemLedger()
 			env.RegisterActivity(&Activities{Ledger: l, Limits: map[string]int64{"card-1": 100_000}})
-			got := make([]string, len(tt.steps))
-			for i, st := range tt.steps {
-				env.RegisterDelayedCallback(func() {
-					if st.want == "" {
-						env.SignalWorkflow(st.name, st.payload)
-						return
-					}
-					var args []any
-					if st.payload != nil {
-						args = append(args, st.payload)
-					}
-					env.UpdateWorkflow(st.name, fmt.Sprint(i), &testsuite.TestUpdateCallback{
-						OnReject: func(error) { got[i] = "rejected" },
-						OnComplete: func(r any, err error) {
-							switch {
-							case err != nil:
-								got[i] = "error"
-							case r == false:
-								got[i] = "declined"
-							default:
-								got[i] = "ok"
-							}
-						},
-					}, args...)
-				}, st.at)
-			}
+			got := sendSteps(env, tt.steps)
 
 			env.ExecuteWorkflow(AuthorizeWorkflow, auth("card-1", 40_000))
 
 			if err := env.GetWorkflowError(); err != nil {
 				t.Fatal(err)
 			}
-			for i, st := range tt.steps {
-				if got[i] != st.want {
-					t.Errorf("step %d (%s): %q, want %q", i, st.name, got[i], st.want)
-				}
-			}
+			checkSteps(t, tt.steps, got)
 			var res AuthResult
 			if err := env.GetWorkflowResult(&res); err != nil {
 				t.Fatal(err)
