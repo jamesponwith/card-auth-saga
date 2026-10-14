@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"testing"
 	"time"
@@ -30,6 +31,14 @@ func refund(at time.Duration, id string, amount int64) signal {
 }
 
 func reverse(at time.Duration) signal { return signal{at, ReverseSignal, nil} }
+
+func partial(at time.Duration, amount int64) signal {
+	return signal{at, CaptureSignal, Capture{Amount: amount, Partial: true}}
+}
+
+func increment(at time.Duration, id string, amount int64) signal {
+	return signal{at, IncrementUpdate, Increment{ID: id, Amount: amount}}
+}
 
 const hr = time.Hour
 
@@ -177,7 +186,8 @@ func TestAuthorizeUpdate(t *testing.T) {
 }
 
 // step is a signal or an update sent at `at`; want is the update's outcome
-// ("ok", "rejected" by its validator, or "error"), empty for a signal.
+// ("ok", "declined" when it returns false, "rejected" by its validator, or
+// "error"), empty for a signal.
 type step struct {
 	signal
 	want string
@@ -210,6 +220,19 @@ func TestMoneyUpdates(t *testing.T) {
 		{"used refund ID rejected", []step{upd(capture(hr, 40_000), "ok"), upd(refund(2*hr, "r1", 15_000), "ok"), upd(refund(3*hr, "r1", 15_000), "rejected")}, StatusCaptured, 15_000, 25_000, 250},
 		{"concurrent refunds can't over-refund", []step{upd(capture(hr, 40_000), "ok"), upd(refund(2*hr, "r1", 30_000), "ok"), upd(refund(2*hr, "r2", 20_000), "rejected")}, StatusCaptured, 30_000, 10_000, 100},
 		{"concurrent refunds to zero", []step{upd(capture(hr, 200), "ok"), upd(refund(2*hr, "r1", 150), "ok"), upd(refund(2*hr, "r2", 50), "ok")}, StatusRefunded, 200, 0, 0},
+		{"split shipment", []step{upd(partial(hr, 15_000), "ok"), upd(capture(2*hr, 25_000), "ok")}, StatusCaptured, 0, 40_000, 400},
+		{"short final capture releases the rest", []step{upd(partial(hr, 10_000), "ok"), upd(capture(2*hr, 5_000), "ok")}, StatusCaptured, 0, 15_000, 150},
+		{"partials can't exceed the hold", []step{upd(partial(hr, 30_000), "ok"), upd(partial(2*hr, 20_000), "rejected"), upd(capture(3*hr, 10_000), "ok")}, StatusCaptured, 0, 40_000, 400},
+		{"expiry after a partial releases the rest", []step{upd(partial(hr, 15_000), "ok")}, StatusCaptured, 0, 15_000, 150},
+		{"reverse after a partial releases the rest", []step{upd(partial(hr, 15_000), "ok"), upd(reverse(2*hr), "ok")}, StatusCaptured, 0, 15_000, 150},
+		{"partial capture signal", []step{sig(partial(hr, 15_000)), sig(capture(2*hr, 5_000))}, StatusCaptured, 0, 20_000, 200},
+		{"refund across a split capture", []step{upd(partial(hr, 15_000), "ok"), upd(capture(2*hr, 25_000), "ok"), upd(refund(3*hr, "r1", 40_000), "ok")}, StatusRefunded, 40_000, 0, 0},
+		{"increment then capture", []step{upd(increment(hr, "i1", 30_000), "ok"), upd(capture(2*hr, 70_000), "ok")}, StatusCaptured, 0, 70_000, 700},
+		{"increment after a partial", []step{upd(partial(hr, 40_000), "ok"), upd(increment(2*hr, "i1", 10_000), "ok"), upd(capture(3*hr, 10_000), "ok")}, StatusCaptured, 0, 50_000, 500},
+		{"capture during increment rejected", []step{upd(increment(hr, "i1", 30_000), "ok"), upd(capture(hr, 40_000), "rejected"), upd(capture(2*hr, 70_000), "ok")}, StatusCaptured, 0, 70_000, 700},
+		{"increment over limit declined", []step{upd(increment(hr, "i1", 60_001), "declined"), upd(capture(2*hr, 40_001), "rejected"), upd(capture(3*hr, 40_000), "ok")}, StatusCaptured, 0, 40_000, 400},
+		{"increment ID reused rejected", []step{upd(increment(hr, "i1", 1_000), "ok"), upd(increment(2*hr, "i1", 1_000), "rejected"), upd(capture(3*hr, 41_000), "ok")}, StatusCaptured, 0, 41_000, 410},
+		{"increment after final capture rejected", []step{upd(capture(hr, 40_000), "ok"), upd(increment(2*hr, "i1", 1_000), "rejected")}, StatusCaptured, 0, 40_000, 400},
 		{"refund signal and update share IDs", []step{upd(capture(hr, 40_000), "ok"), sig(refund(2*hr, "r1", 15_000)), upd(refund(3*hr, "r1", 15_000), "rejected")}, StatusCaptured, 15_000, 25_000, 250},
 	}
 	for _, tt := range tests {
@@ -231,10 +254,14 @@ func TestMoneyUpdates(t *testing.T) {
 					}
 					env.UpdateWorkflow(st.name, fmt.Sprint(i), &testsuite.TestUpdateCallback{
 						OnReject: func(error) { got[i] = "rejected" },
-						OnComplete: func(_ any, err error) {
-							got[i] = "ok"
-							if err != nil {
+						OnComplete: func(r any, err error) {
+							switch {
+							case err != nil:
 								got[i] = "error"
+							case r == false:
+								got[i] = "declined"
+							default:
+								got[i] = "ok"
 							}
 						},
 					}, args...)
@@ -312,8 +339,13 @@ func TestFailedCaptureReleasesHold(t *testing.T) {
 	l := NewMemLedger()
 	a := &Activities{Ledger: l, Limits: map[string]int64{"card-1": 100_000}}
 	env.RegisterActivity(a)
-	env.OnActivity(a.CaptureHold, mock.Anything, mock.Anything, mock.Anything).
-		Return(temporal.NewNonRetryableApplicationError("ledger down", "LedgerDown", nil))
+	env.OnActivity(a.Settle, mock.Anything, mock.Anything, mock.Anything).
+		Return(func(ctx context.Context, req AuthRequest, st Settlement) error {
+			if st.Capture > 0 {
+				return temporal.NewNonRetryableApplicationError("ledger down", "LedgerDown", nil)
+			}
+			return a.Settle(ctx, req, st)
+		})
 	env.RegisterDelayedCallback(func() { env.SignalWorkflow(CaptureSignal, Capture{Amount: 40_000}) }, hr)
 
 	env.ExecuteWorkflow(AuthorizeWorkflow, auth("card-1", 40_000))
@@ -350,6 +382,14 @@ func TestActivityRetryPostsOnce(t *testing.T) {
 			_, err := env.ExecuteActivity(a.ReleaseHold, req)
 			return err
 		}, openToBuyAccount("card-1"), 2_500},
+		{"increase hold", func(env *testsuite.TestActivityEnvironment, a *Activities) error {
+			_, err := env.ExecuteActivity(a.IncreaseHold, req, Increment{ID: "i1", Amount: 500})
+			return err
+		}, holdsAccount("card-1"), 500},
+		{"settle", func(env *testsuite.TestActivityEnvironment, a *Activities) error {
+			_, err := env.ExecuteActivity(a.Settle, req, Settlement{"capture:0", 1_000, 300})
+			return err
+		}, openToBuyAccount("card-1"), 300},
 		{"refund", func(env *testsuite.TestActivityEnvironment, a *Activities) error {
 			_, err := env.ExecuteActivity(a.RefundCapture, req, Refund{ID: "r1", Amount: 700})
 			return err

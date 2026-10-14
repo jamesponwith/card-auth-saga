@@ -132,6 +132,33 @@ func TestDrills(t *testing.T) {
 		d.expectBalances(0, 25_000, 250)
 	})
 
+	t.Run("increments and split capture", func(t *testing.T) {
+		d := newDrill(t, c, "split", nil)
+		d.startWorker()
+		if !d.authorize(AuthRequest{Amount: 40_000, RefundWindow: time.Second}) {
+			t.Fatal("want approved")
+		}
+		for _, inc := range []struct {
+			id     string
+			amount int64
+			want   bool
+		}{{"i1", 20_000, true}, {"i2", 50_000, false}} { // 60,000 held; 110,000 is over the limit
+			var ok bool
+			if err := d.updateResult(IncrementUpdate, inc.id, Increment{ID: inc.id, Amount: inc.amount}, &ok); err != nil || ok != inc.want {
+				t.Fatalf("increment %s = %v, %v; want %v", inc.id, ok, err, inc.want)
+			}
+		}
+		if err := d.update(CaptureSignal, "c1", Capture{Amount: 30_000, Partial: true}); err != nil {
+			t.Fatal(err)
+		}
+		if err := d.update(CaptureSignal, "c2", Capture{Amount: 25_000}); err != nil { // releases the last 5,000
+			t.Fatal(err)
+		}
+
+		d.expect(d.c.GetWorkflow(context.Background(), d.card, ""), AuthResult{Status: StatusCaptured, Captured: 55_000, Points: 550})
+		d.expectBalances(0, 55_000, 550)
+	})
+
 	t.Run("update with start declined", func(t *testing.T) {
 		d := newDrill(t, c, "uws-decline", nil)
 		d.startWorker()
@@ -218,8 +245,11 @@ func (d *drill) authorize(req AuthRequest) bool {
 	return approved
 }
 
-// update sends an update to the drill's workflow and waits for its result.
-func (d *drill) update(name, id string, arg any) error {
+// update sends an update to the drill's workflow and waits for it to finish.
+func (d *drill) update(name, id string, arg any) error { return d.updateResult(name, id, arg, nil) }
+
+// updateResult is update, decoding the update's result into result.
+func (d *drill) updateResult(name, id string, arg, result any) error {
 	h, err := d.c.UpdateWorkflow(context.Background(), client.UpdateWorkflowOptions{
 		WorkflowID: d.card, UpdateID: id, UpdateName: name, Args: []any{arg},
 		WaitForStage: client.WorkflowUpdateStageCompleted,
@@ -227,7 +257,7 @@ func (d *drill) update(name, id string, arg any) error {
 	if err != nil {
 		return err
 	}
-	return h.Get(context.Background(), nil)
+	return h.Get(context.Background(), result)
 }
 
 func (d *drill) signal(run client.WorkflowRun, name string, payload any) {

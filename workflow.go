@@ -17,6 +17,7 @@ const (
 	CaptureSignal       = "capture"
 	ReverseSignal       = "reverse"
 	RefundSignal        = "refund"
+	IncrementUpdate     = "increment"         // raises an open hold; returns false if the limit can't cover it
 	AuthorizeUpdate     = "authorize"         // returns the approve/decline decision; send with Update-with-Start
 	DefaultHoldFor      = 7 * 24 * time.Hour  // how long an uncaptured hold lives
 	DefaultRefundWindow = 30 * 24 * time.Hour // how long after capture refunds are accepted
@@ -43,9 +44,17 @@ type AuthRequest struct {
 	RefundWindow time.Duration // zero means DefaultRefundWindow
 }
 
-// Capture is the payload of the capture signal. Amount may be less than the
-// hold (partial capture); the remainder is released.
+// Capture is the payload of the capture signal or update. A final capture
+// closes the hold and releases what it doesn't take; a Partial one leaves the
+// rest open for later captures (split shipments).
 type Capture struct {
+	Amount  int64 // cents
+	Partial bool
+}
+
+// Increment raises an open hold (hotel, car rental). ID makes it idempotent.
+type Increment struct {
+	ID     string
 	Amount int64 // cents
 }
 
@@ -85,7 +94,9 @@ func pointsFor(cents, rate int64) int64 { return cents * rate / 100 }
 // before it reaches history, and the update returns once the ledger posts.
 func AuthorizeWorkflow(ctx workflow.Context, req AuthRequest) (AuthResult, error) {
 	ctx = withLedger(ctx)
-	s := &authState{req: req, phase: phaseDeciding, seen: map[string]bool{}}
+	s := &authState{req: req, phase: phaseDeciding, held: req.Amount, seen: map[string]bool{}, increments: map[string]bool{}}
+	// Runs started before multiple captures replay on the single-capture path.
+	s.v = workflow.GetVersion(ctx, "multi-capture", workflow.DefaultVersion, 1)
 	if err := s.registerUpdates(ctx); err != nil {
 		return AuthResult{}, err
 	}
@@ -186,9 +197,13 @@ const (
 type authState struct {
 	a       *Activities
 	req     AuthRequest
+	v       workflow.Version // DefaultVersion: single capture, no increments
 	phase   string
 	holdErr error // PlaceHold's error, for the authorize update
 	err     error // a capture, release or refund that could not post
+
+	held       int64           // open hold: the auth plus increments, less partial captures
+	increments map[string]bool // increment IDs claimed
 
 	captured, rate int64
 	refundsOpen    bool            // settlement rewards posted
@@ -206,6 +221,8 @@ func (s *authState) registerUpdates(ctx workflow.Context) error {
 		}),
 		workflow.SetUpdateHandlerWithOptions(ctx, CaptureSignal, s.capture,
 			workflow.UpdateHandlerOptions{Validator: func(_ workflow.Context, c Capture) error { return s.checkCapture(c) }}),
+		workflow.SetUpdateHandlerWithOptions(ctx, IncrementUpdate, s.increment,
+			workflow.UpdateHandlerOptions{Validator: func(_ workflow.Context, i Increment) error { return s.checkIncrement(i) }}),
 		workflow.SetUpdateHandlerWithOptions(ctx, ReverseSignal, func(ctx workflow.Context) error { return s.release(ctx, StatusReversed) },
 			workflow.UpdateHandlerOptions{Validator: func(workflow.Context) error { return s.checkHeld() }}),
 		workflow.SetUpdateHandlerWithOptions(ctx, RefundSignal, s.refund,
@@ -220,47 +237,115 @@ func (s *authState) checkHeld() error {
 	return nil
 }
 
+var errOldRun = errors.New("workflow started before partial captures and increments")
+
 func (s *authState) checkCapture(c Capture) error {
-	if c.Amount <= 0 || c.Amount > s.req.Amount {
-		return fmt.Errorf("capture %d outside the %d hold", c.Amount, s.req.Amount)
+	if c.Partial && s.v == workflow.DefaultVersion {
+		return errOldRun
+	}
+	if c.Amount <= 0 || c.Amount > s.held {
+		return fmt.Errorf("capture %d outside the %d hold", c.Amount, s.held)
 	}
 	return s.checkHeld()
 }
 
-// capture posts c and releases the rest of the hold.
+// capture posts c. A final capture also releases the rest of the hold.
 func (s *authState) capture(ctx workflow.Context, c Capture) error {
 	if err := s.checkCapture(c); err != nil {
 		return err
 	}
 	ctx = withLedger(ctx)
 	s.phase = phaseBusy
-	if err := workflow.ExecuteActivity(ctx, s.a.CaptureHold, s.req, c.Amount).Get(ctx, nil); err != nil {
+	rest := s.held - c.Amount
+	if c.Partial {
+		rest = 0
+	}
+	var err error
+	if s.v == workflow.DefaultVersion {
+		err = workflow.ExecuteActivity(ctx, s.a.CaptureHold, s.req, c.Amount).Get(ctx, nil)
+	} else {
+		// Captured-so-far only grows, so it keys each capture uniquely.
+		st := Settlement{fmt.Sprint("capture:", s.captured), c.Amount, rest}
+		err = workflow.ExecuteActivity(ctx, s.a.Settle, s.req, st).Get(ctx, nil)
+	}
+	if err != nil {
 		// Compensate: a capture that can't post must not leave the hold
 		// eating the card's limit.
-		if rerr := workflow.ExecuteActivity(ctx, s.a.ReleaseHold, s.req).Get(ctx, nil); rerr != nil {
+		if rerr := s.postRelease(ctx); rerr != nil {
 			workflow.GetLogger(ctx).Error("compensating release failed", "error", rerr)
 		}
 		s.phase, s.err = phaseFailed, err
 		return err
 	}
-	s.phase, s.captured = StatusCaptured, c.Amount
+	s.captured += c.Amount
+	s.held -= c.Amount + rest
+	if c.Partial {
+		s.phase = phaseHolding
+		return nil
+	}
+	s.phase = StatusCaptured
 	// Return once settlement rewards post, so a caller can refund right away.
 	return workflow.Await(ctx, func() bool { return s.refundsOpen })
 }
 
-// release returns the whole hold to open-to-buy and ends as status.
+// release returns the open hold to open-to-buy. The auth ends as status, or
+// as captured if partial captures already took some of it.
 func (s *authState) release(ctx workflow.Context, status string) error {
 	if err := s.checkHeld(); err != nil {
 		return err
 	}
 	ctx = withLedger(ctx)
 	s.phase = phaseBusy
-	if err := workflow.ExecuteActivity(ctx, s.a.ReleaseHold, s.req).Get(ctx, nil); err != nil {
+	if err := s.postRelease(ctx); err != nil {
 		s.phase, s.err = phaseFailed, err
 		return err
 	}
+	s.held = 0
+	if s.captured > 0 {
+		status = StatusCaptured
+	}
 	s.phase = status
 	return nil
+}
+
+func (s *authState) postRelease(ctx workflow.Context) error {
+	if s.v == workflow.DefaultVersion {
+		return workflow.ExecuteActivity(ctx, s.a.ReleaseHold, s.req).Get(ctx, nil)
+	}
+	return workflow.ExecuteActivity(ctx, s.a.Settle, s.req, Settlement{"release", 0, s.held}).Get(ctx, nil)
+}
+
+func (s *authState) checkIncrement(i Increment) error {
+	switch {
+	case s.v == workflow.DefaultVersion:
+		return errOldRun
+	case i.ID == "" || s.increments[i.ID]:
+		return fmt.Errorf("increment ID %q empty or already used", i.ID)
+	case i.Amount <= 0:
+		return fmt.Errorf("increment %d not positive", i.Amount)
+	}
+	return s.checkHeld()
+}
+
+// increment raises the open hold if the card's limit covers it.
+func (s *authState) increment(ctx workflow.Context, i Increment) (bool, error) {
+	if err := s.checkIncrement(i); err != nil {
+		return false, err
+	}
+	s.increments[i.ID] = true
+	s.phase = phaseBusy
+	defer func() { s.phase = phaseHolding }()
+	// Retry until the ledger answers: an increment given up on might have
+	// posted, and then nobody would know how much is held.
+	ctx = workflow.WithRetryPolicy(withLedger(ctx), temporal.RetryPolicy{})
+	var ok bool
+	if err := workflow.ExecuteActivity(ctx, s.a.IncreaseHold, s.req, i).Get(ctx, &ok); err != nil {
+		return false, err
+	}
+	if ok {
+		s.held += i.Amount
+	}
+	return ok, nil
 }
 
 func (s *authState) checkRefund(r Refund) error {
@@ -320,14 +405,23 @@ func (a *Activities) PlaceHold(ctx context.Context, req AuthRequest) (bool, erro
 	if req.Amount <= 0 {
 		return false, temporal.NewNonRetryableApplicationError("amount must be positive", "InvalidAmount", nil)
 	}
-	limit, known := a.Limits[req.CardID]
+	return a.hold(ctx, "hold", req.CardID, req.Amount)
+}
+
+// IncreaseHold raises an open hold under the same atomic limit check.
+func (a *Activities) IncreaseHold(ctx context.Context, req AuthRequest, i Increment) (bool, error) {
+	return a.hold(ctx, "hold:"+i.ID, req.CardID, i.Amount)
+}
+
+func (a *Activities) hold(ctx context.Context, step, card string, amount int64) (bool, error) {
+	limit, known := a.Limits[card]
 	if !known {
 		return false, nil
 	}
-	return a.Ledger.PostWithin(ctx, stepKey(ctx, "hold"),
-		[]string{holdsAccount(req.CardID), postedAccount(req.CardID)}, limit,
-		Entry{holdsAccount(req.CardID), req.Amount},
-		Entry{openToBuyAccount(req.CardID), -req.Amount},
+	return a.Ledger.PostWithin(ctx, stepKey(ctx, step),
+		[]string{holdsAccount(card), postedAccount(card)}, limit,
+		Entry{holdsAccount(card), amount},
+		Entry{openToBuyAccount(card), -amount},
 	)
 }
 
@@ -337,6 +431,22 @@ func (a *Activities) CaptureHold(ctx context.Context, req AuthRequest, amount in
 		Entry{holdsAccount(req.CardID), -req.Amount},
 		Entry{postedAccount(req.CardID), amount},
 		Entry{openToBuyAccount(req.CardID), req.Amount - amount},
+	)
+}
+
+// Settlement takes Capture and Release out of the open hold: Capture to posted,
+// Release back to open-to-buy. Step names the idempotency key.
+type Settlement struct {
+	Step             string
+	Capture, Release int64 // cents
+}
+
+// Settle posts a capture, a release, or both from the open hold.
+func (a *Activities) Settle(ctx context.Context, req AuthRequest, st Settlement) error {
+	return a.Ledger.Post(ctx, stepKey(ctx, st.Step),
+		Entry{holdsAccount(req.CardID), -(st.Capture + st.Release)},
+		Entry{postedAccount(req.CardID), st.Capture},
+		Entry{openToBuyAccount(req.CardID), st.Release},
 	)
 }
 
