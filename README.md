@@ -34,6 +34,8 @@ go run .                       # worker on task queue card-auth
 temporal workflow execute-update-with-start --update-name authorize \
   --task-queue card-auth --type AuthorizeWorkflow --id-conflict-policy UseExisting \
   --workflow-id auth-1 --input '{"CardID":"card-1","Amount":40000,"Merchant":"shop"}'
+temporal workflow update execute --workflow-id auth-1 --name increment --input '{"ID":"i1","Amount":10000}'
+temporal workflow update execute --workflow-id auth-1 --name capture --input '{"Amount":20000,"Partial":true}'
 temporal workflow update execute --workflow-id auth-1 --name capture --input '{"Amount":25000}'
 temporal workflow update execute --workflow-id auth-1 --name refund --update-id r1 \
   --input '{"ID":"r1","Amount":5000}'
@@ -48,9 +50,14 @@ rejected with the reason: a capture outside the hold, a second capture, a refund
 a used refund ID. A retry with the same `--update-id` gets the first result back. The same names also
 work as fire-and-forget signals (`temporal workflow signal`), which log and drop bad requests (M7).
 
+`increment` raises the hold, here to $500, and returns `false` if the card's limit can't cover it. A
+`Partial` capture posts without closing the hold, as for a split shipment. The final capture, here
+$250 for $450 captured in total, releases what's left. A reversal or expiry after partial captures
+releases the rest and still settles what was captured (M8).
+
 After a capture the workflow accepts refunds (deduplicated by `ID`, capped at the captured
 amount) for 30 days, then returns e.g. `{"Status":"captured","Captured":25000,"Refunded":5000,"Points":200}`.
-Points accrue at the merchant's partner rate at settlement and are clawed back on refund (SPEC.md).
+Points accrue on the captured total at the merchant's partner rate at settlement and are clawed back on refund (SPEC.md).
 Before capture, `--name reverse` voids the hold; with no signal it expires after 7 days
 (`"HoldFor"`/`"RefundWindow"` in nanoseconds shorten either).
 
@@ -60,8 +67,9 @@ Before capture, `--name reverse` voids the hold; with no signal it expires after
 go test -run TestDrills -v .   # downloads + starts a Temporal dev server; add CAS_MYSQL_DSN for MySQL
 ```
 
-Six drills against a real server: worker killed mid-hold, duplicate capture/refund signals,
-activities that commit then time out, Update-with-Start approved (sent twice) and declined, and
-updates that land mid-step (a refund during settlement, the window closing mid-refund). Each asserts exact balances, then replays the recorded history.
+Seven drills against a real server: worker killed mid-hold, duplicate capture/refund signals,
+activities that commit then time out, Update-with-Start approved (sent twice) and declined,
+updates that land mid-step (a refund during settlement, the window closing mid-refund), and
+increments with a split capture. Each asserts exact balances, then replays the recorded history.
 `CAS_UPDATE_GOLDEN=1` re-records `testdata/history-*.json`, which `go test -short` replays on every
 commit to catch nondeterministic workflow changes.

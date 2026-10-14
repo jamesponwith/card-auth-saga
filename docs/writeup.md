@@ -62,7 +62,13 @@ history:
 | Activity times out after writing | The ledger commits each write, then stalls past a 1s activity timeout, so Temporal retries | Every step posts exactly once |
 | Update-with-Start, sent twice | The caller starts the auth and waits on the `authorize` update; a retry reuses the auth ID | `true` both times, one hold |
 | Update-with-Start, declined | An over-limit auth | `false`, then the workflow closes as declined |
+| Increments and split capture | +$200 increment approved, +$500 declined by the limit, $300 partial capture, $250 final capture | $550 captured, the last $50 released, 550 points |
 | Updates mid-step | Every write stalls 1.5s; a refund update is sent the moment its capture returns, twice with one update ID, and the 1s window closes while it posts | One refund; points clawed back; a new update ID for the same refund is rejected |
+
+M8 changed which activities a capture runs, so it is the first change those recordings had to
+survive. `workflow.GetVersion` tags new runs. Runs without the tag stay on the old `CaptureHold`
+and `ReleaseHold` and reject partial captures and increments. Removing the gate makes 5 of the 6
+older recordings fail to replay.
 
 The recorded histories are committed under `testdata/`. On every commit, `TestReplayGoldenHistories`
 replays them against the current workflow code. As a check, I added one extra activity call at the start
@@ -86,6 +92,10 @@ Each safeguard was removed on purpose to confirm a test notices:
 | Refunds reserve their amount before posting | *concurrent refunds can't over-refund* |
 | Workflow waits for in-flight refunds | mid-step drill: the refund posts, its points are never clawed back |
 | Capture returns only after settlement rewards | mid-step drill: the refund is rejected as too early |
+| Old runs keep the single-capture activities (`GetVersion`) | 5 of the 6 pre-M8 golden histories fail to replay |
+| A partial capture leaves the rest of the hold open | *split shipment*, *partials can't exceed the hold* |
+| Release takes only what's still held | *expiry/reverse after a partial releases the rest* |
+| An increment claims the hold | *capture during increment rejected*: otherwise a final capture strands the increment |
 
 Two experiments removed code instead. Cancelling the hold timer after capture survived mutation,
 because a finished workflow cleans up its own timers, so it was deleted. Likewise, waiting for all

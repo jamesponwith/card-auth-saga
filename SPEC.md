@@ -19,8 +19,12 @@ Each card has three accounts; every posting sums to zero.
 | Step | holds | posted | open-to-buy |
 |------|------:|-------:|------------:|
 | Hold A | +A | | −A |
-| Capture C ≤ A | −A | +C | +(A−C) |
-| Release (expiry, reversal, failed capture) | −A | | +A |
+| Increment X (limit-checked like a hold) | +X | | −X |
+| Partial capture C ≤ open hold H | −C | +C | |
+| Final capture C ≤ H | −H | +C | +(H−C) |
+| Release (expiry, reversal, failed capture) | −H | | +H |
+
+H is the open hold: A plus increments, minus partial captures.
 | Refund R ≤ captured − refunded | | −R | +R |
 
 Rewards are points, not cents, and balance against the brand partner that funds them:
@@ -64,6 +68,20 @@ never finds out. `capture`, `reverse` and `refund` are also Updates (same names 
 - Signals keep working as before, so workflows already running on old code and the golden
   histories still replay.
 
+## Incremental auth and multiple captures (M8)
+
+Split shipments capture several times against one hold, and hotels and car rentals raise the hold
+after the first auth.
+
+- `Capture{Amount, Partial: true}` posts without closing the hold. A final capture (`Partial: false`,
+  the old behaviour), a reversal or expiry closes it and releases whatever is left. If anything was
+  captured, the auth ends `captured`.
+- The `increment` update (`{ID, Amount}`) raises the hold while it's open. The limit check is the same
+  atomic one a hold uses, and the update returns `false` if the card can't cover it.
+- Rewards accrue once on the captured total when the hold closes, and the refund cap is that total.
+- Workflows started before M8 keep single-capture behaviour. `workflow.GetVersion` tags new runs, and
+  old runs reject partial captures and increments, so their histories still replay.
+
 ## Non-goals
 
 - Real card networks (ISO 8583), PCI scope, or real money.
@@ -80,6 +98,7 @@ never finds out. `capture`, `reverse` and `refund` are also Updates (same names 
 - **M5**: Failure drills + writeup (README demo, blog post) → resume Open Source line.
 - **M6**: Synchronous approve/decline via Update-with-Start.
 - **M7**: Capture, reverse and refund as validated updates.
+- **M8**: Incremental auth and multiple captures.
 
 ## Success criteria
 
