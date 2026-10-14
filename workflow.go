@@ -203,7 +203,6 @@ type authState struct {
 	err     error // a capture, release or refund that could not post
 
 	held       int64           // open hold: the auth plus increments, less partial captures
-	captures   int             // captures posted, for their idempotency keys
 	increments map[string]bool // increment IDs claimed
 
 	captured, rate int64
@@ -265,7 +264,8 @@ func (s *authState) capture(ctx workflow.Context, c Capture) error {
 	if s.v == workflow.DefaultVersion {
 		err = workflow.ExecuteActivity(ctx, s.a.CaptureHold, s.req, c.Amount).Get(ctx, nil)
 	} else {
-		st := Settlement{fmt.Sprint("capture:", s.captures), c.Amount, rest}
+		// Captured-so-far only grows, so it keys each capture uniquely.
+		st := Settlement{fmt.Sprint("capture:", s.captured), c.Amount, rest}
 		err = workflow.ExecuteActivity(ctx, s.a.Settle, s.req, st).Get(ctx, nil)
 	}
 	if err != nil {
@@ -277,7 +277,6 @@ func (s *authState) capture(ctx workflow.Context, c Capture) error {
 		s.phase, s.err = phaseFailed, err
 		return err
 	}
-	s.captures++
 	s.captured += c.Amount
 	s.held -= c.Amount + rest
 	if c.Partial {
@@ -450,9 +449,6 @@ func (a *Activities) Settle(ctx context.Context, req AuthRequest, st Settlement)
 		Entry{openToBuyAccount(req.CardID), st.Release},
 	)
 }
-
-// CaptureHold and ReleaseHold serve runs started before Settle; see
-// AuthorizeWorkflow's GetVersion.
 
 // ReleaseHold returns the whole hold to open-to-buy (expiry, reversal, or a
 // failed capture).
