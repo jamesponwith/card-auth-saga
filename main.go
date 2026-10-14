@@ -26,19 +26,15 @@ func main() {
 }
 
 func run(ctx context.Context, args []string, dsn string) error {
+	var change func(context.Context, *MySQLLedger) error
 	if len(args) > 0 {
-		change, err := admin(args)
-		if err != nil {
+		var err error
+		if change, err = admin(args); err != nil {
 			return err
 		}
 		if dsn == "" {
 			return errors.New("set CAS_MYSQL_DSN: card config lives in MySQL")
 		}
-		l, err := OpenMySQL(ctx, dsn)
-		if err != nil {
-			return fmt.Errorf("open ledger: %w", err)
-		}
-		return errors.Join(change(ctx, l), l.Close())
 	}
 
 	acts := &Activities{
@@ -52,6 +48,9 @@ func run(ctx context.Context, args []string, dsn string) error {
 			return fmt.Errorf("open ledger: %w", err)
 		}
 		defer func() { _ = l.Close() }()
+		if change != nil {
+			return change(ctx, l)
+		}
 		acts = &Activities{Ledger: l, Config: l}
 	}
 

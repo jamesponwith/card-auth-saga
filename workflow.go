@@ -513,13 +513,10 @@ func (a *Activities) RefundCapture(ctx context.Context, req AuthRequest, r Refun
 // rate is recorded in workflow history and reused for every clawback.
 func (a *Activities) RewardRate(ctx context.Context, merchant string) (int64, error) {
 	rate, ok, err := a.Config.RewardRate(ctx, merchant)
-	if err != nil {
-		return 0, err
+	if !ok && err == nil { // a failed read retries rather than settling on the default
+		rate = DefaultRewardRate
 	}
-	if !ok {
-		return DefaultRewardRate, nil
-	}
-	return rate, nil
+	return rate, err
 }
 
 // PointsChange moves a card's points from what Before cents earned to what
