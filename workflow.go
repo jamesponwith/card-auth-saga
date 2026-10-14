@@ -15,6 +15,7 @@ const (
 	CaptureSignal       = "capture"
 	ReverseSignal       = "reverse"
 	RefundSignal        = "refund"
+	AuthorizeUpdate     = "authorize"         // returns the approve/decline decision; send with Update-with-Start
 	DefaultHoldFor      = 7 * 24 * time.Hour  // how long an uncaptured hold lives
 	DefaultRefundWindow = 30 * 24 * time.Hour // how long after capture refunds are accepted
 	DefaultRewardRate   = 1                   // points per $1 when the merchant has no partner rate
@@ -85,9 +86,23 @@ func AuthorizeWorkflow(ctx workflow.Context, req AuthRequest) (AuthResult, error
 	})
 	var a *Activities
 
-	var held bool
-	if err := workflow.ExecuteActivity(ctx, a.PlaceHold, req).Get(ctx, &held); err != nil {
+	// The caller learns the decision from the authorize update without waiting
+	// days for the result. Repeated or late updates get the same answer.
+	var decided, held bool
+	var holdErr error
+	if err := workflow.SetUpdateHandler(ctx, AuthorizeUpdate, func(ctx workflow.Context) (bool, error) {
+		err := workflow.Await(ctx, func() bool { return decided })
+		return held, cmp.Or(err, holdErr)
+	}); err != nil {
 		return AuthResult{}, err
+	}
+
+	// Waiting updates run in the same workflow task that sets decided, so they
+	// answer before a decline or error closes the workflow.
+	holdErr = workflow.ExecuteActivity(ctx, a.PlaceHold, req).Get(ctx, &held)
+	decided = true
+	if holdErr != nil {
+		return AuthResult{}, holdErr
 	}
 	if !held {
 		return AuthResult{Status: StatusDeclined}, nil

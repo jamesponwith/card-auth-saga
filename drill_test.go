@@ -85,6 +85,33 @@ func TestDrills(t *testing.T) {
 			t.Errorf("ledger saw %d calls for %d keys; want retries after the timeouts", calls, keys)
 		}
 	})
+
+	t.Run("update with start", func(t *testing.T) {
+		d := newDrill(t, c, "uws", nil)
+		d.startWorker()
+		req := AuthRequest{Amount: 40_000, RefundWindow: time.Second}
+		for range 2 { // the network retries: same auth ID, same answer, one hold
+			if !d.authorize(req) {
+				t.Fatal("want approved")
+			}
+		}
+		d.waitBalance(holdsAccount(d.card), 40_000)
+		run := d.c.GetWorkflow(context.Background(), d.card, "")
+		d.signal(run, CaptureSignal, Capture{Amount: 40_000})
+
+		d.expect(run, AuthResult{Status: StatusCaptured, Captured: 40_000, Points: 400})
+		d.expectBalances(0, 40_000, 400)
+	})
+
+	t.Run("update with start declined", func(t *testing.T) {
+		d := newDrill(t, c, "uws-decline", nil)
+		d.startWorker()
+		if d.authorize(AuthRequest{Amount: 100_001}) {
+			t.Fatal("want declined")
+		}
+		d.expect(d.c.GetWorkflow(context.Background(), d.card, ""), AuthResult{Status: StatusDeclined})
+		d.expectBalances(0, 0, 0)
+	})
 }
 
 // drill is one scenario on its own card and merchant, so drills can share a
@@ -138,6 +165,28 @@ func (d *drill) start(req AuthRequest) client.WorkflowRun {
 		d.t.Fatal(err)
 	}
 	return run
+}
+
+// authorize starts the auth (or attaches to the running one) and waits for the decision.
+func (d *drill) authorize(req AuthRequest) bool {
+	d.t.Helper()
+	req.CardID, req.Merchant = d.card, d.merchant
+	ctx := context.Background()
+	start := d.c.NewWithStartWorkflowOperation(client.StartWorkflowOptions{
+		ID: d.card, TaskQueue: TaskQueue, WorkflowIDConflictPolicy: enumspb.WORKFLOW_ID_CONFLICT_POLICY_USE_EXISTING,
+	}, AuthorizeWorkflow, req)
+	h, err := d.c.UpdateWithStartWorkflow(ctx, client.UpdateWithStartWorkflowOptions{
+		StartWorkflowOperation: start,
+		UpdateOptions:          client.UpdateWorkflowOptions{UpdateName: AuthorizeUpdate, WaitForStage: client.WorkflowUpdateStageCompleted},
+	})
+	if err != nil {
+		d.t.Fatal(err)
+	}
+	var approved bool
+	if err := h.Get(ctx, &approved); err != nil {
+		d.t.Fatal(err)
+	}
+	return approved
 }
 
 func (d *drill) signal(run client.WorkflowRun, name string, payload any) {

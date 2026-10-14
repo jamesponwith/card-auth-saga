@@ -127,6 +127,54 @@ func TestAuthorizeWorkflow(t *testing.T) {
 	}
 }
 
+// The authorize update answers as soon as the hold is decided, while the
+// workflow keeps running; a late or repeated update gets the same answer.
+func TestAuthorizeUpdate(t *testing.T) {
+	tests := []struct {
+		name    string
+		req     AuthRequest
+		at      time.Duration // when the update arrives
+		want    bool
+		wantErr bool
+	}{
+		{"approved", auth("card-1", 40_000), 0, true, false},
+		{"over limit declined", auth("card-1", 100_001), 0, false, false},
+		{"non-positive amount errors", auth("card-1", 0), 0, false, true},
+		{"late update after capture", auth("card-1", 40_000), 2 * hr, true, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var s testsuite.WorkflowTestSuite
+			env := s.NewTestWorkflowEnvironment()
+			env.RegisterActivity(&Activities{Ledger: NewMemLedger(), Limits: map[string]int64{"card-1": 100_000}})
+			env.RegisterDelayedCallback(func() { env.SignalWorkflow(CaptureSignal, Capture{Amount: 40_000}) }, hr)
+			var calls int
+			var got any
+			var gotErr error
+			for _, id := range []string{"u1", "u2"} { // a retried request is a second update
+				env.RegisterDelayedCallback(func() {
+					env.UpdateWorkflow(AuthorizeUpdate, id, &testsuite.TestUpdateCallback{
+						OnReject:   func(err error) { t.Errorf("update rejected: %v", err) },
+						OnComplete: func(r any, err error) { calls++; got, gotErr = r, err },
+					})
+				}, tt.at)
+			}
+
+			env.ExecuteWorkflow(AuthorizeWorkflow, tt.req)
+
+			if calls != 2 {
+				t.Fatalf("update completed %d times, want 2", calls)
+			}
+			if (gotErr != nil) != tt.wantErr {
+				t.Fatalf("update err = %v, wantErr %v", gotErr, tt.wantErr)
+			}
+			if !tt.wantErr && got != tt.want {
+				t.Errorf("approved = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
 // A partner rate change after settlement must not change what a refund claws
 // back, or a full refund would leave the card with negative points.
 func TestRewardRateFixedAtSettlement(t *testing.T) {

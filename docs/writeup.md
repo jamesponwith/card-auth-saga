@@ -51,6 +51,8 @@ history:
 | Worker killed mid-hold | Stop the only worker, signal capture while nothing is running, start a fresh worker | Capture lands once; hold cleared; rewards accrued |
 | Duplicate signals | 3× the same capture, 3× the same refund ID | One capture, one refund, points 250 |
 | Activity times out after writing | The ledger commits each write, then stalls past a 1s activity timeout, so Temporal retries | Every step posts exactly once |
+| Update-with-Start, sent twice | The caller starts the auth and waits on the `authorize` update; a retry reuses the auth ID | `true` both times, one hold |
+| Update-with-Start, declined | An over-limit auth | `false`, then the workflow closes as declined |
 
 The recorded histories are committed under `testdata/`. On every commit, `TestReplayGoldenHistories`
 replays them against the current workflow code. As a check, I added one extra activity call at the start
@@ -71,8 +73,11 @@ Each safeguard was removed on purpose to confirm a test notices:
 | Rate fixed at settlement | `TestRewardRateFixedAtSettlement` |
 | Workflow determinism | golden history replay |
 
-Two of these experiments also removed code. Cancelling the hold timer after capture survived mutation,
-because a finished workflow cleans up its own timers, so it was deleted.
+Two experiments removed code instead. Cancelling the hold timer after capture survived mutation,
+because a finished workflow cleans up its own timers, so it was deleted. Likewise, waiting for all
+update handlers to finish before a decline closes the workflow: without it, the update still answered
+in the test environment and on a real server, because a waiting handler runs in the same workflow
+task that sets the decision. That wait was deleted too.
 
 ## How it was built
 
