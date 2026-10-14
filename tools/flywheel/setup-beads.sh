@@ -39,7 +39,13 @@ exclude=$(git rev-parse --git-path info/exclude)
 grep -qxF .beads.gate.lock "$exclude" 2>/dev/null || echo .beads.gate.lock >> "$exclude"
 
 # 3. The database is the durable copy (ADR 0011).
-bd dolt remote list 2>/dev/null | grep -q '^origin' || bd dolt remote add origin "$dolt_url" >/dev/null
+# `bd init` normally adds this remote; a clone whose database came from
+# somewhere else may lack it. bd >= 1.3 refuses a Dolt remote matching the git
+# origin unless told it's deliberate, and older bd doesn't know that flag.
+if ! bd dolt remote list 2>/dev/null | grep -q '^origin'; then
+  bd dolt remote add origin "$dolt_url" --allow-git-origin >/dev/null 2>&1 ||
+    bd dolt remote add origin "$dolt_url" >/dev/null
+fi
 bd dolt push >/dev/null
 git ls-remote --exit-code origin refs/dolt/data >/dev/null ||
   { echo "FAIL: bd dolt push did not create refs/dolt/data on origin" >&2; exit 1; }
