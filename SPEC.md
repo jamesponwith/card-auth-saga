@@ -103,6 +103,19 @@ One `StatementWorkflow` per card (workflow ID `statement:<card>`) closes a state
 - A `statement` query returns the current statement.
 - After each close, **ContinueAsNew** carries only the new statement forward, so history stays bounded.
 
+## Velocity check (M10)
+
+Card-testing fraud hits a card with many rapid small auths. `PlaceHold` records each auth attempt
+per card and declines one that makes **more than 5 attempts in 60 seconds**, before the limit check.
+Declined attempts count too.
+
+- Attempts are keyed by auth ID, and each is counted in the window ending at its *first* recorded
+  time. A retried `PlaceHold` therefore gets the same answer, even if more attempts arrived since.
+- No workflow code changes. The check happens inside an existing activity, so old histories replay
+  untouched.
+- A velocity decline is reported as a plain `declined`. Callers can't tell it apart from an
+  over-limit decline.
+
 ## Non-goals
 
 - Real card networks (ISO 8583), PCI scope, or real money.
@@ -121,6 +134,7 @@ One `StatementWorkflow` per card (workflow ID `statement:<card>`) closes a state
 - **M7**: Capture, reverse and refund as validated updates.
 - **M8**: Incremental auth and multiple captures.
 - **M9**: Monthly statement cycle (ContinueAsNew, query, late fee, interest).
+- **M10**: Velocity check (more than 5 auths in 60s declines).
 
 ## Success criteria
 

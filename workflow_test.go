@@ -313,6 +313,44 @@ func TestMoneyUpdates(t *testing.T) {
 	}
 }
 
+// More than VelocityMax attempts on a card within VelocityWindow declines,
+// even with plenty of limit left; older attempts don't count.
+func TestVelocityCheck(t *testing.T) {
+	tests := []struct {
+		name  string
+		prior int           // earlier attempts on card-1
+		age   time.Duration // how long ago they were
+		want  string
+	}{
+		{"under the cap", VelocityMax - 1, 0, StatusExpired},
+		{"over the cap declines", VelocityMax, 0, StatusDeclined},
+		{"old attempts age out", VelocityMax, VelocityWindow + time.Second, StatusExpired},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			l := NewMemLedger()
+			for i := range tt.prior {
+				if _, err := l.RecordAttempt(t.Context(), "card-1", fmt.Sprint("earlier-", i), time.Now().Add(-tt.age), VelocityWindow); err != nil {
+					t.Fatal(err)
+				}
+			}
+			var s testsuite.WorkflowTestSuite
+			env := s.NewTestWorkflowEnvironment()
+			env.RegisterActivity(&Activities{Ledger: l, Limits: map[string]int64{"card-1": 100_000}})
+
+			env.ExecuteWorkflow(AuthorizeWorkflow, auth("card-1", 100))
+
+			var res AuthResult
+			if err := env.GetWorkflowResult(&res); err != nil {
+				t.Fatal(err)
+			}
+			if res.Status != tt.want {
+				t.Errorf("status = %s, want %s", res.Status, tt.want)
+			}
+		})
+	}
+}
+
 // A partner rate change after settlement must not change what a refund claws
 // back, or a full refund would leave the card with negative points.
 func TestRewardRateFixedAtSettlement(t *testing.T) {

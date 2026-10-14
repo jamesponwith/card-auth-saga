@@ -171,3 +171,35 @@ func TestLedgerPostWithinConcurrent(t *testing.T) {
 		}
 	})
 }
+
+// Each attempt counts the card's attempts in the minute ending at its first
+// recorded time, so a retry gets the same count however many arrived since.
+func TestRecordAttempt(t *testing.T) {
+	forEachLedger(t, func(t *testing.T, l Ledger, n func(string) string) {
+		t0 := time.Unix(1_000_000, 0)
+		tests := []struct {
+			id   string
+			at   time.Duration
+			want int
+		}{
+			{"a", 0, 1},
+			{"b", 10 * time.Second, 2},
+			{"a", 20 * time.Second, 1}, // retry of a
+			{"c", 30 * time.Second, 3},
+			{"d", 70 * time.Second, 2}, // a and b have aged out
+			{"b", 90 * time.Second, 2}, // retry of b
+		}
+		for _, tt := range tests {
+			got, err := l.RecordAttempt(context.Background(), n("card"), tt.id, t0.Add(tt.at), time.Minute)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got != tt.want {
+				t.Errorf("attempt %s at %v: %d in the window, want %d", tt.id, tt.at, got, tt.want)
+			}
+		}
+		if got, _ := l.RecordAttempt(context.Background(), n("other-card"), "a", t0, time.Minute); got != 1 {
+			t.Errorf("another card's count = %d, want 1", got)
+		}
+	})
+}

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/go-sql-driver/mysql"
 )
@@ -27,6 +28,13 @@ var schema = []string{
 		account  VARCHAR(191) NOT NULL,
 		amount   BIGINT NOT NULL,
 		FOREIGN KEY (idem_key) REFERENCES postings (idem_key)
+	)`,
+	`CREATE TABLE IF NOT EXISTS attempts (
+		card    VARCHAR(191) NOT NULL,
+		auth_id VARCHAR(191) NOT NULL,
+		at_us   BIGINT NOT NULL, -- unix microseconds; no DATETIME/timezone parsing
+		PRIMARY KEY (card, auth_id),
+		INDEX (card, at_us)
 	)`,
 }
 
@@ -124,6 +132,17 @@ func (l *MySQLLedger) PostWithin(ctx context.Context, key string, capped []strin
 		}
 	}
 	return true, tx.Commit()
+}
+
+func (l *MySQLLedger) RecordAttempt(ctx context.Context, card, id string, at time.Time, window time.Duration) (int, error) {
+	if _, err := l.db.ExecContext(ctx, `INSERT IGNORE INTO attempts (card, auth_id, at_us) VALUES (?, ?, ?)`, card, id, at.UnixMicro()); err != nil {
+		return 0, err
+	}
+	var n int
+	err := l.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM attempts a JOIN attempts me ON a.card = me.card
+		WHERE me.card = ? AND me.auth_id = ? AND a.at_us <= me.at_us AND a.at_us > me.at_us - ?`,
+		card, id, window.Microseconds()).Scan(&n)
+	return n, err
 }
 
 func (l *MySQLLedger) Balance(ctx context.Context, account string) (int64, error) {
