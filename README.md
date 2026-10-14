@@ -41,8 +41,8 @@ temporal workflow update execute --workflow-id auth-1 --name refund --update-id 
   --input '{"ID":"r1","Amount":5000}'
 ```
 
-The first command answers `true` (approved) or `false` (declined) as soon as the hold is decided, and the
-workflow keeps running. Running it again on the same `--workflow-id`, as a network retry would, returns
+The first command answers `{"Approved":true}` as soon as the hold is decided, or `{"Approved":false,"Reason":…}`
+with `OverLimit`, `Velocity` or `UnknownCard`. The workflow keeps running. Running it again on the same `--workflow-id`, as a network retry would, returns
 the same answer without placing a second hold (SPEC.md, M6).
 
 `capture`, `reverse` and `refund` are updates: each returns once the ledger posts. A bad request is

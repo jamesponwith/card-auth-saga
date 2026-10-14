@@ -38,6 +38,20 @@ const (
 	StatusRefunded = "refunded" // fully refunded
 )
 
+// Decline reasons. Velocity and unknown-card declines are PlaceHold's
+// non-retryable error types; an over-limit decline is PlaceHold returning false.
+const (
+	DeclineOverLimit   = "OverLimit"
+	DeclineVelocity    = "Velocity"
+	DeclineUnknownCard = "UnknownCard"
+)
+
+// Decision is the authorize update's answer.
+type Decision struct {
+	Approved bool
+	Reason   string // a Decline* reason when not approved
+}
+
 type AuthRequest struct {
 	CardID       string
 	Amount       int64 // cents
@@ -68,9 +82,10 @@ type Refund struct {
 
 type AuthResult struct {
 	Status   string
-	Captured int64 // cents posted to the card
-	Refunded int64 // cents refunded after capture
-	Points   int64 // rewards points the card keeps after any clawback
+	Captured int64  // cents posted to the card
+	Refunded int64  // cents refunded after capture
+	Points   int64  // rewards points the card keeps after any clawback
+	Reason   string // a Decline* reason when declined
 }
 
 // Card accounts. A hold moves money from open-to-buy into holds; a capture
@@ -107,13 +122,19 @@ func AuthorizeWorkflow(ctx workflow.Context, req AuthRequest) (AuthResult, error
 	// deciding, so they answer before a decline or error closes the workflow.
 	var held bool
 	s.holdErr = workflow.ExecuteActivity(ctx, s.a.PlaceHold, req).Get(ctx, &held)
+	var declined *temporal.ApplicationError
+	if errors.As(s.holdErr, &declined) && (declined.Type() == DeclineVelocity || declined.Type() == DeclineUnknownCard) {
+		s.holdErr, s.reason = nil, declined.Type()
+	} else if s.holdErr == nil && !held {
+		s.reason = DeclineOverLimit
+	}
 	switch {
 	case s.holdErr != nil:
 		s.phase = phaseFailed
 		return AuthResult{}, s.holdErr
-	case !held:
+	case s.reason != "":
 		s.phase = StatusDeclined
-		return AuthResult{Status: StatusDeclined}, nil
+		return AuthResult{Status: StatusDeclined, Reason: s.reason}, nil
 	}
 	s.phase = phaseHolding
 
@@ -201,8 +222,9 @@ type authState struct {
 	req     AuthRequest
 	v       workflow.Version // DefaultVersion: single capture, no increments
 	phase   string
-	holdErr error // PlaceHold's error, for the authorize update
-	err     error // a capture, release or refund that could not post
+	holdErr error  // PlaceHold's error, for the authorize update
+	reason  string // a Decline* reason once declined
+	err     error  // a capture, release or refund that could not post
 
 	held       int64           // open hold: the auth plus increments, less partial captures
 	increments map[string]bool // increment IDs claimed
@@ -217,9 +239,9 @@ type authState struct {
 
 func (s *authState) registerUpdates(ctx workflow.Context) error {
 	return errors.Join(
-		workflow.SetUpdateHandler(ctx, AuthorizeUpdate, func(ctx workflow.Context) (bool, error) {
+		workflow.SetUpdateHandler(ctx, AuthorizeUpdate, func(ctx workflow.Context) (Decision, error) {
 			err := workflow.Await(ctx, func() bool { return s.phase != phaseDeciding })
-			return s.phase != StatusDeclined, cmp.Or(err, s.holdErr)
+			return Decision{Approved: s.phase != StatusDeclined, Reason: s.reason}, cmp.Or(err, s.holdErr)
 		}),
 		workflow.SetUpdateHandlerWithOptions(ctx, CaptureSignal, s.capture,
 			workflow.UpdateHandlerOptions{Validator: func(_ workflow.Context, c Capture) error { return s.checkCapture(c) }}),
@@ -407,16 +429,16 @@ func (a *Activities) PlaceHold(ctx context.Context, req AuthRequest) (bool, erro
 	if req.Amount <= 0 {
 		return false, temporal.NewNonRetryableApplicationError("amount must be positive", "InvalidAmount", nil)
 	}
+	if _, known := a.Limits[req.CardID]; !known {
+		return false, temporal.NewNonRetryableApplicationError("unknown card", DeclineUnknownCard, nil)
+	}
 	// Velocity first: card testing makes many small auths, each under the limit.
-	// ponytail: a velocity decline reads as a plain decline; return a reason
-	// when callers need to tell it from an over-limit one.
 	n, err := a.Ledger.RecordAttempt(ctx, req.CardID, activity.GetInfo(ctx).WorkflowExecution.ID, time.Now(), VelocityWindow)
 	if err != nil {
 		return false, err
 	}
 	if n > VelocityMax {
-		activity.GetLogger(ctx).Warn("velocity decline", "card", req.CardID, "attempts", n, "window", VelocityWindow)
-		return false, nil
+		return false, temporal.NewNonRetryableApplicationError(fmt.Sprintf("%d auths in %v", n, VelocityWindow), DeclineVelocity, nil)
 	}
 	return a.hold(ctx, "hold", req.CardID, req.Amount)
 }
