@@ -131,7 +131,7 @@ func AuthorizeWorkflow(ctx workflow.Context, req AuthRequest) (AuthResult, error
 	receive(ctx, RefundSignal, func(ctx workflow.Context, r *Refund) error { return s.refund(ctx, *r) })
 	// In-flight refunds finish even if the window closes under them.
 	if err := workflow.Await(ctx, func() bool {
-		return s.err != nil || s.inflight == 0 && (s.refundsClosed || s.refunded == s.captured)
+		return s.err != nil || s.reserved == s.refunded && (s.refundsClosed || s.refunded == s.captured)
 	}); err != nil {
 		return AuthResult{}, err
 	}
@@ -196,7 +196,6 @@ type authState struct {
 	seen           map[string]bool // refund IDs claimed
 	reserved       int64           // refunded plus refunds still posting
 	refunded       int64
-	inflight       int // refunds still posting
 }
 
 func (s *authState) registerUpdates(ctx workflow.Context) error {
@@ -266,10 +265,8 @@ func (s *authState) release(ctx workflow.Context, status string) error {
 
 func (s *authState) checkRefund(r Refund) error {
 	switch {
-	case s.phase != StatusCaptured:
-		return fmt.Errorf("nothing to refund: hold is %s", s.phase)
 	case !s.refundsOpen:
-		return errors.New("refunds open once settlement rewards post")
+		return fmt.Errorf("refunds not open: hold is %s, or settlement rewards still posting", s.phase)
 	case s.refundsClosed:
 		return errors.New("refund window closed")
 	case r.ID == "" || s.seen[r.ID]:
@@ -289,8 +286,6 @@ func (s *authState) refund(ctx workflow.Context, r Refund) error {
 	s.seen[r.ID] = true
 	left := s.captured - s.reserved
 	s.reserved += r.Amount
-	s.inflight++
-	defer func() { s.inflight-- }()
 	if err := workflow.ExecuteActivity(ctx, s.a.RefundCapture, s.req, r).Get(ctx, nil); err != nil {
 		s.err = err
 		return err
