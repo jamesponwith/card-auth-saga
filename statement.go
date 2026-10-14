@@ -54,10 +54,10 @@ func StatementWorkflow(ctx workflow.Context, terms StatementTerms, last Statemen
 	ctx = withLedger(ctx)
 	var a *Activities
 	closing := false
-	// ponytail: payment IDs dedupe per cycle. The ledger key ("pay:"+ID) stops a
-	// resend in a later cycle from posting twice, but it would still count toward
-	// that cycle's Paid; carry IDs forward or have Post report duplicates if so.
-	seen := map[string]bool{}
+	seen := map[string]bool{} // payment IDs this cycle, to reject a reuse up front
+	// Runs started before payments credited a per-statement paid account
+	// replay on PostToCard and count Paid themselves.
+	v := workflow.GetVersion(ctx, "paid-from-ledger", workflow.DefaultVersion, 1)
 
 	if err := workflow.SetQueryHandler(ctx, StatementQuery, func() (Statement, error) { return last, nil }); err != nil {
 		return err
@@ -65,10 +65,18 @@ func StatementWorkflow(ctx workflow.Context, terms StatementTerms, last Statemen
 	if err := workflow.SetUpdateHandlerWithOptions(ctx, PayUpdate,
 		func(ctx workflow.Context, p Payment) error {
 			seen[p.ID] = true
-			if err := workflow.ExecuteActivity(withLedger(ctx), a.PostToCard, terms.CardID, "pay:"+p.ID, -p.Amount).Get(ctx, nil); err != nil {
+			if v == workflow.DefaultVersion {
+				if err := workflow.ExecuteActivity(withLedger(ctx), a.PostToCard, terms.CardID, "pay:"+p.ID, -p.Amount).Get(ctx, nil); err != nil {
+					return err
+				}
+				last.Paid += p.Amount
+				return nil
+			}
+			var paid int64
+			if err := workflow.ExecuteActivity(withLedger(ctx), a.Pay, terms.CardID, last.N, p).Get(ctx, &paid); err != nil {
 				return err
 			}
-			last.Paid += p.Amount
+			last.Paid = max(last.Paid, paid) // concurrent payments can finish out of order
 			return nil
 		},
 		workflow.UpdateHandlerOptions{Validator: func(_ workflow.Context, p Payment) error {
@@ -131,6 +139,23 @@ func (a *Activities) PostToCard(ctx context.Context, card, step string, amount i
 		Entry{postedAccount(card), amount},
 		Entry{openToBuyAccount(card), -amount},
 	)
+}
+
+// Pay posts a payment against statement n and returns what n has been paid
+// so far. The posting is keyed by the payment ID alone and also credits n's
+// paid account, so a resend in any later cycle posts nothing and leaves that
+// cycle's paid total alone.
+func (a *Activities) Pay(ctx context.Context, card string, n int, p Payment) (int64, error) {
+	paid := fmt.Sprintf("card:%s:paid:s%d", card, n)
+	if err := a.Ledger.Post(ctx, stepKey(ctx, "pay:"+p.ID),
+		Entry{postedAccount(card), -p.Amount},
+		Entry{openToBuyAccount(card), p.Amount},
+		Entry{paid, p.Amount},                          // memo: what statement n has been paid,
+		Entry{"card:" + card + ":payments", -p.Amount}, // balanced by all payments made
+	); err != nil {
+		return 0, err
+	}
+	return a.Ledger.Balance(ctx, paid)
 }
 
 // PostedBalance is the card's posted balance, which a statement closes on.

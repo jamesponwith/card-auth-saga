@@ -209,7 +209,7 @@ func TestDrills(t *testing.T) {
 		if d.authorize(AuthRequest{Amount: 100_001}) {
 			t.Fatal("want declined")
 		}
-		d.expect(d.c.GetWorkflow(context.Background(), d.card, ""), AuthResult{Status: StatusDeclined})
+		d.expect(d.c.GetWorkflow(context.Background(), d.card, ""), AuthResult{Status: StatusDeclined, Reason: DeclineOverLimit})
 		d.expectBalances(0, 0, 0)
 	})
 }
@@ -283,11 +283,11 @@ func (d *drill) authorize(req AuthRequest) bool {
 	if err != nil {
 		d.t.Fatal(err)
 	}
-	var approved bool
-	if err := h.Get(ctx, &approved); err != nil {
+	var dec Decision
+	if err := h.Get(ctx, &dec); err != nil {
 		d.t.Fatal(err)
 	}
-	return approved
+	return dec.Approved
 }
 
 // update sends an update to the drill's workflow and waits for it to finish.

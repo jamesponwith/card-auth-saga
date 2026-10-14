@@ -44,7 +44,7 @@ Limit check: `holds + posted + amount ≤ limit`, evaluated in the same transact
 
 A network needs approve/decline in ~100ms, but the workflow's result arrives days later. The caller
 sends an `authorize` Update with **Update-with-Start** (conflict policy `USE_EXISTING`, workflow ID =
-auth ID). The update returns `true`/`false` as soon as the hold is placed or declined; the workflow
+auth ID). The update returns a `Decision` (`Approved`, plus a decline `Reason`) as soon as the hold is placed or declined; the workflow
 carries on with the hold.
 
 - A retried request with the same auth ID attaches to the running workflow and gets the same answer.
@@ -98,7 +98,10 @@ One `StatementWorkflow` per card (workflow ID `statement:<card>`) closes a state
 - **Interest:** charged at the next close on the part of the statement still unpaid, at APR/12
   (default 24.99%). A statement paid in full by its next close accrues no interest, which is the
   grace period.
-- **Payments:** a `pay` update (`{ID, Amount}`). Each ID posts once in the ledger. While the statement
+- **Payments:** a `pay` update (`{ID, Amount}`). Each ID posts once in the ledger, ever. The posting
+  also credits a memo account for that statement (`card:<id>:paid:s<N>`, balanced by
+  `card:<id>:payments`), and the statement's paid total is read back from it. So a payment resent in a
+  later cycle posts nothing and counts for nothing. While the statement
   is closing, `pay` is rejected so the caller retries against the next cycle.
 - A `statement` query returns the current statement.
 - After each close, **ContinueAsNew** carries only the new statement forward, so history stays bounded.
@@ -113,8 +116,10 @@ Declined attempts count too.
   time. A retried `PlaceHold` therefore gets the same answer, even if more attempts arrived since.
 - No workflow code changes. The check happens inside an existing activity, so old histories replay
   untouched.
-- A velocity decline is reported as a plain `declined`. Callers can't tell it apart from an
-  over-limit decline.
+- Every decline carries a reason, in both the authorize `Decision` and `AuthResult.Reason`:
+  `Velocity`, `OverLimit` or `UnknownCard`. `PlaceHold` reports velocity and unknown-card declines as
+  non-retryable typed errors, and an over-limit decline as `false`. Old histories only hold
+  `true`/`false` results, so they replay unchanged.
 
 ## Non-goals
 

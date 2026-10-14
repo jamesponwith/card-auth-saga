@@ -102,6 +102,8 @@ Each safeguard was removed on purpose to confirm a test notices:
 | A partial capture leaves the rest of the hold open | *split shipment*, *partials can't exceed the hold* |
 | Release takes only what's still held | *expiry/reverse after a partial releases the rest* |
 | Payments still posting finish before the statement closes | *in-flight payment*: interest charged on $500, not $490 |
+| A statement's paid total comes from the ledger | `TestStatementPaymentResentNextCycle`: a payment resent in the next cycle waives its late fee |
+| Old statement runs keep counting Paid themselves (`GetVersion`) | the pre-change statement recording fails to replay (`TMPRL1100`) |
 | Payments arriving mid-close are rejected | *mid-close payment* accepted while interest posts |
 | Velocity: more than 5 attempts in 60s declines | `TestVelocityCheck`: the 6th attempt is approved |
 | A retried attempt counts from its first recorded time | `TestRecordAttempt`: a retry sees the attempts that arrived since |

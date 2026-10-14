@@ -144,13 +144,14 @@ func TestAuthorizeUpdate(t *testing.T) {
 		name    string
 		req     AuthRequest
 		at      time.Duration // when the update arrives
-		want    bool
+		want    Decision
 		wantErr bool
 	}{
-		{"approved", auth("card-1", 40_000), 0, true, false},
-		{"over limit declined", auth("card-1", 100_001), 0, false, false},
-		{"non-positive amount errors", auth("card-1", 0), 0, false, true},
-		{"late update after capture", auth("card-1", 40_000), 2 * hr, true, false},
+		{"approved", auth("card-1", 40_000), 0, Decision{Approved: true}, false},
+		{"over limit declined", auth("card-1", 100_001), 0, Decision{Reason: DeclineOverLimit}, false},
+		{"unknown card declined", auth("card-x", 100), 0, Decision{Reason: DeclineUnknownCard}, false},
+		{"non-positive amount errors", auth("card-1", 0), 0, Decision{}, true},
+		{"late update after capture", auth("card-1", 40_000), 2 * hr, Decision{Approved: true}, false},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -179,7 +180,7 @@ func TestAuthorizeUpdate(t *testing.T) {
 				t.Fatalf("update err = %v, wantErr %v", gotErr, tt.wantErr)
 			}
 			if !tt.wantErr && got != tt.want {
-				t.Errorf("approved = %v, want %v", got, tt.want)
+				t.Errorf("decision = %v, want %v", got, tt.want)
 			}
 		})
 	}
@@ -320,11 +321,11 @@ func TestVelocityCheck(t *testing.T) {
 		name  string
 		prior int           // earlier attempts on card-1
 		age   time.Duration // how long ago they were
-		want  string
+		want  AuthResult
 	}{
-		{"under the cap", VelocityMax - 1, 0, StatusExpired},
-		{"over the cap declines", VelocityMax, 0, StatusDeclined},
-		{"old attempts age out", VelocityMax, VelocityWindow + time.Second, StatusExpired},
+		{"under the cap", VelocityMax - 1, 0, AuthResult{Status: StatusExpired}},
+		{"over the cap declines", VelocityMax, 0, AuthResult{Status: StatusDeclined, Reason: DeclineVelocity}},
+		{"old attempts age out", VelocityMax, VelocityWindow + time.Second, AuthResult{Status: StatusExpired}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -344,8 +345,8 @@ func TestVelocityCheck(t *testing.T) {
 			if err := env.GetWorkflowResult(&res); err != nil {
 				t.Fatal(err)
 			}
-			if res.Status != tt.want {
-				t.Errorf("status = %s, want %s", res.Status, tt.want)
+			if res != tt.want {
+				t.Errorf("result = %+v, want %+v", res, tt.want)
 			}
 		})
 	}
