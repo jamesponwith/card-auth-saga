@@ -61,6 +61,9 @@ Points accrue on the captured total at the merchant's partner rate at settlement
 Before capture, `--name reverse` voids the hold; with no signal it expires after 7 days
 (`"HoldFor"`/`"RefundWindow"` in nanoseconds shorten either).
 
+A card that attempts more than 5 auths in 60 seconds is declined regardless of its limit. This
+catches card testing, and it covers declined attempts too (SPEC.md, M10).
+
 Run a card's monthly statement (SPEC.md, M9). `Cycle`/`Grace` are in nanoseconds; leave them out for
 30 and 25 days:
 

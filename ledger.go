@@ -5,6 +5,7 @@ import (
 	"errors"
 	"slices"
 	"sync"
+	"time"
 )
 
 // Entry is one leg of a double-entry posting, in cents. Debits are positive,
@@ -26,6 +27,10 @@ type Ledger interface {
 	// It reports whether the posting is in the ledger (true for a replayed key).
 	PostWithin(ctx context.Context, key string, capped []string, limit int64, entries ...Entry) (bool, error)
 	Balance(ctx context.Context, account string) (int64, error)
+	// RecordAttempt notes auth attempt id on card at `at`, once per id, and
+	// counts the card's attempts in the window ending at this attempt's first
+	// recorded time, this one included. A retry gets the same count.
+	RecordAttempt(ctx context.Context, card, id string, at time.Time, window time.Duration) (int, error)
 }
 
 func balanced(entries []Entry) bool {
@@ -66,11 +71,32 @@ func within(balances map[string]int64, capped []string, limit int64, entries []E
 type MemLedger struct {
 	mu       sync.Mutex
 	balances map[string]int64
-	posted   map[string]bool // idempotency keys already applied
+	posted   map[string]bool                 // idempotency keys already applied
+	attempts map[string]map[string]time.Time // card → auth ID → first seen
 }
 
 func NewMemLedger() *MemLedger {
-	return &MemLedger{balances: map[string]int64{}, posted: map[string]bool{}}
+	return &MemLedger{balances: map[string]int64{}, posted: map[string]bool{}, attempts: map[string]map[string]time.Time{}}
+}
+
+func (l *MemLedger) RecordAttempt(_ context.Context, card, id string, at time.Time, window time.Duration) (int, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.attempts[card] == nil {
+		l.attempts[card] = map[string]time.Time{}
+	}
+	if first, ok := l.attempts[card][id]; ok {
+		at = first
+	} else {
+		l.attempts[card][id] = at
+	}
+	n := 0
+	for _, t := range l.attempts[card] {
+		if t.After(at.Add(-window)) && !t.After(at) {
+			n++
+		}
+	}
+	return n, nil
 }
 
 func (l *MemLedger) Post(ctx context.Context, key string, entries ...Entry) error {

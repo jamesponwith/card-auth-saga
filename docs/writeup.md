@@ -103,6 +103,8 @@ Each safeguard was removed on purpose to confirm a test notices:
 | Release takes only what's still held | *expiry/reverse after a partial releases the rest* |
 | Payments still posting finish before the statement closes | *in-flight payment*: interest charged on $500, not $490 |
 | Payments arriving mid-close are rejected | *mid-close payment* accepted while interest posts |
+| Velocity: more than 5 attempts in 60s declines | `TestVelocityCheck`: the 6th attempt is approved |
+| A retried attempt counts from its first recorded time | `TestRecordAttempt`: a retry sees the attempts that arrived since |
 | An increment claims the hold | *capture during increment rejected*: otherwise a final capture strands the increment |
 
 Two experiments removed code instead. Cancelling the hold timer after capture survived mutation,

@@ -22,6 +22,8 @@ const (
 	DefaultHoldFor      = 7 * 24 * time.Hour  // how long an uncaptured hold lives
 	DefaultRefundWindow = 30 * 24 * time.Hour // how long after capture refunds are accepted
 	DefaultRewardRate   = 1                   // points per $1 when the merchant has no partner rate
+	VelocityMax         = 5                   // auths a card may attempt per VelocityWindow
+	VelocityWindow      = time.Minute
 )
 
 // activityTimeout bounds one activity attempt. A var so the timeout drill can shrink it.
@@ -404,6 +406,17 @@ func stepKey(ctx context.Context, step string) string {
 func (a *Activities) PlaceHold(ctx context.Context, req AuthRequest) (bool, error) {
 	if req.Amount <= 0 {
 		return false, temporal.NewNonRetryableApplicationError("amount must be positive", "InvalidAmount", nil)
+	}
+	// Velocity first: card testing makes many small auths, each under the limit.
+	// ponytail: a velocity decline reads as a plain decline; return a reason
+	// when callers need to tell it from an over-limit one.
+	n, err := a.Ledger.RecordAttempt(ctx, req.CardID, activity.GetInfo(ctx).WorkflowExecution.ID, time.Now(), VelocityWindow)
+	if err != nil {
+		return false, err
+	}
+	if n > VelocityMax {
+		activity.GetLogger(ctx).Warn("velocity decline", "card", req.CardID, "attempts", n, "window", VelocityWindow)
+		return false, nil
 	}
 	return a.hold(ctx, "hold", req.CardID, req.Amount)
 }
