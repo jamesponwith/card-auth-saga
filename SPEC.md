@@ -98,7 +98,10 @@ One `StatementWorkflow` per card (workflow ID `statement:<card>`) closes a state
 - **Interest:** charged at the next close on the part of the statement still unpaid, at APR/12
   (default 24.99%). A statement paid in full by its next close accrues no interest, which is the
   grace period.
-- **Payments:** a `pay` update (`{ID, Amount}`). Each ID posts once in the ledger. While the statement
+- **Payments:** a `pay` update (`{ID, Amount}`). Each ID posts once in the ledger, ever. The posting
+  also credits a memo account for that statement (`card:<id>:paid:s<N>`, balanced by
+  `card:<id>:payments`), and the statement's paid total is read back from it. So a payment resent in a
+  later cycle posts nothing and counts for nothing. While the statement
   is closing, `pay` is rejected so the caller retries against the next cycle.
 - A `statement` query returns the current statement.
 - After each close, **ContinueAsNew** carries only the new statement forward, so history stays bounded.

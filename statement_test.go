@@ -100,6 +100,38 @@ func TestStatementCloseWithPaymentsInFlight(t *testing.T) {
 	}
 }
 
+// A payment resent in a later cycle posts nothing and doesn't count toward
+// that cycle's minimum, so the late fee still lands.
+func TestStatementPaymentResentNextCycle(t *testing.T) {
+	l := NewMemLedger()
+	if err := l.Post(t.Context(), "seed", Entry{postedAccount("card-1"), 50_000}, Entry{openToBuyAccount("card-1"), -50_000}); err != nil {
+		t.Fatal(err)
+	}
+	cycle := func(last Statement, steps []step) Statement {
+		var s testsuite.WorkflowTestSuite
+		env := s.NewTestWorkflowEnvironment() // same workflow ID every run, as after ContinueAsNew
+		env.RegisterActivity(&Activities{Ledger: l})
+		got := sendSteps(env, steps)
+		env.ExecuteWorkflow(StatementWorkflow, StatementTerms{CardID: "card-1"}, last)
+		checkSteps(t, steps, got)
+		_, next := continuedAs(t, env)
+		return next
+	}
+	s2 := cycle(Statement{N: 1, Balance: 50_000, MinDue: 2_500}, []step{upd(pay(10*day, "p1", 2_500), "ok")})
+	s3 := cycle(s2, []step{upd(pay(10*day, "p1", 2_500), "ok")}) // the resend
+
+	// 48,489 + 25.00 fee + 48,489 × 24.99% / 12 = 1,009 interest
+	if want := (Statement{N: 3, Balance: 51_998, MinDue: 2_500, Fees: 2_500, Interest: 1_009}); s3 != want {
+		t.Errorf("statement 3 = %+v, want %+v", s3, want)
+	}
+	if got := balance(t, l, postedAccount("card-1")); got != s3.Balance {
+		t.Errorf("posted = %d, want %d", got, s3.Balance)
+	}
+	if got := l.Total(); got != 0 {
+		t.Errorf("ledger Total = %d, want 0", got)
+	}
+}
+
 // The statement query shows payments as they land.
 func TestStatementQuery(t *testing.T) {
 	var s testsuite.WorkflowTestSuite
