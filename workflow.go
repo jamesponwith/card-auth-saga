@@ -449,12 +449,9 @@ func (a *Activities) IncreaseHold(ctx context.Context, req AuthRequest, i Increm
 }
 
 func (a *Activities) hold(ctx context.Context, step, card string, amount int64) (bool, error) {
-	limit, known := a.Limits[card]
-	if !known {
-		return false, nil
-	}
+	// An unknown card has limit 0, so PostWithin declines it.
 	return a.Ledger.PostWithin(ctx, stepKey(ctx, step),
-		[]string{holdsAccount(card), postedAccount(card)}, limit,
+		[]string{holdsAccount(card), postedAccount(card)}, a.Limits[card],
 		Entry{holdsAccount(card), amount},
 		Entry{openToBuyAccount(card), -amount},
 	)
