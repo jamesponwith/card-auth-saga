@@ -48,6 +48,22 @@ carries on with the hold.
 - If `PlaceHold` fails (bad amount), the update returns that error rather than hanging.
 - The update has no arguments and no side effects, so old histories without it still replay.
 
+## Capture, reverse, refund as updates (M7)
+
+Signals are fire-and-forget: a bad capture or an over-refund is logged and dropped, and the merchant
+never finds out. `capture`, `reverse` and `refund` are also Updates (same names as the signals):
+
+- **Validators** reject a request before it is written to history: wrong phase (capture after
+  release, refund before capture or after the window), bad amount, a refund ID already used, or a
+  refund over what is left.
+- The update **returns once the ledger has posted**, or with the error that stopped it.
+- A network retry reuses the same **update ID**, so Temporal returns the first result instead of
+  running the update again. A new update ID with a used refund ID is rejected.
+- Concurrent requests can't double-capture or over-refund. A capture or release claims the hold
+  before its first activity, and a refund reserves its amount before it posts.
+- Signals keep working as before, so workflows already running on old code and the golden
+  histories still replay.
+
 ## Non-goals
 
 - Real card networks (ISO 8583), PCI scope, or real money.
@@ -63,6 +79,7 @@ carries on with the hold.
 - **M4**: Rewards accrual and refund clawback.
 - **M5**: Failure drills + writeup (README demo, blog post) → resume Open Source line.
 - **M6**: Synchronous approve/decline via Update-with-Start.
+- **M7**: Capture, reverse and refund as validated updates.
 
 ## Success criteria
 

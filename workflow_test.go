@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"testing"
 	"time"
 
@@ -170,6 +171,104 @@ func TestAuthorizeUpdate(t *testing.T) {
 			}
 			if !tt.wantErr && got != tt.want {
 				t.Errorf("approved = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+// step is a signal or an update sent at `at`; want is the update's outcome
+// ("ok", "rejected" by its validator, or "error"), empty for a signal.
+type step struct {
+	signal
+	want string
+}
+
+func upd(s signal, want string) step { return step{s, want} }
+func sig(s signal) step              { return step{s, ""} }
+
+// Updates tell the caller what happened to the money; validators reject bad
+// requests before they reach history, and concurrent requests can't overspend.
+func TestMoneyUpdates(t *testing.T) {
+	tests := []struct {
+		name         string
+		steps        []step
+		want         string
+		wantRefunded int64
+		wantPosted   int64
+		wantPoints   int64
+	}{
+		{"capture", []step{upd(capture(hr, 25_000), "ok")}, StatusCaptured, 0, 25_000, 250},
+		{"bad capture amount rejected", []step{upd(capture(hr, 50_000), "rejected"), upd(capture(hr, 0), "rejected"), upd(capture(hr, 30_000), "ok")}, StatusCaptured, 0, 30_000, 300},
+		{"second capture rejected", []step{upd(capture(hr, 40_000), "ok"), upd(capture(2*hr, 40_000), "rejected")}, StatusCaptured, 0, 40_000, 400},
+		{"concurrent captures post once", []step{upd(capture(hr, 40_000), "ok"), upd(capture(hr, 30_000), "rejected")}, StatusCaptured, 0, 40_000, 400},
+		{"capture signal during capture update ignored", []step{upd(capture(hr, 40_000), "ok"), sig(capture(hr, 30_000))}, StatusCaptured, 0, 40_000, 400},
+		{"capture during reverse rejected", []step{upd(reverse(hr), "ok"), upd(capture(hr, 40_000), "rejected")}, StatusReversed, 0, 0, 0},
+		{"reverse after capture rejected", []step{upd(capture(hr, 40_000), "ok"), upd(reverse(2*hr), "rejected")}, StatusCaptured, 0, 40_000, 400},
+		{"refund before capture rejected", []step{upd(refund(hr, "r1", 100), "rejected"), upd(capture(2*hr, 40_000), "ok")}, StatusCaptured, 0, 40_000, 400},
+		{"refund", []step{upd(capture(hr, 40_000), "ok"), upd(refund(2*hr, "r1", 15_000), "ok")}, StatusCaptured, 15_000, 25_000, 250},
+		{"over-refund rejected", []step{upd(capture(hr, 25_000), "ok"), upd(refund(2*hr, "r1", 30_000), "rejected")}, StatusCaptured, 0, 25_000, 250},
+		{"used refund ID rejected", []step{upd(capture(hr, 40_000), "ok"), upd(refund(2*hr, "r1", 15_000), "ok"), upd(refund(3*hr, "r1", 15_000), "rejected")}, StatusCaptured, 15_000, 25_000, 250},
+		{"concurrent refunds can't over-refund", []step{upd(capture(hr, 40_000), "ok"), upd(refund(2*hr, "r1", 30_000), "ok"), upd(refund(2*hr, "r2", 20_000), "rejected")}, StatusCaptured, 30_000, 10_000, 100},
+		{"concurrent refunds to zero", []step{upd(capture(hr, 200), "ok"), upd(refund(2*hr, "r1", 150), "ok"), upd(refund(2*hr, "r2", 50), "ok")}, StatusRefunded, 200, 0, 0},
+		{"refund signal and update share IDs", []step{upd(capture(hr, 40_000), "ok"), sig(refund(2*hr, "r1", 15_000)), upd(refund(3*hr, "r1", 15_000), "rejected")}, StatusCaptured, 15_000, 25_000, 250},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var s testsuite.WorkflowTestSuite
+			env := s.NewTestWorkflowEnvironment()
+			l := NewMemLedger()
+			env.RegisterActivity(&Activities{Ledger: l, Limits: map[string]int64{"card-1": 100_000}})
+			got := make([]string, len(tt.steps))
+			for i, st := range tt.steps {
+				env.RegisterDelayedCallback(func() {
+					if st.want == "" {
+						env.SignalWorkflow(st.name, st.payload)
+						return
+					}
+					var args []any
+					if st.payload != nil {
+						args = append(args, st.payload)
+					}
+					env.UpdateWorkflow(st.name, fmt.Sprint(i), &testsuite.TestUpdateCallback{
+						OnReject: func(error) { got[i] = "rejected" },
+						OnComplete: func(_ any, err error) {
+							got[i] = "ok"
+							if err != nil {
+								got[i] = "error"
+							}
+						},
+					}, args...)
+				}, st.at)
+			}
+
+			env.ExecuteWorkflow(AuthorizeWorkflow, auth("card-1", 40_000))
+
+			if err := env.GetWorkflowError(); err != nil {
+				t.Fatal(err)
+			}
+			for i, st := range tt.steps {
+				if got[i] != st.want {
+					t.Errorf("step %d (%s): %q, want %q", i, st.name, got[i], st.want)
+				}
+			}
+			var res AuthResult
+			if err := env.GetWorkflowResult(&res); err != nil {
+				t.Fatal(err)
+			}
+			if res.Status != tt.want || res.Refunded != tt.wantRefunded || res.Points != tt.wantPoints {
+				t.Errorf("result = %+v, want %s refunded %d points %d", res, tt.want, tt.wantRefunded, tt.wantPoints)
+			}
+			if got := balance(t, l, postedAccount("card-1")); got != tt.wantPosted {
+				t.Errorf("posted = %d, want %d", got, tt.wantPosted)
+			}
+			if got := balance(t, l, holdsAccount("card-1")); got != 0 {
+				t.Errorf("holds = %d, want 0", got)
+			}
+			if got := balance(t, l, pointsAccount("card-1")); got != tt.wantPoints {
+				t.Errorf("points account = %d, want %d", got, tt.wantPoints)
+			}
+			if got := l.Total(); got != 0 {
+				t.Errorf("ledger Total = %d, want 0", got)
 			}
 		})
 	}

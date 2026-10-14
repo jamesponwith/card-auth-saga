@@ -40,6 +40,15 @@ and wait on the other. Account rows are now created before the transaction start
 as points(remaining before) − points(remaining after), using the rate fixed at settlement, so a full refund
 always lands on exactly zero, even if the partner changes its rate in between.
 
+**Check-then-act, again, inside the workflow.** With signals, one loop handled one request at a time.
+Updates run as concurrent handlers. Workflow code is single-threaded, but every activity is a yield
+point, so a second capture could pass its validator while the first was still posting. Each step
+now claims its share before its first activity: a capture or release marks the hold busy, and a
+refund reserves its amount and ID. Updates also exposed two timing gaps that a single signal loop
+could never hit: a refund arriving before settlement rewards had posted, and the refund window
+closing mid-refund. The test environment can't produce either, since activities there take no
+time, so a drill with a slow ledger forces both.
+
 ## Failure drills
 
 These run the real worker against a real Temporal dev server (the SDK downloads and starts it), on the
@@ -53,6 +62,7 @@ history:
 | Activity times out after writing | The ledger commits each write, then stalls past a 1s activity timeout, so Temporal retries | Every step posts exactly once |
 | Update-with-Start, sent twice | The caller starts the auth and waits on the `authorize` update; a retry reuses the auth ID | `true` both times, one hold |
 | Update-with-Start, declined | An over-limit auth | `false`, then the workflow closes as declined |
+| Updates mid-step | Every write stalls 1.5s; a refund update is sent the moment its capture returns, twice with one update ID, and the 1s window closes while it posts | One refund; points clawed back; a new update ID for the same refund is rejected |
 
 The recorded histories are committed under `testdata/`. On every commit, `TestReplayGoldenHistories`
 replays them against the current workflow code. As a check, I added one extra activity call at the start
@@ -72,6 +82,10 @@ Each safeguard was removed on purpose to confirm a test notices:
 | Remaining-spend clawback | *odd refunds claw back every point* |
 | Rate fixed at settlement | `TestRewardRateFixedAtSettlement` |
 | Workflow determinism | golden history replay |
+| Capture/release claims the hold before posting | *concurrent captures post once*, *capture during reverse rejected* |
+| Refunds reserve their amount before posting | *concurrent refunds can't over-refund* |
+| Workflow waits for in-flight refunds | mid-step drill: the refund posts, its points are never clawed back |
+| Capture returns only after settlement rewards | mid-step drill: the refund is rejected as too early |
 
 Two experiments removed code instead. Cancelling the hold timer after capture survived mutation,
 because a finished workflow cleans up its own timers, so it was deleted. Likewise, waiting for all

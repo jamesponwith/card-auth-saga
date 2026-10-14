@@ -3,6 +3,8 @@ package main
 import (
 	"cmp"
 	"context"
+	"errors"
+	"fmt"
 	"time"
 
 	"go.temporal.io/sdk/activity"
@@ -77,135 +79,226 @@ func pointsFor(cents, rate int64) int64 { return cents * rate / 100 }
 // AuthorizeWorkflow places a hold if the card's limit allows it, then waits for
 // a capture, a reversal, or expiry. After a capture it accepts refunds until
 // the refund window closes or the capture is fully refunded.
+//
+// Capture, reverse and refund arrive as signals or as updates (same names).
+// Both routes run the same steps; an update's validator rejects a bad request
+// before it reaches history, and the update returns once the ledger posts.
 func AuthorizeWorkflow(ctx workflow.Context, req AuthRequest) (AuthResult, error) {
-	ctx = workflow.WithActivityOptions(ctx, workflow.ActivityOptions{
-		StartToCloseTimeout: activityTimeout,
-		// Bounded so a ledger that keeps failing surfaces here, where the saga
-		// can compensate, instead of retrying forever.
-		RetryPolicy: &temporal.RetryPolicy{MaximumAttempts: 5},
-	})
-	var a *Activities
-
-	// The caller learns the decision from the authorize update without waiting
-	// days for the result. Repeated or late updates get the same answer.
-	var decided, held bool
-	var holdErr error
-	if err := workflow.SetUpdateHandler(ctx, AuthorizeUpdate, func(ctx workflow.Context) (bool, error) {
-		err := workflow.Await(ctx, func() bool { return decided })
-		return held, cmp.Or(err, holdErr)
-	}); err != nil {
+	ctx = withLedger(ctx)
+	s := &authState{req: req, phase: phaseDeciding, seen: map[string]bool{}}
+	if err := s.registerUpdates(ctx); err != nil {
 		return AuthResult{}, err
 	}
 
-	// Waiting updates run in the same workflow task that sets decided, so they
-	// answer before a decline or error closes the workflow.
-	holdErr = workflow.ExecuteActivity(ctx, a.PlaceHold, req).Get(ctx, &held)
-	decided = true
-	if holdErr != nil {
-		return AuthResult{}, holdErr
-	}
-	if !held {
+	// Waiting authorize updates run in the same workflow task that ends
+	// deciding, so they answer before a decline or error closes the workflow.
+	var held bool
+	s.holdErr = workflow.ExecuteActivity(ctx, s.a.PlaceHold, req).Get(ctx, &held)
+	switch {
+	case s.holdErr != nil:
+		s.phase = phaseFailed
+		return AuthResult{}, s.holdErr
+	case !held:
+		s.phase = StatusDeclined
 		return AuthResult{Status: StatusDeclined}, nil
 	}
+	s.phase = phaseHolding
 
-	captured, status, err := awaitCapture(ctx, a, req)
-	if err != nil || captured == 0 {
-		return AuthResult{Status: status}, err
+	expiry := workflow.NewTimer(ctx, cmp.Or(req.HoldFor, DefaultHoldFor))
+	workflow.Go(ctx, func(ctx workflow.Context) { _ = expiry.Get(ctx, nil); _ = s.release(ctx, StatusExpired) })
+	receive(ctx, ReverseSignal, func(ctx workflow.Context, _ *struct{}) error { return s.release(ctx, StatusReversed) })
+	receive(ctx, CaptureSignal, func(ctx workflow.Context, c *Capture) error { return s.capture(ctx, *c) })
+	if err := workflow.Await(ctx, func() bool { return s.phase != phaseHolding && s.phase != phaseBusy }); err != nil {
+		return AuthResult{}, err
+	}
+	if s.err != nil || s.phase != StatusCaptured {
+		return AuthResult{Status: s.phase}, s.err
 	}
 
 	// Rewards never undo money movement, so their activities retry until the
 	// ledger takes them. The rate is fixed at settlement and reused for refunds.
 	rctx := workflow.WithRetryPolicy(ctx, temporal.RetryPolicy{})
-	var rate int64
-	if err := workflow.ExecuteActivity(rctx, a.RewardRate, req.Merchant).Get(ctx, &rate); err != nil {
+	if err := workflow.ExecuteActivity(rctx, s.a.RewardRate, req.Merchant).Get(ctx, &s.rate); err != nil {
 		return AuthResult{}, err
 	}
-	if err := workflow.ExecuteActivity(rctx, a.AdjustRewards, req, PointsChange{"rewards", rate, 0, captured}).Get(ctx, nil); err != nil {
+	if err := workflow.ExecuteActivity(rctx, s.a.AdjustRewards, req, PointsChange{"rewards", s.rate, 0, s.captured}).Get(ctx, nil); err != nil {
 		return AuthResult{}, err
 	}
 
-	refunded, err := acceptRefunds(ctx, rctx, a, req, captured, rate)
-	if err != nil {
+	window := workflow.NewTimer(ctx, cmp.Or(req.RefundWindow, DefaultRefundWindow))
+	s.refundsOpen = true
+	workflow.Go(ctx, func(ctx workflow.Context) { _ = window.Get(ctx, nil); s.refundsClosed = true })
+	receive(ctx, RefundSignal, func(ctx workflow.Context, r *Refund) error { return s.refund(ctx, *r) })
+	// In-flight refunds finish even if the window closes under them.
+	if err := workflow.Await(ctx, func() bool {
+		return s.err != nil || s.reserved == s.refunded && (s.refundsClosed || s.refunded == s.captured)
+	}); err != nil {
 		return AuthResult{}, err
 	}
-	res := AuthResult{Status: StatusCaptured, Captured: captured, Refunded: refunded, Points: pointsFor(captured-refunded, rate)}
-	if refunded == captured {
+	if s.err != nil {
+		return AuthResult{}, s.err
+	}
+	res := AuthResult{Status: StatusCaptured, Captured: s.captured, Refunded: s.refunded, Points: pointsFor(s.captured-s.refunded, s.rate)}
+	if s.refunded == s.captured {
 		res.Status = StatusRefunded
 	}
 	return res, nil
 }
 
-// awaitCapture waits for a valid capture, a reversal, or the hold to expire.
-// It returns the captured amount (0 if the hold was released) and the status.
-func awaitCapture(ctx workflow.Context, a *Activities, req AuthRequest) (int64, string, error) {
-	expiry := workflow.NewTimer(ctx, cmp.Or(req.HoldFor, DefaultHoldFor))
-	captures := workflow.GetSignalChannel(ctx, CaptureSignal)
-	reversals := workflow.GetSignalChannel(ctx, ReverseSignal)
-
-	for {
-		var c Capture
-		release := ""
-		sel := workflow.NewSelector(ctx)
-		sel.AddReceive(captures, func(ch workflow.ReceiveChannel, _ bool) { ch.Receive(ctx, &c) })
-		sel.AddReceive(reversals, func(ch workflow.ReceiveChannel, _ bool) { ch.Receive(ctx, nil); release = StatusReversed })
-		sel.AddFuture(expiry, func(workflow.Future) { release = StatusExpired })
-		sel.Select(ctx)
-
-		if release != "" {
-			return 0, release, workflow.ExecuteActivity(ctx, a.ReleaseHold, req).Get(ctx, nil)
-		}
-		if c.Amount <= 0 || c.Amount > req.Amount {
-			workflow.GetLogger(ctx).Warn("ignoring invalid capture", "amount", c.Amount, "hold", req.Amount)
-			continue
-		}
-		if err := workflow.ExecuteActivity(ctx, a.CaptureHold, req, c.Amount).Get(ctx, nil); err != nil {
-			// Compensate: a capture that can't post must not leave the hold
-			// eating the card's limit.
-			if rerr := workflow.ExecuteActivity(ctx, a.ReleaseHold, req).Get(ctx, nil); rerr != nil {
-				workflow.GetLogger(ctx).Error("compensating release failed", "error", rerr)
-			}
-			return 0, "", err
-		}
-		return c.Amount, StatusCaptured, nil
-	}
+// withLedger sets the options for ledger activities. Update handlers get a
+// fresh context, so each step applies these itself.
+func withLedger(ctx workflow.Context) workflow.Context {
+	return workflow.WithActivityOptions(ctx, workflow.ActivityOptions{
+		StartToCloseTimeout: activityTimeout,
+		// Bounded so a ledger that keeps failing surfaces here, where the saga
+		// can compensate, instead of retrying forever.
+		RetryPolicy: &temporal.RetryPolicy{MaximumAttempts: 5},
+	})
 }
 
-// acceptRefunds posts refunds, clawing back their rewards, until the window
-// closes or the capture is fully refunded, and returns the total refunded.
-func acceptRefunds(ctx, rctx workflow.Context, a *Activities, req AuthRequest, captured, rate int64) (int64, error) {
-	window := workflow.NewTimer(ctx, cmp.Or(req.RefundWindow, DefaultRefundWindow))
-	refunds := workflow.GetSignalChannel(ctx, RefundSignal)
-	seen := map[string]bool{}
-	var refunded int64
+// receive runs f for each signal named name, one at a time. A signal f
+// rejects is logged and dropped: unlike an update, nobody is waiting on it.
+func receive[T any](ctx workflow.Context, name string, f func(workflow.Context, *T) error) {
+	ch := workflow.GetSignalChannel(ctx, name)
+	workflow.Go(ctx, func(ctx workflow.Context) {
+		for {
+			var v T
+			ch.Receive(ctx, &v)
+			if err := f(ctx, &v); err != nil {
+				workflow.GetLogger(ctx).Warn("signal not applied", "signal", name, "payload", v, "error", err)
+			}
+		}
+	})
+}
 
-	for refunded < captured {
-		var r Refund
-		closed := false
-		sel := workflow.NewSelector(ctx)
-		sel.AddReceive(refunds, func(ch workflow.ReceiveChannel, _ bool) { ch.Receive(ctx, &r) })
-		sel.AddFuture(window, func(workflow.Future) { closed = true })
-		sel.Select(ctx)
+// Hold phases. After the hold, phase ends as one of the Status values.
+const (
+	phaseDeciding = "deciding" // PlaceHold running
+	phaseHolding  = "holding"  // waiting for capture, reversal or expiry
+	phaseBusy     = "busy"     // a capture or release has claimed the hold
+	phaseFailed   = "failed"   // a capture or release could not post; see err
+)
 
-		if closed {
-			break
-		}
-		if r.ID == "" || seen[r.ID] || r.Amount <= 0 || refunded+r.Amount > captured {
-			workflow.GetLogger(ctx).Warn("ignoring refund", "id", r.ID, "amount", r.Amount, "refundable", captured-refunded)
-			continue
-		}
-		if err := workflow.ExecuteActivity(ctx, a.RefundCapture, req, r).Get(ctx, nil); err != nil {
-			return refunded, err
-		}
-		// Claw back by what the remaining spend is now worth, not by the
-		// refund's own (rounded) points, so a full refund lands on exactly 0.
-		left := captured - refunded
-		if err := workflow.ExecuteActivity(rctx, a.AdjustRewards, req, PointsChange{"rewards:refund:" + r.ID, rate, left, left - r.Amount}).Get(ctx, nil); err != nil {
-			return refunded, err
-		}
-		seen[r.ID] = true
-		refunded += r.Amount
+// authState is one authorization, shared by the main workflow, the signal
+// loops and the update handlers. Workflow coroutines take turns and never run
+// in parallel, so a check and the state change after it can't interleave:
+// each step claims its share (phase, seen, reserved) before its first activity.
+type authState struct {
+	a       *Activities
+	req     AuthRequest
+	phase   string
+	holdErr error // PlaceHold's error, for the authorize update
+	err     error // a capture, release or refund that could not post
+
+	captured, rate int64
+	refundsOpen    bool            // settlement rewards posted
+	refundsClosed  bool            // window closed or workflow finishing
+	seen           map[string]bool // refund IDs claimed
+	reserved       int64           // refunded plus refunds still posting
+	refunded       int64
+}
+
+func (s *authState) registerUpdates(ctx workflow.Context) error {
+	return errors.Join(
+		workflow.SetUpdateHandler(ctx, AuthorizeUpdate, func(ctx workflow.Context) (bool, error) {
+			err := workflow.Await(ctx, func() bool { return s.phase != phaseDeciding })
+			return s.phase != StatusDeclined, cmp.Or(err, s.holdErr)
+		}),
+		workflow.SetUpdateHandlerWithOptions(ctx, CaptureSignal, s.capture,
+			workflow.UpdateHandlerOptions{Validator: func(_ workflow.Context, c Capture) error { return s.checkCapture(c) }}),
+		workflow.SetUpdateHandlerWithOptions(ctx, ReverseSignal, func(ctx workflow.Context) error { return s.release(ctx, StatusReversed) },
+			workflow.UpdateHandlerOptions{Validator: func(workflow.Context) error { return s.checkHeld() }}),
+		workflow.SetUpdateHandlerWithOptions(ctx, RefundSignal, s.refund,
+			workflow.UpdateHandlerOptions{Validator: func(_ workflow.Context, r Refund) error { return s.checkRefund(r) }}),
+	)
+}
+
+func (s *authState) checkHeld() error {
+	if s.phase != phaseHolding {
+		return fmt.Errorf("hold is %s", s.phase)
 	}
-	return refunded, nil
+	return nil
+}
+
+func (s *authState) checkCapture(c Capture) error {
+	if c.Amount <= 0 || c.Amount > s.req.Amount {
+		return fmt.Errorf("capture %d outside the %d hold", c.Amount, s.req.Amount)
+	}
+	return s.checkHeld()
+}
+
+// capture posts c and releases the rest of the hold.
+func (s *authState) capture(ctx workflow.Context, c Capture) error {
+	if err := s.checkCapture(c); err != nil {
+		return err
+	}
+	ctx = withLedger(ctx)
+	s.phase = phaseBusy
+	if err := workflow.ExecuteActivity(ctx, s.a.CaptureHold, s.req, c.Amount).Get(ctx, nil); err != nil {
+		// Compensate: a capture that can't post must not leave the hold
+		// eating the card's limit.
+		if rerr := workflow.ExecuteActivity(ctx, s.a.ReleaseHold, s.req).Get(ctx, nil); rerr != nil {
+			workflow.GetLogger(ctx).Error("compensating release failed", "error", rerr)
+		}
+		s.phase, s.err = phaseFailed, err
+		return err
+	}
+	s.phase, s.captured = StatusCaptured, c.Amount
+	// Return once settlement rewards post, so a caller can refund right away.
+	return workflow.Await(ctx, func() bool { return s.refundsOpen })
+}
+
+// release returns the whole hold to open-to-buy and ends as status.
+func (s *authState) release(ctx workflow.Context, status string) error {
+	if err := s.checkHeld(); err != nil {
+		return err
+	}
+	ctx = withLedger(ctx)
+	s.phase = phaseBusy
+	if err := workflow.ExecuteActivity(ctx, s.a.ReleaseHold, s.req).Get(ctx, nil); err != nil {
+		s.phase, s.err = phaseFailed, err
+		return err
+	}
+	s.phase = status
+	return nil
+}
+
+func (s *authState) checkRefund(r Refund) error {
+	switch {
+	case !s.refundsOpen:
+		return fmt.Errorf("refunds not open: hold is %s, or settlement rewards still posting", s.phase)
+	case s.refundsClosed:
+		return errors.New("refund window closed")
+	case r.ID == "" || s.seen[r.ID]:
+		return fmt.Errorf("refund ID %q empty or already used", r.ID)
+	case r.Amount <= 0 || s.reserved+r.Amount > s.captured:
+		return fmt.Errorf("refund %d outside the %d left", r.Amount, s.captured-s.reserved)
+	}
+	return nil
+}
+
+// refund posts r and claws back its rewards.
+func (s *authState) refund(ctx workflow.Context, r Refund) error {
+	if err := s.checkRefund(r); err != nil {
+		return err
+	}
+	ctx = withLedger(ctx)
+	s.seen[r.ID] = true
+	left := s.captured - s.reserved
+	s.reserved += r.Amount
+	if err := workflow.ExecuteActivity(ctx, s.a.RefundCapture, s.req, r).Get(ctx, nil); err != nil {
+		s.err = err
+		return err
+	}
+	// Claw back by what the remaining spend is now worth, not by the
+	// refund's own (rounded) points, so a full refund lands on exactly 0.
+	rctx := workflow.WithRetryPolicy(ctx, temporal.RetryPolicy{})
+	if err := workflow.ExecuteActivity(rctx, s.a.AdjustRewards, s.req, PointsChange{"rewards:refund:" + r.ID, s.rate, left, left - r.Amount}).Get(ctx, nil); err != nil {
+		s.err = err
+		return err
+	}
+	s.refunded += r.Amount
+	return nil
 }
 
 // Activities do the I/O the workflow can't: every ledger read and write.

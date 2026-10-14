@@ -103,6 +103,35 @@ func TestDrills(t *testing.T) {
 		d.expectBalances(0, 40_000, 400)
 	})
 
+	t.Run("updates mid-step", func(t *testing.T) {
+		// Every first write stalls 1.5s, so the refund lands while settlement
+		// rewards are posting, and the 1s window closes while the refund posts.
+		slow := &slowFirstLedger{delay: 1500 * time.Millisecond, seen: map[string]bool{}}
+		d := newDrill(t, c, "updates", slow)
+		d.startWorker()
+		if !d.authorize(AuthRequest{Amount: 40_000, RefundWindow: time.Second}) {
+			t.Fatal("want approved")
+		}
+		if err := d.update(CaptureSignal, "c1", Capture{Amount: 40_000}); err != nil {
+			t.Fatal(err)
+		}
+		var wg sync.WaitGroup
+		for range 2 { // a retried request reuses the update ID: one refund
+			wg.Go(func() {
+				if err := d.update(RefundSignal, "r1", Refund{ID: "r1", Amount: 15_000}); err != nil {
+					t.Error(err)
+				}
+			})
+		}
+		wg.Wait()
+		if err := d.update(RefundSignal, "r1-new-id", Refund{ID: "r1", Amount: 15_000}); err == nil {
+			t.Error("want a used refund ID rejected")
+		}
+
+		d.expect(d.c.GetWorkflow(context.Background(), d.card, ""), AuthResult{Status: StatusCaptured, Captured: 40_000, Refunded: 15_000, Points: 250})
+		d.expectBalances(0, 25_000, 250)
+	})
+
 	t.Run("update with start declined", func(t *testing.T) {
 		d := newDrill(t, c, "uws-decline", nil)
 		d.startWorker()
@@ -187,6 +216,18 @@ func (d *drill) authorize(req AuthRequest) bool {
 		d.t.Fatal(err)
 	}
 	return approved
+}
+
+// update sends an update to the drill's workflow and waits for its result.
+func (d *drill) update(name, id string, arg any) error {
+	h, err := d.c.UpdateWorkflow(context.Background(), client.UpdateWorkflowOptions{
+		WorkflowID: d.card, UpdateID: id, UpdateName: name, Args: []any{arg},
+		WaitForStage: client.WorkflowUpdateStageCompleted,
+	})
+	if err != nil {
+		return err
+	}
+	return h.Get(context.Background(), nil)
 }
 
 func (d *drill) signal(run client.WorkflowRun, name string, payload any) {
