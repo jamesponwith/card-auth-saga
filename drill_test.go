@@ -226,23 +226,27 @@ type drill struct {
 }
 
 func newDrill(t *testing.T, c client.Client, name string, wrap *slowFirstLedger) *drill {
+	card := fmt.Sprintf("drill-%s-%d", name, runID)
 	var l Ledger = NewMemLedger()
-	if dsn := os.Getenv("CAS_MYSQL_DSN"); dsn != "" {
+	var cfg Config = StaticConfig{Limits: map[string]int64{card: 100_000}}
+	if dsn := os.Getenv("CAS_MYSQL_DSN"); dsn != "" { // limits come from the cards table
 		ml, err := OpenMySQL(context.Background(), dsn)
 		if err != nil {
 			t.Fatal(err)
 		}
 		t.Cleanup(func() { _ = ml.Close() })
-		l = ml
+		if err := ml.SetCreditLimit(context.Background(), card, 100_000); err != nil {
+			t.Fatal(err)
+		}
+		l, cfg = ml, ml
 	}
 	if wrap != nil {
 		wrap.Ledger = l
 		l = wrap
 	}
-	card := fmt.Sprintf("drill-%s-%d", name, runID)
 	return &drill{
 		t: t, c: c, l: l, card: card, merchant: card + "-shop",
-		acts: &Activities{Ledger: l, Limits: map[string]int64{card: 100_000}},
+		acts: &Activities{Ledger: l, Config: cfg},
 	}
 }
 

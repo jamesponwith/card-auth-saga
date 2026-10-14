@@ -121,6 +121,22 @@ Declined attempts count too.
   non-retryable typed errors, and an over-limit decline as `false`. Old histories only hold
   `true`/`false` results, so they replay unchanged.
 
+## Per-card config and migrations (M11)
+
+Card limits and partner reward rates live in MySQL, not in code:
+
+- `cards(id, credit_limit)` and `partners(merchant, points_per_dollar)`. `CHECK` constraints reject
+  negative values. A card with no row is an `UnknownCard` decline, and a merchant with no row earns the
+  default rate. A partner row with rate 0 earns no points.
+- Activities read them through a `Config` interface. Tests and the in-memory worker use a static
+  map; the MySQL worker uses the tables. Set them with `go run . set-limit <card> <cents>` and
+  `go run . set-rate <merchant> <points-per-dollar>`.
+- The limit is read just before the hold's ledger transaction. A limit change that races an auth
+  applies one value or the other, never a mix. Balances are still checked under the row locks.
+- The schema is versioned (ADR 0005). Migrations are ordered and recorded in `schema_migrations`,
+  applied under an advisory lock, and each one is re-runnable. A database newer than the binary is
+  refused.
+
 ## Non-goals
 
 - Real card networks (ISO 8583), PCI scope, or real money.
@@ -140,6 +156,7 @@ Declined attempts count too.
 - **M8**: Incremental auth and multiple captures.
 - **M9**: Monthly statement cycle (ContinueAsNew, query, late fee, interest).
 - **M10**: Velocity check (more than 5 auths in 60s declines).
+- **M11**: Per-card config tables and versioned migrations.
 
 ## Success criteria
 

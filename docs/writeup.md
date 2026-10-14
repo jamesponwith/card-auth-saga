@@ -107,6 +107,14 @@ Each safeguard was removed on purpose to confirm a test notices:
 | Payments arriving mid-close are rejected | *mid-close payment* accepted while interest posts |
 | Velocity: more than 5 attempts in 60s declines | `TestVelocityCheck`: the 6th attempt is approved |
 | A retried attempt counts from its first recorded time | `TestRecordAttempt`: a retry sees the attempts that arrived since |
+| Migrations run under an advisory lock | 8 concurrent boots: duplicate version rows without it |
+| A boot that can't get the lock refuses to migrate | *migrate waits for the lock*: tables created unguarded |
+| The lock is released, not left on a pooled session | *a running worker doesn't block the next boot* |
+| Every migration is re-runnable | re-applying all migrations on a migrated database; adopting pre-versioning schemas |
+| A database newer than the binary is refused | *refuses newer database* |
+| `CHECK` constraints on limits and rates | negative limit or rate accepted |
+| A config read error fails the auth, never declines it | *config outage is not a decline*: every card declined as unknown |
+| A failed rate read is retried, not defaulted | *reward rate outage retries*: settlement fixes the default rate for good |
 | An increment claims the hold | *capture during increment rejected*: otherwise a final capture strands the increment |
 
 Two experiments removed code instead. Cancelling the hold timer after capture survived mutation,
