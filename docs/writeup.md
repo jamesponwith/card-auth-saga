@@ -12,10 +12,15 @@ designed carefully? The answer turned out to be "the orchestration, but not the 
 
 ## Shape
 
-- **One workflow per authorization** (`AuthorizeWorkflow`). It places a hold, then waits on a
-  selector: a `capture` signal, a `reverse` signal, or a 7-day timer. After a capture it takes `refund`
-  signals for 30 days. The timers are durable: a worker can die mid-wait and the workflow continues on
-  another one.
+- **One workflow per authorization** (`AuthorizeWorkflow`). An `authorize` update, sent with
+  Update-with-Start, returns approve/decline as soon as the hold is placed. The hold then takes
+  increments and partial captures until a final capture, a reversal, or a 7-day timer closes it.
+  After a capture it takes refunds for 30 days. Each of these is a validated update, or a signal
+  for fire-and-forget callers. The timers are durable: a worker can die mid-wait and the workflow
+  continues on another one.
+- **One workflow per card for statements** (`StatementWorkflow`). Each run is one cycle: late fee at
+  the due date, interest and a new statement at close. Then it continues as new, so history never
+  grows past a cycle.
 - **A double-entry ledger** (MySQL, `database/sql`). Every posting sums to zero, and every posting is
   keyed `<workflow ID>:<step>` with a unique index, so a retried activity hits the duplicate key and
   becomes a no-op.
@@ -63,6 +68,7 @@ history:
 | Update-with-Start, sent twice | The caller starts the auth and waits on the `authorize` update; a retry reuses the auth ID | `true` both times, one hold |
 | Update-with-Start, declined | An over-limit auth | `false`, then the workflow closes as declined |
 | Increments and split capture | +$200 increment approved, +$500 declined by the limit, $300 partial capture, $250 final capture | $550 captured, the last $50 released, 550 points |
+| Statement cycles | 3s cycles, 1s grace: close on $500, pay $10 (sent twice, one update ID), let the due date pass | One payment; $25 fee; $10.20 interest on $490; next statement $525.20; the closed run replays |
 | Updates mid-step | Every write stalls 1.5s; a refund update is sent the moment its capture returns, twice with one update ID, and the 1s window closes while it posts | One refund; points clawed back; a new update ID for the same refund is rejected |
 
 M8 changed which activities a capture runs, so it is the first change those recordings had to
@@ -95,6 +101,8 @@ Each safeguard was removed on purpose to confirm a test notices:
 | Old runs keep the single-capture activities (`GetVersion`) | 5 of the 6 pre-M8 golden histories fail to replay |
 | A partial capture leaves the rest of the hold open | *split shipment*, *partials can't exceed the hold* |
 | Release takes only what's still held | *expiry/reverse after a partial releases the rest* |
+| Payments still posting finish before the statement closes | *in-flight payment*: interest charged on $500, not $490 |
+| Payments arriving mid-close are rejected | *mid-close payment* accepted while interest posts |
 | An increment claims the hold | *capture during increment rejected*: otherwise a final capture strands the increment |
 
 Two experiments removed code instead. Cancelling the hold timer after capture survived mutation,

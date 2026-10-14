@@ -31,6 +31,7 @@ func main() {
 
 	w := worker.New(c, TaskQueue, worker.Options{})
 	w.RegisterWorkflow(AuthorizeWorkflow)
+	w.RegisterWorkflow(StatementWorkflow)
 	// ponytail: hard-coded demo limits and partner rates until they get their own tables.
 	w.RegisterActivity(&Activities{
 		Ledger: ledger,

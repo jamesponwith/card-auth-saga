@@ -159,6 +159,50 @@ func TestDrills(t *testing.T) {
 		d.expectBalances(0, 55_000, 550)
 	})
 
+	t.Run("statement cycles", func(t *testing.T) {
+		d := newDrill(t, c, "stmt", nil)
+		d.startWorker()
+		ctx := context.Background()
+		if err := d.l.Post(ctx, d.card+":seed", Entry{postedAccount(d.card), 50_000}, Entry{openToBuyAccount(d.card), -50_000}); err != nil {
+			t.Fatal(err)
+		}
+		id := "statement:" + d.card
+		if _, err := d.c.ExecuteWorkflow(ctx, client.StartWorkflowOptions{ID: id, TaskQueue: TaskQueue}, StatementWorkflow,
+			StatementTerms{CardID: d.card, Cycle: 3 * time.Second, Grace: time.Second}, Statement{}); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = d.c.TerminateWorkflow(ctx, id, "", "drill done") })
+
+		d.waitStatement(id, 1)
+		var wg sync.WaitGroup
+		for range 2 { // under the 25.00 minimum; a resent request reuses the update ID
+			wg.Go(func() {
+				h, err := d.c.UpdateWorkflow(ctx, client.UpdateWorkflowOptions{WorkflowID: id, UpdateID: "p1", UpdateName: PayUpdate,
+					Args: []any{Payment{ID: "p1", Amount: 1_000}}, WaitForStage: client.WorkflowUpdateStageCompleted})
+				if err == nil {
+					err = h.Get(ctx, nil)
+				}
+				if err != nil {
+					t.Error(err)
+				}
+			})
+		}
+		wg.Wait()
+
+		// 49,000 unpaid × 24.99% / 12 = 1,020 interest, plus the late fee.
+		want := Statement{N: 2, Balance: 52_520, MinDue: 2_500, Fees: 2_500, Interest: 1_020}
+		if got := d.waitStatement(id, 2); got != want {
+			t.Errorf("statement = %+v, want %+v", got, want)
+		}
+		if got := balance(t, d.l, postedAccount(d.card)); got != want.Balance {
+			t.Errorf("posted = %d, want %d", got, want.Balance)
+		}
+		d.expectBalances(0, want.Balance, 0)
+		// The run that closed statement 2 is complete: replay it.
+		cur := d.c.GetWorkflow(ctx, id, "")
+		d.replay(d.c.GetWorkflow(ctx, id, d.previousRun(id, cur.GetRunID())))
+	})
+
 	t.Run("update with start declined", func(t *testing.T) {
 		d := newDrill(t, c, "uws-decline", nil)
 		d.startWorker()
@@ -205,6 +249,7 @@ func newDrill(t *testing.T, c client.Client, name string, wrap *slowFirstLedger)
 func (d *drill) startWorker() worker.Worker {
 	w := worker.New(d.c, TaskQueue, worker.Options{Identity: "drill-worker"})
 	w.RegisterWorkflow(AuthorizeWorkflow)
+	w.RegisterWorkflow(StatementWorkflow)
 	w.RegisterActivity(d.acts)
 	if err := w.Start(); err != nil {
 		d.t.Fatal(err)
@@ -258,6 +303,32 @@ func (d *drill) updateResult(name, id string, arg, result any) error {
 		return err
 	}
 	return h.Get(context.Background(), result)
+}
+
+// waitStatement polls the statement query until statement n has closed.
+func (d *drill) waitStatement(id string, n int) Statement {
+	d.t.Helper()
+	deadline := time.Now().Add(30 * time.Second)
+	for time.Now().Before(deadline) {
+		var st Statement
+		if v, err := d.c.QueryWorkflow(context.Background(), id, "", StatementQuery); err == nil && v.Get(&st) == nil && st.N >= n {
+			return st
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	d.t.Fatalf("statement %d never closed", n)
+	return Statement{}
+}
+
+// previousRun is the run that continued as new into runID.
+func (d *drill) previousRun(id, runID string) string {
+	d.t.Helper()
+	iter := d.c.GetWorkflowHistory(context.Background(), id, runID, false, enumspb.HISTORY_EVENT_FILTER_TYPE_ALL_EVENT)
+	e, err := iter.Next()
+	if err != nil {
+		d.t.Fatal(err)
+	}
+	return e.GetWorkflowExecutionStartedEventAttributes().GetContinuedExecutionRunId()
 }
 
 func (d *drill) signal(run client.WorkflowRun, name string, payload any) {
@@ -328,6 +399,7 @@ func (d *drill) replay(run client.WorkflowRun) {
 	}
 	r := worker.NewWorkflowReplayer()
 	r.RegisterWorkflow(AuthorizeWorkflow)
+	r.RegisterWorkflow(StatementWorkflow)
 	if err := r.ReplayWorkflowHistory(nil, &h); err != nil {
 		d.t.Errorf("replay: %v", err)
 	}
@@ -398,6 +470,7 @@ func TestReplayGoldenHistories(t *testing.T) {
 		t.Run(filepath.Base(f), func(t *testing.T) {
 			r := worker.NewWorkflowReplayer()
 			r.RegisterWorkflow(AuthorizeWorkflow)
+			r.RegisterWorkflow(StatementWorkflow)
 			if err := r.ReplayWorkflowHistoryFromJSONFile(nil, f); err != nil {
 				t.Error(err)
 			}
