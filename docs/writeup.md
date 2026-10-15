@@ -70,6 +70,7 @@ history:
 | Increments and split capture | +$200 increment approved, +$500 declined by the limit, $300 partial capture, $250 final capture | $550 captured, the last $50 released, 550 points |
 | Statement cycles | 1s cycles of ten 100ms days: pay $10 in the first (sent twice, one update ID), then pay nothing | One payment; $25 fee on day 4; $3.47 interest on the daily balances; next statement $518.47; the closed run replays |
 | Disputes | Seconds-long deadlines: one dispute contested and won, one the merchant never answers, one contested and lost | $250 charged back, $50 rebilled, 150 points kept; the history replays |
+| Worker process | `run` as `main` calls it: ops port taken, then started, probed, cancelled | Refuses to start without its ops port; `/healthz` ok with the version; SDK metrics served; stops on cancel and closes the port |
 | Card lifecycle (MySQL) | `set-limit` a new card, then raise its limit | One running statement cycle, same run both times |
 | Updates mid-step | Every write stalls 1.5s; a refund update is sent the moment its capture returns, twice with one update ID, and the 1s window closes while it posts | One refund; points clawed back; a new update ID for the same refund is rejected |
 
@@ -131,6 +132,10 @@ Each safeguard was removed on purpose to confirm a test notices:
 | The dispute update returns after its credit posts | *dispute returns after credit* |
 | A credit the ledger refuses fails the update | *dispute credit failure is reported* |
 | Accepting ends a dispute at once, not at the review deadline | *disputes query*: an accepted dispute still open |
+| `/healthz` checks Temporal, then MySQL | *worker health, Temporal down*; operate drill: a MySQL outage reads "ok" |
+| The worker listens before starting work | worker drill: starts without its ops port, invisible to the prober |
+| The SDK reports into the served metrics | worker drill: `/debug/vars` has no Temporal series |
+| Metrics series: sorted tags, gauges set, timers totalled | `TestExpvarMetrics` |
 | An increment claims the hold | *capture during increment rejected*: otherwise a final capture strands the increment |
 
 Two experiments removed code instead. Cancelling the hold timer after capture survived mutation,

@@ -9,9 +9,14 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
+	"net"
+	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -266,6 +271,71 @@ func TestDrills(t *testing.T) {
 		// d1 and d2 charged back (25,000); d3 rebilled; points on the 15,000 kept.
 		d.expect(d.c.GetWorkflow(context.Background(), d.card, ""), AuthResult{Status: StatusCaptured, Captured: 40_000, ChargedBack: 25_000, Points: 150})
 		d.expectBalances(0, 15_000, 150)
+	})
+
+	t.Run("health names a MySQL outage", func(t *testing.T) {
+		dbDown := func(context.Context) error { return errors.New("connection refused") }
+		if got := workerHealth(c, dbDown)(); got != "degraded: mysql: connection refused" {
+			t.Errorf("health with MySQL down = %q, want degraded: mysql", got)
+		}
+	})
+
+	t.Run("worker process", func(t *testing.T) {
+		ln, err := net.Listen("tcp", "127.0.0.1:0") // a free port for the ops endpoint
+		if err != nil {
+			t.Fatal(err)
+		}
+		addr := ln.Addr().String()
+		env := envOf(map[string]string{"TEMPORAL_ADDRESS": srv.FrontendHostPort(), "CAS_HTTP_ADDR": addr})
+		if err := run(context.Background(), nil, env); err == nil || !strings.Contains(err.Error(), "ops endpoint") {
+			t.Errorf("run with the ops port taken = %v, want it to refuse to start", err)
+		}
+		_ = ln.Close()
+
+		ctx, cancel := context.WithCancel(context.Background())
+		done := make(chan error, 1)
+		go func() { done <- run(ctx, nil, env) }()
+		var health map[string]any
+		deadline := time.Now().Add(30 * time.Second)
+		for time.Now().Before(deadline) && health["status"] != "ok" {
+			if res, err := http.Get("http://" + addr + "/healthz"); err == nil {
+				_ = json.NewDecoder(res.Body).Decode(&health)
+				_ = res.Body.Close()
+			}
+			time.Sleep(100 * time.Millisecond)
+		}
+		if health["status"] != "ok" || health["version"] != Version {
+			t.Errorf("/healthz = %v, want ok and version %s", health, Version)
+		}
+		// The worker's Temporal client reports into the served metrics.
+		var vars struct{ Temporal map[string]any }
+		if res, err := http.Get("http://" + addr + "/debug/vars"); err != nil {
+			t.Error(err)
+		} else {
+			_ = json.NewDecoder(res.Body).Decode(&vars)
+			_ = res.Body.Close()
+		}
+		polls := 0
+		for k := range vars.Temporal {
+			if strings.HasPrefix(k, "temporal_long_request") || strings.HasPrefix(k, "temporal_request") {
+				polls++
+			}
+		}
+		if polls == 0 {
+			t.Errorf("/debug/vars has no Temporal client metrics: %v", vars.Temporal)
+		}
+		cancel() // as SIGTERM would
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Errorf("run after shutdown: %v", err)
+			}
+		case <-time.After(30 * time.Second):
+			t.Fatal("worker did not stop on cancel")
+		}
+		if _, err := http.Get("http://" + addr + "/healthz"); err == nil {
+			t.Error("ops endpoint still serving after shutdown")
+		}
 	})
 
 	t.Run("update with start declined", func(t *testing.T) {

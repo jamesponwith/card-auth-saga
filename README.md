@@ -107,16 +107,30 @@ minimum isn't paid by the due date, and at close charges interest on the average
 unless the last statement was paid in full. The workflow then continues as new, so its history covers
 one cycle. `temporal workflow show` lists each run.
 
+## Operate
+
+The worker serves the flywheel's Operate contract on `CAS_HTTP_ADDR` (default `:8080`, ADR 0006):
+
+```sh
+curl localhost:8080/healthz      # {"status":"ok","version":"v1.2.3","uptime_s":42}, or "degraded: temporal: …"
+curl localhost:8080/debug/vars   # the Temporal SDK's metrics under "temporal", one series per name and tags
+```
+
+`/healthz` reports `ok` only if Temporal and MySQL both answer. Release builds stamp the version.
+`docs/slo.yml` is ready. Probing stays off until the url points at a real deployment, because probing
+an address that isn't deployed would file incidents that never close.
+
 ## Failure drills
 
 ```sh
 go test -run TestDrills -v .   # downloads + starts a Temporal dev server; add CAS_MYSQL_DSN for MySQL
 ```
 
-Ten drills against a real server: worker killed mid-hold, duplicate capture/refund signals,
+Twelve drills against a real server: worker killed mid-hold, duplicate capture/refund signals,
 activities that commit then time out, Update-with-Start approved (sent twice) and declined,
 updates that land mid-step (a refund during settlement, the window closing mid-refund),
-increments with a split capture, three disputes on one charge (won, unanswered, lost), two statement cycles across ContinueAsNew, and (on MySQL)
+increments with a split capture, three disputes on one charge (won, unanswered, lost), the worker process end to end (ops port,
+`/healthz`, metrics, shutdown), a MySQL outage named by `/healthz`, two statement cycles across ContinueAsNew, and (on MySQL)
 a card created twice with `set-limit` getting a single statement cycle. Each asserts exact balances, then replays the recorded history.
 `CAS_UPDATE_GOLDEN=1` re-records `testdata/history-*.json`, which `go test -short` replays on every
 commit to catch nondeterministic workflow changes.
