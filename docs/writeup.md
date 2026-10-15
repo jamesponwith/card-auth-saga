@@ -129,6 +129,8 @@ Each safeguard was removed on purpose to confirm a test notices:
 | A won dispute claims its place in the points chain when it's won | *two chargebacks won together*, *chargeback then refund*: a point clawed twice |
 | Disputes open only once the charge settles | *dispute waits for settlement*: a quick win would claw back at rate 0 |
 | The dispute update returns after its credit posts | *dispute returns after credit* |
+| A credit the ledger refuses fails the update | *dispute credit failure is reported* |
+| Accepting ends a dispute at once, not at the review deadline | *disputes query*: an accepted dispute still open |
 | An increment claims the hold | *capture during increment rejected*: otherwise a final capture strands the increment |
 
 Two experiments removed code instead. Cancelling the hold timer after capture survived mutation,

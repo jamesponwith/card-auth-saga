@@ -1,10 +1,12 @@
 package main
 
 import (
+	"fmt"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/mock"
+	"go.temporal.io/sdk/temporal"
 	"go.temporal.io/sdk/testsuite"
 )
 
@@ -30,73 +32,73 @@ func TestDisputes(t *testing.T) {
 		name  string
 		req   AuthRequest // zero: auth("card-1", 40_000)
 		steps []step
-		want  AuthResult // Captured is always the capture
+		want  AuthResult
 		// card-1's posted balance and points afterwards
 		wantPosted, wantPoints int64
 	}{
 		{"merchant accepts: cardholder wins", AuthRequest{},
 			[]step{upd(capture(hr, 40_000), "ok"), upd(dispute(2*hr, "d1", 15_000), "ok"), upd(respond(3*hr, "d1", true), "ok")},
-			AuthResult{Status: StatusCaptured, ChargedBack: 15_000, Points: 250}, 25_000, 250},
+			AuthResult{Captured: 40_000, Status: StatusCaptured, ChargedBack: 15_000, Points: 250}, 25_000, 250},
 		{"no merchant response: cardholder wins at the deadline", AuthRequest{},
 			[]step{upd(capture(hr, 40_000), "ok"), upd(dispute(2*hr, "d1", 15_000), "ok")},
-			AuthResult{Status: StatusCaptured, ChargedBack: 15_000, Points: 250}, 25_000, 250},
+			AuthResult{Captured: 40_000, Status: StatusCaptured, ChargedBack: 15_000, Points: 250}, 25_000, 250},
 		{"contested, merchant wins: rebilled", AuthRequest{},
 			[]step{upd(capture(hr, 40_000), "ok"), upd(dispute(2*hr, "d1", 15_000), "ok"), upd(respond(3*hr, "d1", false), "ok"), upd(rule(4*hr, "d1", false), "ok")},
-			AuthResult{Status: StatusCaptured, Points: 400}, 40_000, 400},
+			AuthResult{Captured: 40_000, Status: StatusCaptured, Points: 400}, 40_000, 400},
 		{"contested, cardholder wins", AuthRequest{},
 			[]step{upd(capture(hr, 40_000), "ok"), upd(dispute(2*hr, "d1", 15_000), "ok"), upd(respond(3*hr, "d1", false), "ok"), upd(rule(4*hr, "d1", true), "ok")},
-			AuthResult{Status: StatusCaptured, ChargedBack: 15_000, Points: 250}, 25_000, 250},
+			AuthResult{Captured: 40_000, Status: StatusCaptured, ChargedBack: 15_000, Points: 250}, 25_000, 250},
 		{"contested, no ruling: cardholder wins at the deadline", AuthRequest{},
 			[]step{upd(capture(hr, 40_000), "ok"), upd(dispute(2*hr, "d1", 15_000), "ok"), upd(respond(3*hr, "d1", false), "ok")},
-			AuthResult{Status: StatusCaptured, ChargedBack: 15_000, Points: 250}, 25_000, 250},
+			AuthResult{Captured: 40_000, Status: StatusCaptured, ChargedBack: 15_000, Points: 250}, 25_000, 250},
 		{"dispute over what refunds left rejected", AuthRequest{},
 			[]step{upd(capture(hr, 40_000), "ok"), upd(refund(2*hr, "r1", 30_000), "ok"), upd(dispute(3*hr, "d1", 15_000), "rejected")},
-			AuthResult{Status: StatusCaptured, Refunded: 30_000, Points: 100}, 10_000, 100},
+			AuthResult{Captured: 40_000, Status: StatusCaptured, Refunded: 30_000, Points: 100}, 10_000, 100},
 		{"refund over what disputes left rejected", AuthRequest{},
 			[]step{upd(capture(hr, 40_000), "ok"), upd(dispute(2*hr, "d1", 30_000), "ok"), upd(refund(3*hr, "r1", 15_000), "rejected"), upd(respond(4*hr, "d1", true), "ok")},
-			AuthResult{Status: StatusCaptured, ChargedBack: 30_000, Points: 100}, 10_000, 100},
+			AuthResult{Captured: 40_000, Status: StatusCaptured, ChargedBack: 30_000, Points: 100}, 10_000, 100},
 		{"dispute before capture rejected", AuthRequest{},
 			[]step{upd(dispute(hr/2, "d1", 100), "rejected"), upd(capture(hr, 40_000), "ok")},
-			AuthResult{Status: StatusCaptured, Points: 400}, 40_000, 400},
+			AuthResult{Captured: 40_000, Status: StatusCaptured, Points: 400}, 40_000, 400},
 		{"dispute ID reused rejected", AuthRequest{},
 			[]step{upd(capture(hr, 40_000), "ok"), upd(dispute(2*hr, "d1", 15_000), "ok"), upd(dispute(3*hr, "d1", 5_000), "rejected"), upd(respond(4*hr, "d1", true), "ok")},
-			AuthResult{Status: StatusCaptured, ChargedBack: 15_000, Points: 250}, 25_000, 250},
+			AuthResult{Captured: 40_000, Status: StatusCaptured, ChargedBack: 15_000, Points: 250}, 25_000, 250},
 		{"merchant response after the deadline rejected", longWindow,
 			[]step{upd(capture(hr, 40_000), "ok"), upd(dispute(2*hr, "d1", 15_000), "ok"), upd(respond(46*day, "d1", false), "rejected")},
-			AuthResult{Status: StatusCaptured, ChargedBack: 15_000, Points: 250}, 25_000, 250},
+			AuthResult{Captured: 40_000, Status: StatusCaptured, ChargedBack: 15_000, Points: 250}, 25_000, 250},
 		{"ruling before the merchant contests rejected", AuthRequest{},
 			[]step{upd(capture(hr, 40_000), "ok"), upd(dispute(2*hr, "d1", 15_000), "ok"), upd(rule(3*hr, "d1", true), "rejected"), upd(respond(4*hr, "d1", true), "ok")},
-			AuthResult{Status: StatusCaptured, ChargedBack: 15_000, Points: 250}, 25_000, 250},
+			AuthResult{Captured: 40_000, Status: StatusCaptured, ChargedBack: 15_000, Points: 250}, 25_000, 250},
 		{"unknown dispute rejected", AuthRequest{},
 			[]step{upd(capture(hr, 40_000), "ok"), upd(respond(2*hr, "nope", true), "rejected")},
-			AuthResult{Status: StatusCaptured, Points: 400}, 40_000, 400},
+			AuthResult{Captured: 40_000, Status: StatusCaptured, Points: 400}, 40_000, 400},
 		// d1 keeps the auth open past the 30-day window; d2 comes too late.
 		{"dispute after the window rejected", AuthRequest{},
 			[]step{upd(capture(hr, 40_000), "ok"), upd(dispute(2*hr, "d1", 15_000), "ok"), upd(dispute(31*day, "d2", 5_000), "rejected")},
-			AuthResult{Status: StatusCaptured, ChargedBack: 15_000, Points: 250}, 25_000, 250},
+			AuthResult{Captured: 40_000, Status: StatusCaptured, ChargedBack: 15_000, Points: 250}, 25_000, 250},
 		{"whole charge disputed and won", AuthRequest{},
 			[]step{upd(capture(hr, 40_000), "ok"), upd(dispute(2*hr, "d1", 40_000), "ok"), upd(respond(3*hr, "d1", true), "ok")},
-			AuthResult{Status: StatusRefunded, ChargedBack: 40_000}, 0, 0},
+			AuthResult{Captured: 40_000, Status: StatusRefunded, ChargedBack: 40_000}, 0, 0},
 		// 2 points on $2.00: the refund claws back points(200) - points(150) = 1;
 		// the lost dispute never claws, so 1 point stays, matching points(150).
 		{"lost dispute between refunds keeps points exact", AuthRequest{},
 			[]step{upd(capture(hr, 200), "ok"), upd(dispute(2*hr, "d1", 150), "ok"), upd(respond(3*hr, "d1", false), "ok"),
 				upd(rule(4*hr, "d1", false), "ok"), upd(refund(5*hr, "r1", 50), "ok")},
-			AuthResult{Status: StatusCaptured, Refunded: 50, Points: 1}, 150, 1},
+			AuthResult{Captured: 200, Status: StatusCaptured, Refunded: 50, Points: 1}, 150, 1},
 		// The chargeback claws points(200) - points(150) = 1; the refund then chains
 		// from 150, not 200, and claws the last 1.
 		{"chargeback then refund claw back every point", AuthRequest{},
 			[]step{upd(capture(hr, 200), "ok"), upd(dispute(2*hr, "d1", 50), "ok"), upd(respond(3*hr, "d1", true), "ok"), upd(refund(4*hr, "r1", 150), "ok")},
-			AuthResult{Status: StatusRefunded, Refunded: 150, ChargedBack: 50}, 0, 0},
+			AuthResult{Captured: 200, Status: StatusRefunded, Refunded: 150, ChargedBack: 50}, 0, 0},
 		// Won in the same instant: each claims its slice of the chain before posting.
 		{"two chargebacks won together claw back every point", AuthRequest{},
 			[]step{upd(capture(hr, 200), "ok"), upd(dispute(2*hr, "d1", 150), "ok"), upd(dispute(2*hr, "d2", 50), "ok"),
 				upd(respond(3*hr, "d1", true), "ok"), upd(respond(3*hr, "d2", true), "ok")},
-			AuthResult{Status: StatusRefunded, ChargedBack: 200}, 0, 0},
+			AuthResult{Captured: 200, Status: StatusRefunded, ChargedBack: 200}, 0, 0},
 		// Per-step rounding would leave a point: 150 claws back 2, then 50 claws 0.
 		{"refund then chargeback claw back every point", AuthRequest{},
 			[]step{upd(capture(hr, 200), "ok"), upd(refund(2*hr, "r1", 150), "ok"), upd(dispute(3*hr, "d1", 50), "ok"), upd(respond(4*hr, "d1", true), "ok")},
-			AuthResult{Status: StatusRefunded, Refunded: 150, ChargedBack: 50}, 0, 0},
+			AuthResult{Captured: 200, Status: StatusRefunded, Refunded: 150, ChargedBack: 50}, 0, 0},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -120,14 +122,8 @@ func TestDisputes(t *testing.T) {
 			if err := env.GetWorkflowResult(&res); err != nil {
 				t.Fatal(err)
 			}
-			want := tt.want
-			for _, st := range tt.steps {
-				if c, ok := st.payload.(Capture); ok {
-					want.Captured = c.Amount
-				}
-			}
-			if res != want {
-				t.Errorf("result = %+v, want %+v", res, want)
+			if res != tt.want {
+				t.Errorf("result = %+v, want %+v", res, tt.want)
 			}
 			if got := balance(t, l, postedAccount("card-1")); got != tt.wantPosted {
 				t.Errorf("posted = %d, want %d", got, tt.wantPosted)
@@ -145,35 +141,66 @@ func TestDisputes(t *testing.T) {
 	}
 }
 
+func queryDisputes(t *testing.T, env *testsuite.TestWorkflowEnvironment) []DisputeState {
+	t.Helper()
+	v, err := env.QueryWorkflow(DisputesQuery)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var ds []DisputeState
+	if err := v.Get(&ds); err != nil {
+		t.Fatal(err)
+	}
+	return ds
+}
+
 // The disputes query shows each dispute's stage as it moves.
 func TestDisputesQuery(t *testing.T) {
 	var s testsuite.WorkflowTestSuite
 	env := s.NewTestWorkflowEnvironment()
 	env.RegisterActivity(&Activities{Ledger: NewMemLedger(), Config: card1()})
-	sendSteps(env, []step{upd(capture(hr, 40_000), "ok"), upd(dispute(2*hr, "d1", 15_000), "ok"), upd(respond(3*hr, "d1", false), "ok")})
-	check := func(at time.Duration, want DisputeState) {
+	sendSteps(env, []step{upd(capture(hr, 40_000), "ok"),
+		upd(dispute(2*hr, "d1", 15_000), "ok"), upd(respond(3*hr, "d1", false), "ok"), // contested
+		upd(dispute(4*hr, "d2", 5_000), "ok"), upd(respond(5*hr, "d2", true), "ok")}) // accepted
+	check := func(at time.Duration, want ...DisputeState) {
 		env.RegisterDelayedCallback(func() {
-			v, err := env.QueryWorkflow(DisputesQuery)
-			if err != nil {
-				t.Fatal(err)
-			}
-			var got []DisputeState
-			if err := v.Get(&got); err != nil {
-				t.Fatal(err)
-			}
-			if len(got) != 1 || got[0] != want {
-				t.Errorf("at %v: disputes = %+v, want [%+v]", at, got, want)
+			if got := queryDisputes(t, env); fmt.Sprint(got) != fmt.Sprint(want) {
+				t.Errorf("at %v: disputes = %+v, want %+v", at, got, want)
 			}
 		}, at)
 	}
-	check(2*hr+time.Minute, DisputeState{ID: "d1", Amount: 15_000, Stage: StageAwaitingMerchant})
-	check(3*hr+time.Minute, DisputeState{ID: "d1", Amount: 15_000, Stage: StageUnderReview})
-	check(40*day, DisputeState{ID: "d1", Amount: 15_000, Stage: StageCardholderWon}) // review deadline passed
+	d1 := DisputeState{ID: "d1", Amount: 15_000}
+	d2 := DisputeState{ID: "d2", Amount: 5_000}
+	at := func(d DisputeState, stage string) DisputeState { d.Stage = stage; return d }
+	check(2*hr+time.Minute, at(d1, StageAwaitingMerchant))
+	check(3*hr+time.Minute, at(d1, StageUnderReview))
+	check(5*hr+time.Minute, at(d1, StageUnderReview), at(d2, StageCardholderWon)) // accepting ends it at once
+	check(40*day, at(d1, StageCardholderWon), at(d2, StageCardholderWon))         // d1's review deadline passed
 
 	env.ExecuteWorkflow(AuthorizeWorkflow, auth("card-1", 40_000))
 
 	if err := env.GetWorkflowError(); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// A provisional credit the ledger refuses outright fails the dispute update,
+// rather than reporting a credit that never posted.
+func TestDisputeCreditFailureIsReported(t *testing.T) {
+	var s testsuite.WorkflowTestSuite
+	env := s.NewTestWorkflowEnvironment()
+	a := &Activities{Ledger: NewMemLedger(), Config: card1()}
+	env.RegisterActivity(a)
+	env.OnActivity(a.PostToCard, mock.Anything, mock.Anything, mock.Anything, mock.Anything).
+		Return(temporal.NewNonRetryableApplicationError("ledger refused", "LedgerRefused", nil))
+	steps := []step{upd(capture(hr, 40_000), "ok"), upd(dispute(2*hr, "d1", 15_000), "error")}
+	got := sendSteps(env, steps)
+
+	env.ExecuteWorkflow(AuthorizeWorkflow, auth("card-1", 40_000))
+
+	checkSteps(t, steps, got)
+	if env.GetWorkflowError() == nil {
+		t.Error("want the failed credit to fail the auth workflow")
 	}
 }
 
@@ -269,15 +296,7 @@ func TestMerchantResponseAtTheDeadline(t *testing.T) {
 	}, deadline)
 	var stage string
 	env.RegisterDelayedCallback(func() {
-		v, err := env.QueryWorkflow(DisputesQuery)
-		if err != nil {
-			t.Fatal(err)
-		}
-		var ds []DisputeState
-		if err := v.Get(&ds); err != nil {
-			t.Fatal(err)
-		}
-		stage = ds[0].Stage
+		stage = queryDisputes(t, env)[0].Stage
 	}, deadline+hr)
 
 	env.ExecuteWorkflow(AuthorizeWorkflow, req)

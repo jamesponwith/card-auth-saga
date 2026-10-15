@@ -55,9 +55,7 @@ type DisputeState struct {
 
 type disputeState struct {
 	DisputeState
-	credited bool  // provisional credit posted
-	response *bool // set by merchant-response: accepted?
-	ruling   *bool // set by resolve-dispute: cardholder wins?
+	credited bool // provisional credit posted
 }
 
 func (s *authState) registerDisputes(ctx workflow.Context) error {
@@ -127,13 +125,10 @@ func (s *authState) openDispute(ctx workflow.Context, d Dispute) error {
 			s.err = err
 		}
 	})
-	if err := workflow.Await(ctx, func() bool { return ds.credited || s.err != nil }); err != nil {
+	if err := workflow.Await(ctx, func() bool { return ds.credited || s.err != nil }); err != nil || ds.credited {
 		return err
 	}
-	if !ds.credited {
-		return s.err
-	}
-	return nil
+	return s.err
 }
 
 // runDispute posts the provisional credit, then waits out the merchant and,
@@ -146,27 +141,32 @@ func (s *authState) runDispute(ctx workflow.Context, ds *disputeState) error {
 	}
 	ds.credited = true
 
-	responded, err := workflow.AwaitWithTimeout(ctx, cmp.Or(s.req.MerchantResponse, DefaultMerchantResponse), func() bool { return ds.response != nil })
-	if err != nil {
-		return err
-	}
-	cardholderWins := !responded || *ds.response
-	if responded && !*ds.response {
-		ds.Stage = StageUnderReview
-		ruled, err := workflow.AwaitWithTimeout(ctx, cmp.Or(s.req.DisputeReview, DefaultDisputeReview), func() bool { return ds.ruling != nil })
+	// The handlers move the stage on; a deadline that passes first decides
+	// for the cardholder.
+	for _, wait := range []struct {
+		stage   string
+		timeout time.Duration
+	}{
+		{StageAwaitingMerchant, cmp.Or(s.req.MerchantResponse, DefaultMerchantResponse)},
+		{StageUnderReview, cmp.Or(s.req.DisputeReview, DefaultDisputeReview)},
+	} {
+		if ds.Stage != wait.stage {
+			continue
+		}
+		moved, err := workflow.AwaitWithTimeout(ctx, wait.timeout, func() bool { return ds.Stage != wait.stage })
 		if err != nil {
 			return err
 		}
-		cardholderWins = !ruled || *ds.ruling
+		if !moved {
+			ds.Stage = StageCardholderWon
+		}
 	}
 
-	if !cardholderWins {
-		ds.Stage = StageMerchantWon
+	if ds.Stage == StageMerchantWon {
 		return workflow.ExecuteActivity(ctx, s.a.PostToCard, s.req.CardID, "dispute:"+ds.ID+":rebill", ds.Amount).Get(ctx, nil)
 	}
 	// The credit stands; claw back the dispute's points from the remaining
 	// spend, claimed now so clawbacks always chain to exact points.
-	ds.Stage = StageCardholderWon
 	left := s.captured - s.clawed
 	s.clawed += ds.Amount
 	if err := workflow.ExecuteActivity(ctx, s.a.AdjustRewards, s.req, PointsChange{"rewards:dispute:" + ds.ID, s.rate, left, left - ds.Amount}).Get(ctx, nil); err != nil {
@@ -176,14 +176,18 @@ func (s *authState) runDispute(ctx workflow.Context, ds *disputeState) error {
 	return nil
 }
 
-// merchantResponds records the merchant's answer. The deadline may have passed
-// since the validator ran, so it checks the stage again.
+// merchantResponds records the merchant's answer: accepting ends the dispute
+// for the cardholder, contesting sends it to review. The deadline may have
+// passed since the validator ran, so it checks the stage again.
 func (s *authState) merchantResponds(_ workflow.Context, r MerchantResponse) error {
 	ds, err := s.disputeAt(r.DisputeID, StageAwaitingMerchant)
 	if err != nil {
 		return err
 	}
-	ds.response = &r.Accept
+	ds.Stage = StageUnderReview
+	if r.Accept {
+		ds.Stage = StageCardholderWon
+	}
 	return nil
 }
 
@@ -194,6 +198,9 @@ func (s *authState) analystRules(_ workflow.Context, r Ruling) error {
 	if err != nil {
 		return err
 	}
-	ds.ruling = &r.CardholderWins
+	ds.Stage = StageMerchantWon
+	if r.CardholderWins {
+		ds.Stage = StageCardholderWon
+	}
 	return nil
 }
