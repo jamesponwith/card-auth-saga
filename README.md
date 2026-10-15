@@ -73,6 +73,21 @@ Points accrue on the captured total at the merchant's partner rate at settlement
 Before capture, `--name reverse` voids the hold; with no signal it expires after 7 days
 (`"HoldFor"`/`"RefundWindow"` in nanoseconds shorten either).
 
+Dispute a captured charge while refunds are open (SPEC.md, M13). The credit lands at once, the
+merchant has 45 days to accept or contest, and a contested dispute goes to an analyst for 30 days. A
+missed deadline goes to the cardholder:
+
+```sh
+temporal workflow update execute --workflow-id auth-1 --name dispute --input '{"ID":"d1","Amount":5000}'
+temporal workflow update execute --workflow-id auth-1 --name merchant-response --input '{"DisputeID":"d1","Accept":false}'
+temporal workflow update execute --workflow-id auth-1 --name resolve-dispute --input '{"DisputeID":"d1","CardholderWins":true}'
+temporal workflow query --workflow-id auth-1 --name disputes
+```
+
+If the cardholder wins, the credit stands and the dispute's points are clawed back. If the merchant
+wins, the charge is rebilled. Refunds and disputes share one cap, so together they never return more
+than was captured.
+
 A card that attempts more than 5 auths in 60 seconds is declined regardless of its limit. This
 catches card testing, and it covers declined attempts too (SPEC.md, M10).
 
@@ -98,10 +113,10 @@ one cycle. `temporal workflow show` lists each run.
 go test -run TestDrills -v .   # downloads + starts a Temporal dev server; add CAS_MYSQL_DSN for MySQL
 ```
 
-Nine drills against a real server: worker killed mid-hold, duplicate capture/refund signals,
+Ten drills against a real server: worker killed mid-hold, duplicate capture/refund signals,
 activities that commit then time out, Update-with-Start approved (sent twice) and declined,
 updates that land mid-step (a refund during settlement, the window closing mid-refund),
-increments with a split capture, two statement cycles across ContinueAsNew, and (on MySQL)
+increments with a split capture, three disputes on one charge (won, unanswered, lost), two statement cycles across ContinueAsNew, and (on MySQL)
 a card created twice with `set-limit` getting a single statement cycle. Each asserts exact balances, then replays the recorded history.
 `CAS_UPDATE_GOLDEN=1` re-records `testdata/history-*.json`, which `go test -short` replays on every
 commit to catch nondeterministic workflow changes.

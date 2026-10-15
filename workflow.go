@@ -35,7 +35,7 @@ const (
 	StatusExpired  = "expired"
 	StatusReversed = "reversed" // merchant voided the auth before capture
 	StatusCaptured = "captured" // possibly partially refunded; see Refunded
-	StatusRefunded = "refunded" // fully refunded
+	StatusRefunded = "refunded" // fully returned, by refunds and chargebacks
 )
 
 // Decline reasons. Velocity and unknown-card declines are PlaceHold's
@@ -57,7 +57,9 @@ type AuthRequest struct {
 	Amount       int64 // cents
 	Merchant     string
 	HoldFor      time.Duration // zero means DefaultHoldFor
-	RefundWindow time.Duration // zero means DefaultRefundWindow
+	RefundWindow time.Duration // zero means DefaultRefundWindow; disputes open in the same window
+	// Dispute deadlines; zero means DefaultMerchantResponse and DefaultDisputeReview.
+	MerchantResponse, DisputeReview time.Duration
 }
 
 // Capture is the payload of the capture signal or update. A final capture
@@ -81,11 +83,12 @@ type Refund struct {
 }
 
 type AuthResult struct {
-	Status   string
-	Captured int64  // cents posted to the card
-	Refunded int64  // cents refunded after capture
-	Points   int64  // rewards points the card keeps after any clawback
-	Reason   string // a Decline* reason when declined
+	Status      string
+	Captured    int64  // cents posted to the card
+	Refunded    int64  // cents refunded after capture
+	ChargedBack int64  // cents of disputes the cardholder won
+	Points      int64  // rewards points the card keeps after any clawback
+	Reason      string // a Decline* reason when declined
 }
 
 // Card accounts. A hold moves money from open-to-buy into holds; a capture
@@ -111,10 +114,10 @@ func pointsFor(cents, rate int64) int64 { return cents * rate / 100 }
 // before it reaches history, and the update returns once the ledger posts.
 func AuthorizeWorkflow(ctx workflow.Context, req AuthRequest) (AuthResult, error) {
 	ctx = withLedger(ctx)
-	s := &authState{req: req, phase: phaseDeciding, held: req.Amount, seen: map[string]bool{}, increments: map[string]bool{}}
+	s := &authState{req: req, root: ctx, phase: phaseDeciding, held: req.Amount, seen: map[string]bool{}, increments: map[string]bool{}, disputes: map[string]*disputeState{}}
 	// Runs started before multiple captures replay on the single-capture path.
 	s.v = workflow.GetVersion(ctx, "multi-capture", workflow.DefaultVersion, 1)
-	if err := s.registerUpdates(ctx); err != nil {
+	if err := errors.Join(s.registerUpdates(ctx), s.registerDisputes(ctx)); err != nil {
 		return AuthResult{}, err
 	}
 
@@ -163,17 +166,18 @@ func AuthorizeWorkflow(ctx workflow.Context, req AuthRequest) (AuthResult, error
 	s.refundsOpen = true
 	workflow.Go(ctx, func(ctx workflow.Context) { _ = window.Get(ctx, nil); s.refundsClosed = true })
 	receive(ctx, RefundSignal, func(ctx workflow.Context, r *Refund) error { return s.refund(ctx, *r) })
-	// In-flight refunds finish even if the window closes under them.
+	// In-flight refunds and open disputes finish even if the window closes
+	// under them; the auth ends early only once nothing is left to return.
 	if err := workflow.Await(ctx, func() bool {
-		return s.err != nil || s.reserved == s.refunded && (s.refundsClosed || s.refunded == s.captured)
+		return s.err != nil || s.reserved == s.refunded && s.openDisputes == 0 && (s.refundsClosed || s.reserved+s.disputed == s.captured)
 	}); err != nil {
 		return AuthResult{}, err
 	}
 	if s.err != nil {
 		return AuthResult{}, s.err
 	}
-	res := AuthResult{Status: StatusCaptured, Captured: s.captured, Refunded: s.refunded, Points: pointsFor(s.captured-s.refunded, s.rate)}
-	if s.refunded == s.captured {
+	res := AuthResult{Status: StatusCaptured, Captured: s.captured, Refunded: s.refunded, ChargedBack: s.chargedBack, Points: pointsFor(s.captured-s.clawed, s.rate)}
+	if s.refunded+s.chargedBack == s.captured {
 		res.Status = StatusRefunded
 	}
 	return res, nil
@@ -220,6 +224,7 @@ const (
 type authState struct {
 	a       *Activities
 	req     AuthRequest
+	root    workflow.Context // the workflow's own context, for work that outlives an update handler
 	v       workflow.Version // DefaultVersion: single capture, no increments
 	phase   string
 	holdErr error  // PlaceHold's error, for the authorize update
@@ -235,6 +240,13 @@ type authState struct {
 	seen           map[string]bool // refund IDs claimed
 	reserved       int64           // refunded plus refunds still posting
 	refunded       int64
+	clawed         int64 // spend whose points are clawed back, claimed in order: refunds, then disputes won
+
+	disputes     map[string]*disputeState
+	disputeOrder []string // dispute IDs, oldest first
+	disputed     int64    // cents claimed by disputes, won, lost or open
+	openDisputes int
+	chargedBack  int64
 }
 
 func (s *authState) registerUpdates(ctx workflow.Context) error {
@@ -380,8 +392,8 @@ func (s *authState) checkRefund(r Refund) error {
 		return errors.New("refund window closed")
 	case r.ID == "" || s.seen[r.ID]:
 		return fmt.Errorf("refund ID %q empty or already used", r.ID)
-	case r.Amount <= 0 || s.reserved+r.Amount > s.captured:
-		return fmt.Errorf("refund %d outside the %d left", r.Amount, s.captured-s.reserved)
+	case r.Amount <= 0 || s.reserved+s.disputed+r.Amount > s.captured:
+		return fmt.Errorf("refund %d outside the %d left", r.Amount, s.captured-s.reserved-s.disputed)
 	}
 	return nil
 }
@@ -393,7 +405,8 @@ func (s *authState) refund(ctx workflow.Context, r Refund) error {
 	}
 	ctx = withLedger(ctx)
 	s.seen[r.ID] = true
-	left := s.captured - s.reserved
+	left := s.captured - s.clawed
+	s.clawed += r.Amount
 	s.reserved += r.Amount
 	if err := workflow.ExecuteActivity(ctx, s.a.RefundCapture, s.req, r).Get(ctx, nil); err != nil {
 		s.err = err
