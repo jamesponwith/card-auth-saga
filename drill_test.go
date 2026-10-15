@@ -236,6 +236,38 @@ func TestDrills(t *testing.T) {
 		}
 	})
 
+	t.Run("disputes", func(t *testing.T) {
+		d := newDrill(t, c, "dispute", nil)
+		d.startWorker()
+		// Seconds-long deadlines; refunds and disputes open for 6s after settlement.
+		req := AuthRequest{Amount: 40_000, RefundWindow: 6 * time.Second, MerchantResponse: 2 * time.Second, DisputeReview: 2 * time.Second}
+		if !d.authorize(req) {
+			t.Fatal("want approved")
+		}
+		steps := []struct {
+			name, id string
+			arg      any
+		}{
+			{CaptureSignal, "c1", Capture{Amount: 40_000}},
+			{DisputeUpdate, "d1", Dispute{ID: "d1", Amount: 15_000}}, // contested, cardholder wins
+			{MerchantResponseUpdate, "d1-response", MerchantResponse{DisputeID: "d1", Accept: false}},
+			{ResolveDisputeUpdate, "d1-ruling", Ruling{DisputeID: "d1", CardholderWins: true}},
+			{DisputeUpdate, "d2", Dispute{ID: "d2", Amount: 10_000}}, // the merchant never answers
+			{DisputeUpdate, "d3", Dispute{ID: "d3", Amount: 5_000}},  // contested, merchant wins
+			{MerchantResponseUpdate, "d3-response", MerchantResponse{DisputeID: "d3", Accept: false}},
+			{ResolveDisputeUpdate, "d3-ruling", Ruling{DisputeID: "d3", CardholderWins: false}},
+		}
+		for _, st := range steps {
+			if err := d.update(st.name, st.id, st.arg); err != nil {
+				t.Fatalf("%s %s: %v", st.name, st.id, err)
+			}
+		}
+
+		// d1 and d2 charged back (25,000); d3 rebilled; points on the 15,000 kept.
+		d.expect(d.c.GetWorkflow(context.Background(), d.card, ""), AuthResult{Status: StatusCaptured, Captured: 40_000, ChargedBack: 25_000, Points: 150})
+		d.expectBalances(0, 15_000, 150)
+	})
+
 	t.Run("update with start declined", func(t *testing.T) {
 		d := newDrill(t, c, "uws-decline", nil)
 		d.startWorker()

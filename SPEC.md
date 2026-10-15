@@ -153,6 +153,38 @@ Card limits and partner reward rates live in MySQL, not in code:
 - Runs started earlier stay on the close-timer path (`GetVersion("daily-balance-interest")`), and their
   recorded histories are kept so they keep replaying.
 
+## Disputes (M13)
+
+A cardholder can dispute part or all of a captured charge while refunds are open. The dispute runs
+inside the auth's own workflow, so refunds and disputes share one cap: together they never credit
+more than was captured.
+
+| Step | posted | open-to-buy |
+|------|-------:|------------:|
+| Provisional credit D, on opening | −D | +D |
+| Cardholder wins | (the credit stands) | |
+| Merchant wins: rebill D | +D | −D |
+
+1. **Open:** the `dispute` update (`{ID, Amount}`) is validated against what's left after refunds and
+   other disputes. It posts the provisional credit, so the statement's daily balances and interest
+   stop counting the disputed amount right away, and it returns.
+2. **Merchant response** (default 45 days): the `merchant-response` update (`{DisputeID, Accept}`).
+   Accepting, or letting the deadline pass, means the cardholder wins. Contesting (`Accept: false`)
+   sends the dispute to review.
+3. **Review** (default 30 days): the `resolve-dispute` update (`{DisputeID, CardholderWins}`) records the
+   analyst's ruling. A ruling that doesn't arrive by the deadline goes to the cardholder.
+4. **Outcome:** if the cardholder wins, the dispute's points are clawed back like a refund's. If the
+   merchant wins, the credit is rebilled and the points stay.
+
+- Each dispute claims its money share when it opens. Its place in the points clawback chain is
+  claimed when it's won, so the clawbacks always telescope to exact points (SPEC rewards), even when
+  a lost dispute sits between refunds.
+- A lost dispute keeps its share: the cardholder can't re-dispute or refund the same amount.
+- The auth workflow stays open until every dispute resolves. `AuthResult.ChargedBack` is the total
+  won. `Status` is `refunded` once refunds plus chargebacks equal the capture.
+- The `disputes` query lists each dispute and its stage. Money steps retry until the ledger answers,
+  because a provisional credit or rebill has nothing to compensate with.
+
 ## Non-goals
 
 - Real card networks (ISO 8583), PCI scope, or real money.
@@ -174,6 +206,7 @@ Card limits and partner reward rates live in MySQL, not in code:
 - **M10**: Velocity check (more than 5 auths in 60s declines).
 - **M11**: Per-card config tables and versioned migrations.
 - **M12**: Statements start with the card; per-card APR; average-daily-balance interest.
+- **M13**: Disputes (provisional credit, merchant response, analyst review, chargeback or rebill).
 
 ## Success criteria
 
