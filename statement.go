@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"time"
 
+	"go.temporal.io/sdk/temporal"
 	"go.temporal.io/sdk/workflow"
 )
 
@@ -16,18 +17,23 @@ const (
 
 	DefaultCycle  = 30 * 24 * time.Hour // statement cycle length
 	DefaultGrace  = 25 * 24 * time.Hour // payment due this long after close
-	DefaultAPRBps = 2499                // 24.99% APR, in basis points
+	DefaultDay    = 24 * time.Hour      // one daily balance sample per day
+	DefaultAPRBps = 2499                // 24.99% APR, in basis points, for a card with none set
 	MinDueFloor   = 2_500               // cents; the minimum due is at least this...
 	MinDuePercent = 2                   // ...or this share of the balance
 	LateFee       = 2_500               // cents
 )
+
+// StatementWorkflowID is the ID of a card's statement cycle: one per card.
+func StatementWorkflowID(card string) string { return "statement:" + card }
 
 // StatementTerms are a card's billing terms. Zero values take the defaults.
 type StatementTerms struct {
 	CardID string
 	Cycle  time.Duration
 	Grace  time.Duration
-	APRBps int64
+	Day    time.Duration // the daily-balance sampling interval; shrunk by drills
+	APRBps int64         // runs before daily-balance interest only; newer runs read the card's APR at each close
 }
 
 // Statement is one closed cycle and the payments made against it since.
@@ -46,10 +52,11 @@ type Payment struct {
 	Amount int64 // cents
 }
 
-// StatementWorkflow runs one cycle per run: from the last close it charges a
-// late fee at the due date if the minimum wasn't paid, then at the next close
-// charges interest on what's left of the last statement, closes a new one, and
-// continues as new with it so history never grows past one cycle.
+// StatementWorkflow runs one cycle per run. Each day it samples the card's
+// posted balance; on the due day it charges a late fee if the last statement's
+// minimum wasn't paid. At close it charges interest on the average daily
+// balance unless the last statement was paid in full, closes a new statement,
+// and continues as new with it so history never grows past one cycle.
 func StatementWorkflow(ctx workflow.Context, terms StatementTerms, last Statement) error {
 	ctx = withLedger(ctx)
 	var a *Activities
@@ -58,6 +65,8 @@ func StatementWorkflow(ctx workflow.Context, terms StatementTerms, last Statemen
 	// Runs started before payments credited a per-statement paid account
 	// replay on PostToCard and count Paid themselves.
 	v := workflow.GetVersion(ctx, "paid-from-ledger", workflow.DefaultVersion, 1)
+	// Runs started before daily-balance interest replay on the close-timer path.
+	daily := workflow.GetVersion(ctx, "daily-balance-interest", workflow.DefaultVersion, 1) != workflow.DefaultVersion
 
 	if err := workflow.SetQueryHandler(ctx, StatementQuery, func() (Statement, error) { return last, nil }); err != nil {
 		return err
@@ -96,9 +105,12 @@ func StatementWorkflow(ctx workflow.Context, terms StatementTerms, last Statemen
 
 	step := func(name string) string { return fmt.Sprintf("s%d:%s", last.N+1, name) }
 	next := Statement{N: last.N + 1}
+	if daily {
+		return closeDaily(ctx, a, terms, &last, &closing, step)
+	}
+
 	due := workflow.NewTimer(ctx, cmp.Or(terms.Grace, DefaultGrace))
 	closeAt := workflow.NewTimer(ctx, cmp.Or(terms.Cycle, DefaultCycle))
-
 	if err := due.Get(ctx, nil); err != nil {
 		return err
 	}
@@ -108,7 +120,6 @@ func StatementWorkflow(ctx workflow.Context, terms StatementTerms, last Statemen
 			return err
 		}
 	}
-
 	if err := closeAt.Get(ctx, nil); err != nil {
 		return err
 	}
@@ -117,8 +128,6 @@ func StatementWorkflow(ctx workflow.Context, terms StatementTerms, last Statemen
 	if err := workflow.Await(ctx, func() bool { return workflow.AllHandlersFinished(ctx) }); err != nil {
 		return err
 	}
-	// ponytail: interest on the unpaid statement balance at close, not an
-	// average daily balance; switch if interest must match a real issuer.
 	if unpaid := last.Balance - last.Paid; unpaid > 0 {
 		next.Interest = unpaid * cmp.Or(terms.APRBps, DefaultAPRBps) / 12 / 10_000
 		if err := workflow.ExecuteActivity(ctx, a.PostToCard, terms.CardID, step("interest"), next.Interest).Get(ctx, nil); err != nil {
@@ -128,8 +137,69 @@ func StatementWorkflow(ctx workflow.Context, terms StatementTerms, last Statemen
 	if err := workflow.ExecuteActivity(ctx, a.PostedBalance, terms.CardID).Get(ctx, &next.Balance); err != nil {
 		return err
 	}
-	next.MinDue = min(max(MinDueFloor, next.Balance*MinDuePercent/100), max(next.Balance, 0))
+	next.MinDue = minDue(next.Balance)
 	return workflow.NewContinueAsNewError(ctx, StatementWorkflow, terms, next)
+}
+
+// closeDaily is one cycle on daily balances. It runs day by day, so the late
+// fee lands before that day's sample and every sample is in a fixed order.
+// Its ledger steps retry until the ledger answers: a statement has nothing to
+// compensate, and giving up would end the card's billing.
+func closeDaily(ctx workflow.Context, a *Activities, terms StatementTerms, last *Statement, closing *bool, step func(string) string) error {
+	ctx = workflow.WithRetryPolicy(ctx, temporal.RetryPolicy{})
+	day := cmp.Or(terms.Day, DefaultDay)
+	days := max(int(cmp.Or(terms.Cycle, DefaultCycle)/day), 1)
+	dueDay := min(int((cmp.Or(terms.Grace, DefaultGrace)+day-1)/day), days) // the first day end at or after the grace period
+	next := Statement{N: last.N + 1}
+
+	var dailySum int64 // Σ end-of-day posted balance, credits counted as 0
+	for d := 1; d <= days; d++ {
+		if err := workflow.Sleep(ctx, day); err != nil {
+			return err
+		}
+		if d == dueDay && last.Paid < last.MinDue {
+			next.Fees = LateFee
+			if err := workflow.ExecuteActivity(ctx, a.PostToCard, terms.CardID, step("late-fee"), next.Fees).Get(ctx, nil); err != nil {
+				return err
+			}
+		}
+		var b int64
+		if err := workflow.ExecuteActivity(ctx, a.PostedBalance, terms.CardID).Get(ctx, &b); err != nil {
+			return err
+		}
+		dailySum += max(b, 0)
+	}
+
+	*closing = true
+	// Payments already accepted finish before interest and the balance.
+	if err := workflow.Await(ctx, func() bool { return workflow.AllHandlersFinished(ctx) }); err != nil {
+		return err
+	}
+	// Grace: a statement paid in full by the next close accrues nothing, and
+	// the first cycle has no statement to carry a balance from.
+	if last.N > 0 && last.Paid < last.Balance {
+		var apr int64
+		if err := workflow.ExecuteActivity(ctx, a.CardAPR, terms.CardID).Get(ctx, &apr); err != nil {
+			return err
+		}
+		next.Interest = dailySum * apr / (365 * 10_000) // daily periodic rate × each day's balance
+		if next.Interest > 0 {
+			if err := workflow.ExecuteActivity(ctx, a.PostToCard, terms.CardID, step("interest"), next.Interest).Get(ctx, nil); err != nil {
+				return err
+			}
+		}
+	}
+	if err := workflow.ExecuteActivity(ctx, a.PostedBalance, terms.CardID).Get(ctx, &next.Balance); err != nil {
+		return err
+	}
+	next.MinDue = minDue(next.Balance)
+	return workflow.NewContinueAsNewError(ctx, StatementWorkflow, terms, next)
+}
+
+// minDue is the larger of the floor and a share of the balance, but never more
+// than the balance; nothing is due on a credit.
+func minDue(balance int64) int64 {
+	return min(max(MinDueFloor, balance*MinDuePercent/100), max(balance, 0))
 }
 
 // PostToCard moves amount into the card's posted balance from open-to-buy:
@@ -156,6 +226,16 @@ func (a *Activities) Pay(ctx context.Context, card string, n int, p Payment) (in
 		return 0, err
 	}
 	return a.Ledger.Balance(ctx, paid)
+}
+
+// CardAPR is the card's APR in basis points, read at each close so a change
+// applies from the next statement.
+func (a *Activities) CardAPR(ctx context.Context, card string) (int64, error) {
+	bps, ok, err := a.Config.APR(ctx, card)
+	if !ok && err == nil {
+		bps = DefaultAPRBps
+	}
+	return bps, err
 }
 
 // PostedBalance is the card's posted balance, which a statement closes on.

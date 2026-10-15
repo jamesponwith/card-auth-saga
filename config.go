@@ -10,12 +10,15 @@ type Config interface {
 	// RewardRate is the partner's points per $1; ok is false for a merchant
 	// with no partner rate.
 	RewardRate(ctx context.Context, merchant string) (rate int64, ok bool, err error)
+	// APR is the card's annual rate in basis points; ok is false for an unknown card.
+	APR(ctx context.Context, card string) (bps int64, ok bool, err error)
 }
 
 // StaticConfig is a fixed Config, for tests and the in-memory worker.
 type StaticConfig struct {
 	Limits map[string]int64 // card → credit limit, cents
 	Rates  map[string]int64 // merchant → points per $1
+	APRs   map[string]int64 // card → APR, basis points
 }
 
 func (c StaticConfig) CreditLimit(_ context.Context, card string) (int64, bool, error) {
@@ -26,4 +29,9 @@ func (c StaticConfig) CreditLimit(_ context.Context, card string) (int64, bool, 
 func (c StaticConfig) RewardRate(_ context.Context, merchant string) (int64, bool, error) {
 	rate, ok := c.Rates[merchant]
 	return rate, ok, nil
+}
+
+func (c StaticConfig) APR(_ context.Context, card string) (int64, bool, error) {
+	bps, ok := c.APRs[card]
+	return bps, ok, nil
 }

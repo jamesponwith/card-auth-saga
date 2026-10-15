@@ -398,6 +398,9 @@ func (brokenConfig) CreditLimit(context.Context, string) (int64, bool, error) {
 func (brokenConfig) RewardRate(context.Context, string) (int64, bool, error) {
 	return 0, false, errors.New("config store down")
 }
+func (brokenConfig) APR(context.Context, string) (int64, bool, error) {
+	return 0, false, errors.New("config store down")
+}
 
 // A config store outage must fail the auth, not decline the card as unknown.
 func TestConfigOutageIsNotADecline(t *testing.T) {

@@ -95,9 +95,7 @@ One `StatementWorkflow` per card (workflow ID `statement:<card>`) closes a state
 - **Close:** the statement balance is the card's posted balance. The minimum due is the larger of
   $25 and 2% of the balance, but never more than the balance. Payment is due 25 days after close.
 - **Late fee ($25):** charged at the due date if payments since close are below the minimum.
-- **Interest:** charged at the next close on the part of the statement still unpaid, at APR/12
-  (default 24.99%). A statement paid in full by its next close accrues no interest, which is the
-  grace period.
+- **Interest:** charged at the next close on the average daily balance (M12).
 - **Payments:** a `pay` update (`{ID, Amount}`). Each ID posts once in the ledger, ever. The posting
   also credits a memo account for that statement (`card:<id>:paid:s<N>`, balanced by
   `card:<id>:payments`), and the statement's paid total is read back from it. So a payment resent in a
@@ -137,6 +135,23 @@ Card limits and partner reward rates live in MySQL, not in code:
   applied under an advisory lock, and each one is re-runnable. A database newer than the binary is
   refused.
 
+## Statements v2 (M12)
+
+- **Statements start with the card.** `set-limit` starts `statement:<card>` with conflict policy
+  `USE_EXISTING`, so it creates the cycle once and leaves a running one alone. If Temporal is
+  unreachable, the limit is still saved and the command says to run it again.
+- **APR per card.** The rate lives in `cards.apr_bps` (default 2499, `CHECK >= 0`), is set with
+  `set-apr`, and is read at each close, so a change applies from the next statement. Migration 4 adds
+  the column. It's the first `ALTER`, so it's guarded by an `unless` query (ADR 0005).
+- **Average daily balance.** The cycle runs day by day. At the end of each day it samples the posted
+  balance, counting a credit as 0. On the due day, the late fee posts before that day's sample.
+  Interest = Σ daily balances × APR / 365. It's waived if the last statement was paid in full by the
+  close, and the first cycle never carries interest.
+- **Outages don't end billing.** The statement's own ledger steps retry until the ledger answers.
+  A statement has nothing to compensate, so giving up would stop the card's billing for good.
+- Runs started earlier stay on the close-timer path (`GetVersion("daily-balance-interest")`), and their
+  recorded histories are kept so they keep replaying.
+
 ## Non-goals
 
 - Real card networks (ISO 8583), PCI scope, or real money.
@@ -157,6 +172,7 @@ Card limits and partner reward rates live in MySQL, not in code:
 - **M9**: Monthly statement cycle (ContinueAsNew, query, late fee, interest).
 - **M10**: Velocity check (more than 5 auths in 60s declines).
 - **M11**: Per-card config tables and versioned migrations.
+- **M12**: Statements start with the card; per-card APR; average-daily-balance interest.
 
 ## Success criteria
 

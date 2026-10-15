@@ -166,16 +166,16 @@ func TestDrills(t *testing.T) {
 		if err := d.l.Post(ctx, d.card+":seed", Entry{postedAccount(d.card), 50_000}, Entry{openToBuyAccount(d.card), -50_000}); err != nil {
 			t.Fatal(err)
 		}
-		id := "statement:" + d.card
+		id := StatementWorkflowID(d.card)
+		// 10 "days" of 100ms per 1s cycle; payment due on day 4.
 		if _, err := d.c.ExecuteWorkflow(ctx, client.StartWorkflowOptions{ID: id, TaskQueue: TaskQueue}, StatementWorkflow,
-			StatementTerms{CardID: d.card, Cycle: 3 * time.Second, Grace: time.Second}, Statement{}); err != nil {
+			StatementTerms{CardID: d.card, Cycle: time.Second, Grace: 400 * time.Millisecond, Day: 100 * time.Millisecond}, Statement{}); err != nil {
 			t.Fatal(err)
 		}
 		t.Cleanup(func() { _ = d.c.TerminateWorkflow(ctx, id, "", "drill done") })
 
-		d.waitStatement(id, 1)
 		var wg sync.WaitGroup
-		for range 2 { // under the 25.00 minimum; a resent request reuses the update ID
+		for range 2 { // in the first cycle; a resent request reuses the update ID
 			wg.Go(func() {
 				h, err := d.c.UpdateWorkflow(ctx, client.UpdateWorkflowOptions{WorkflowID: id, UpdateID: "p1", UpdateName: PayUpdate,
 					Args: []any{Payment{ID: "p1", Amount: 1_000}}, WaitForStage: client.WorkflowUpdateStageCompleted})
@@ -188,9 +188,13 @@ func TestDrills(t *testing.T) {
 			})
 		}
 		wg.Wait()
+		if got := d.waitStatement(id, 1); got.Balance != 49_000 {
+			t.Fatalf("statement 1 = %+v, want a 49,000 balance (one payment)", got)
+		}
 
-		// 49,000 unpaid × 24.99% / 12 = 1,020 interest, plus the late fee.
-		want := Statement{N: 2, Balance: 52_520, MinDue: 2_500, Fees: 2_500, Interest: 1_020}
+		// Nothing paid on statement 1: the fee lands on day 4, before its sample.
+		// 3 days at 49,000 + 7 at 51,500 = 507,500 → 347.46 interest.
+		want := Statement{N: 2, Balance: 51_847, MinDue: 2_500, Fees: 2_500, Interest: 347}
 		if got := d.waitStatement(id, 2); got != want {
 			t.Errorf("statement = %+v, want %+v", got, want)
 		}
@@ -201,6 +205,35 @@ func TestDrills(t *testing.T) {
 		// The run that closed statement 2 is complete: replay it.
 		cur := d.c.GetWorkflow(ctx, id, "")
 		d.replay(d.c.GetWorkflow(ctx, id, d.previousRun(id, cur.GetRunID())))
+	})
+
+	t.Run("card lifecycle", func(t *testing.T) {
+		dsn := os.Getenv("CAS_MYSQL_DSN")
+		if dsn == "" {
+			t.Skip("set-limit keeps cards in MySQL; set CAS_MYSQL_DSN")
+		}
+		ctx := context.Background()
+		card := fmt.Sprintf("drill-life-%d", runID)
+		env := envOf(map[string]string{"CAS_MYSQL_DSN": dsn, "TEMPORAL_ADDRESS": srv.FrontendHostPort()})
+		t.Cleanup(func() { _ = c.TerminateWorkflow(ctx, StatementWorkflowID(card), "", "drill done") })
+
+		var runs []string
+		for _, limit := range []string{"100000", "150000"} { // create, then raise: one statement cycle throughout
+			if err := run(ctx, []string{"set-limit", card, limit}, env); err != nil {
+				t.Fatal(err)
+			}
+			desc, err := c.DescribeWorkflowExecution(ctx, StatementWorkflowID(card), "")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if st := desc.GetWorkflowExecutionInfo().GetStatus(); st != enumspb.WORKFLOW_EXECUTION_STATUS_RUNNING {
+				t.Fatalf("statement workflow %v, want running", st)
+			}
+			runs = append(runs, desc.GetWorkflowExecutionInfo().GetExecution().GetRunId())
+		}
+		if runs[0] != runs[1] {
+			t.Errorf("set-limit started a second statement run: %v", runs)
+		}
 	})
 
 	t.Run("update with start declined", func(t *testing.T) {
@@ -309,10 +342,11 @@ func (d *drill) updateResult(name, id string, arg, result any) error {
 	return h.Get(context.Background(), result)
 }
 
-// waitStatement polls the statement query until statement n has closed.
+// waitStatement polls the statement query until statement n has closed. Each
+// simulated day costs a timer and a few round trips on the dev server.
 func (d *drill) waitStatement(id string, n int) Statement {
 	d.t.Helper()
-	deadline := time.Now().Add(30 * time.Second)
+	deadline := time.Now().Add(90 * time.Second)
 	for time.Now().Before(deadline) {
 		var st Statement
 		if v, err := d.c.QueryWorkflow(context.Background(), id, "", StatementQuery); err == nil && v.Get(&st) == nil && st.N >= n {

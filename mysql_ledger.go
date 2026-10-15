@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"strings"
 	"time"
 
@@ -134,6 +135,10 @@ func (l *MySQLLedger) RewardRate(ctx context.Context, merchant string) (int64, b
 	return l.lookup(ctx, `SELECT points_per_dollar FROM partners WHERE merchant = ?`, merchant)
 }
 
+func (l *MySQLLedger) APR(ctx context.Context, card string) (int64, bool, error) {
+	return l.lookup(ctx, `SELECT apr_bps FROM cards WHERE id = ?`, card)
+}
+
 func (l *MySQLLedger) lookup(ctx context.Context, query, key string) (int64, bool, error) {
 	var v int64
 	err := l.db.QueryRowContext(ctx, query, key).Scan(&v)
@@ -157,4 +162,23 @@ func (l *MySQLLedger) SetRewardRate(ctx context.Context, merchant string, rate i
 	_, err := l.db.ExecContext(ctx, `INSERT INTO partners (merchant, points_per_dollar) VALUES (?, ?) AS new
 		ON DUPLICATE KEY UPDATE points_per_dollar = new.points_per_dollar`, merchant, rate)
 	return err
+}
+
+// SetAPR changes an existing card's APR, in basis points. A negative APR fails
+// the column's CHECK constraint.
+func (l *MySQLLedger) SetAPR(ctx context.Context, card string, bps int64) error {
+	res, err := l.db.ExecContext(ctx, `UPDATE cards SET apr_bps = ? WHERE id = ?`, bps, card)
+	if err != nil {
+		return err
+	}
+	if n, err := res.RowsAffected(); err == nil && n == 0 {
+		var exists int
+		if err := l.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM cards WHERE id = ?`, card).Scan(&exists); err != nil {
+			return err
+		}
+		if exists == 0 {
+			return fmt.Errorf("no card %q: set-limit creates it", card)
+		}
+	}
+	return nil
 }

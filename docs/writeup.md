@@ -68,7 +68,8 @@ history:
 | Update-with-Start, sent twice | The caller starts the auth and waits on the `authorize` update; a retry reuses the auth ID | `true` both times, one hold |
 | Update-with-Start, declined | An over-limit auth | `false`, then the workflow closes as declined |
 | Increments and split capture | +$200 increment approved, +$500 declined by the limit, $300 partial capture, $250 final capture | $550 captured, the last $50 released, 550 points |
-| Statement cycles | 3s cycles, 1s grace: close on $500, pay $10 (sent twice, one update ID), let the due date pass | One payment; $25 fee; $10.20 interest on $490; next statement $525.20; the closed run replays |
+| Statement cycles | 1s cycles of ten 100ms days: pay $10 in the first (sent twice, one update ID), then pay nothing | One payment; $25 fee on day 4; $3.47 interest on the daily balances; next statement $518.47; the closed run replays |
+| Card lifecycle (MySQL) | `set-limit` a new card, then raise its limit | One running statement cycle, same run both times |
 | Updates mid-step | Every write stalls 1.5s; a refund update is sent the moment its capture returns, twice with one update ID, and the 1s window closes while it posts | One refund; points clawed back; a new update ID for the same refund is rejected |
 
 M8 changed which activities a capture runs, so it is the first change those recordings had to
@@ -115,6 +116,11 @@ Each safeguard was removed on purpose to confirm a test notices:
 | `CHECK` constraints on limits and rates | negative limit or rate accepted |
 | A config read error fails the auth, never declines it | *config outage is not a decline*: every card declined as unknown |
 | A failed rate read is retried, not defaulted | *reward rate outage retries*: settlement fixes the default rate for good |
+| Statement ledger steps retry until the ledger answers | *rides out ledger outage*: 8 failures end the card's billing |
+| The late fee posts before that day's sample | *nothing paid: fee and interest* |
+| Interest waived when the last statement was paid in full | *paid in full*, *overpaid* |
+| Credit days count as zero | *credit days count as zero*: a refund's credit offsets interest owed |
+| APR read from the card's config | *statement APR from config* |
 | An increment claims the hold | *capture during increment rejected*: otherwise a final capture strands the increment |
 
 Two experiments removed code instead. Cancelling the hold timer after capture survived mutation,
@@ -122,6 +128,9 @@ because a finished workflow cleans up its own timers, so it was deleted. Likewis
 update handlers to finish before a decline closes the workflow: without it, the update still answered
 in the test environment and on a real server, because a waiting handler runs in the same workflow
 task that sets the decision. That wait was deleted too.
+
+A note on the test environment: it caps "retry forever" at 10 attempts so a unit test can't hang,
+so the outage test fails 8 times. That's past the saga's limit of 5, and under the test cap.
 
 ## How it was built
 
