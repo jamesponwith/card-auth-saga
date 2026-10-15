@@ -207,6 +207,7 @@ more than was captured.
 - **M11**: Per-card config tables and versioned migrations.
 - **M12**: Statements start with the card; per-card APR; average-daily-balance interest.
 - **M13**: Disputes (provisional credit, merchant response, analyst review, chargeback or rebill).
+- **M14**: Operate stage: `/healthz` with dependency checks, SDK metrics via expvar, SLO contract (ADR 0006).
 
 ## Success criteria
 

@@ -37,6 +37,9 @@ func OpenMySQL(ctx context.Context, dsn string) (*MySQLLedger, error) {
 
 func (l *MySQLLedger) Close() error { return l.db.Close() }
 
+// Ping checks the database is reachable, for /healthz.
+func (l *MySQLLedger) Ping(ctx context.Context) error { return l.db.PingContext(ctx) }
+
 func (l *MySQLLedger) Post(ctx context.Context, key string, entries ...Entry) error {
 	_, err := l.PostWithin(ctx, key, nil, 0, entries...)
 	return err

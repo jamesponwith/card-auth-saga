@@ -8,6 +8,10 @@ builds:
     env: [CGO_ENABLED=0]
     goos: [linux, darwin]
     goarch: [amd64, arm64]
+    ldflags:
+      # Operate needs the running binary to report which release it is, so an
+      # incident can be attributed to a deploy (healthz.go, ADR 0006).
+      - -s -w -X main.Version={{.Version}}
 
 changelog:
   filters:

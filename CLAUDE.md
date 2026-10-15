@@ -1,6 +1,7 @@
 # CLAUDE.md
 
-Go project built inside the personal agentic flywheel: Intent → Build → Validate → Release → Learn.
+Go project built inside the personal agentic flywheel: Intent → Build → Validate → Release →
+Operate → Learn.
 
 ## Before writing code (Intent)
 
@@ -23,6 +24,18 @@ Go project built inside the personal agentic flywheel: Intent → Build → Vali
 - Pre-push runs a local AI review (ponytail-review) — advisory findings, read them before opening the PR.
 - PRs merge only on a green Validate pipeline; the human is the final approver.
 
+## Running in production (Operate)
+
+- `docs/slo.yml` is the contract: probe url, latency budget, and how long a
+  breach must persist before it is an incident. Point `url` at the real
+  deployment before enabling the operate workflow (ADR 0006; bead cas-0a1 adds it).
+- `healthz.go` comes from the template byte-for-byte; the worker serves it on
+  `CAS_HTTP_ADDR` (default `:8080`) and reports `degraded` when Temporal or
+  MySQL is unreachable. The version it reports is how Learn attributes an
+  incident to a release.
+- Incidents are filed and closed by `tools/watch`, never by hand. If you find
+  yourself opening an `incident` issue manually, the prober is misconfigured —
+  fix that instead, or the DORA numbers go back to measuring your memory.
 
 <!-- BEGIN BEADS INTEGRATION v:1 profile:minimal hash:7510c1e2 -->
 ## Beads Issue Tracker
