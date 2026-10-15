@@ -6,12 +6,15 @@ import (
 	"errors"
 	"fmt"
 	"time"
+
+	"github.com/go-sql-driver/mysql"
 )
 
 // migrations is the schema history, oldest first: version n is migrations[n-1].
 // Append only. MySQL DDL commits as it goes, so a migration that dies halfway
 // can't roll back; it is finished by running it again on the next boot. Every
-// statement must therefore be safe to re-run (ADR 0005).
+// statement must therefore be safe to re-run: IF NOT EXISTS, or an error the
+// loop below treats as already applied (ADR 0005).
 var migrations = [][]string{
 	{ // 1: the ledger, as first created on boot before versioning
 		`CREATE TABLE IF NOT EXISTS accounts (
@@ -51,7 +54,14 @@ var migrations = [][]string{
 			CONSTRAINT partners_rate_non_negative CHECK (points_per_dollar >= 0)
 		)`,
 	},
+	{ // 4: each card's APR, read at every statement close
+		`ALTER TABLE cards ADD COLUMN apr_bps BIGINT NOT NULL DEFAULT 2499 CHECK (apr_bps >= 0)`,
+	},
 }
+
+// mysqlDupColumn is ADD COLUMN on a column that exists: MySQL has no
+// ADD COLUMN IF NOT EXISTS, so a re-run of migration 4 lands here.
+const mysqlDupColumn = 1060
 
 const migrateLock = "card-auth-saga:migrate"
 
@@ -95,7 +105,12 @@ func migrate(ctx context.Context, db *sql.DB) (err error) {
 	}
 	for v := current + 1; v <= len(migrations); v++ {
 		for _, stmt := range migrations[v-1] {
-			if _, err := conn.ExecContext(ctx, stmt); err != nil {
+			_, err := conn.ExecContext(ctx, stmt)
+			var me *mysql.MySQLError
+			if errors.As(err, &me) && me.Number == mysqlDupColumn {
+				continue // already applied
+			}
+			if err != nil {
 				return fmt.Errorf("migrate: version %d: %w", v, err)
 			}
 		}

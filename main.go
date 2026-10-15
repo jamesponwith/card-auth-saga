@@ -1,9 +1,11 @@
 // Command card-auth-saga runs the Temporal worker for the card authorization
-// saga against a local server (`temporal server start-dev`). Set CAS_MYSQL_DSN
-// to keep the ledger and card config in MySQL; otherwise both live in memory.
+// saga against a local server (`temporal server start-dev`, or TEMPORAL_ADDRESS).
+// Set CAS_MYSQL_DSN to keep the ledger and card config in MySQL; otherwise both
+// live in memory.
 //
 //	card-auth-saga                                run the worker
-//	card-auth-saga set-limit <card> <cents>       set a card's credit limit (MySQL)
+//	card-auth-saga set-limit <card> <cents>       create or update a card, and start its statements (MySQL)
+//	card-auth-saga set-apr <card> <basis-points>  set a card's APR, from its next statement (MySQL)
 //	card-auth-saga set-rate <merchant> <points>   set a partner's points per $1 (MySQL)
 package main
 
@@ -15,21 +17,24 @@ import (
 	"os"
 	"strconv"
 
+	enumspb "go.temporal.io/api/enums/v1"
 	"go.temporal.io/sdk/client"
 	"go.temporal.io/sdk/worker"
 )
 
 func main() {
-	if err := run(context.Background(), os.Args[1:], os.Getenv("CAS_MYSQL_DSN")); err != nil {
+	if err := run(context.Background(), os.Args[1:], os.Getenv); err != nil {
 		log.Fatalln(err)
 	}
 }
 
-func run(ctx context.Context, args []string, dsn string) error {
-	var change func(context.Context, *MySQLLedger) error
+func run(ctx context.Context, args []string, env func(string) string) error {
+	dsn := env("CAS_MYSQL_DSN")
+	temporalOptions := client.Options{HostPort: env("TEMPORAL_ADDRESS")} // empty: localhost:7233
+	var cmd adminCmd
 	if len(args) > 0 {
 		var err error
-		if change, err = admin(args); err != nil {
+		if cmd, err = admin(args); err != nil {
 			return err
 		}
 		if dsn == "" {
@@ -48,13 +53,13 @@ func run(ctx context.Context, args []string, dsn string) error {
 			return fmt.Errorf("open ledger: %w", err)
 		}
 		defer func() { _ = l.Close() }()
-		if change != nil {
-			return change(ctx, l)
+		if cmd != nil {
+			return cmd(ctx, l, temporalOptions)
 		}
 		acts = &Activities{Ledger: l, Config: l}
 	}
 
-	c, err := client.Dial(client.Options{}) // localhost:7233
+	c, err := client.Dial(temporalOptions)
 	if err != nil {
 		return fmt.Errorf("dial temporal: %w", err)
 	}
@@ -66,11 +71,15 @@ func run(ctx context.Context, args []string, dsn string) error {
 	return w.Run(worker.InterruptCh())
 }
 
-var errUsage = errors.New("usage: card-auth-saga [set-limit <card> <cents> | set-rate <merchant> <points-per-dollar>]")
+var errUsage = errors.New("usage: card-auth-saga [set-limit <card> <cents> | set-apr <card> <basis-points> | set-rate <merchant> <points-per-dollar>]")
 
-// admin parses an admin command into the config change it makes. Bad values
-// such as a negative limit are left to the tables' CHECK constraints.
-func admin(args []string) (func(context.Context, *MySQLLedger) error, error) {
+// adminCmd applies a parsed admin command. Temporal options reach set-limit,
+// which also starts the card's statements.
+type adminCmd func(context.Context, *MySQLLedger, client.Options) error
+
+// admin parses an admin command. Bad values such as a negative limit are left
+// to the tables' CHECK constraints.
+func admin(args []string) (adminCmd, error) {
 	if len(args) != 3 || args[1] == "" {
 		return nil, errUsage
 	}
@@ -81,9 +90,35 @@ func admin(args []string) (func(context.Context, *MySQLLedger) error, error) {
 	}
 	switch args[0] {
 	case "set-limit":
-		return func(ctx context.Context, l *MySQLLedger) error { return l.SetCreditLimit(ctx, id, n) }, nil
+		return func(ctx context.Context, l *MySQLLedger, opts client.Options) error {
+			if err := l.SetCreditLimit(ctx, id, n); err != nil {
+				return err
+			}
+			return startStatement(ctx, opts, id)
+		}, nil
+	case "set-apr":
+		return func(ctx context.Context, l *MySQLLedger, _ client.Options) error { return l.SetAPR(ctx, id, n) }, nil
 	case "set-rate":
-		return func(ctx context.Context, l *MySQLLedger) error { return l.SetRewardRate(ctx, id, n) }, nil
+		return func(ctx context.Context, l *MySQLLedger, _ client.Options) error { return l.SetRewardRate(ctx, id, n) }, nil
 	}
 	return nil, errUsage
+}
+
+// startStatement starts the card's statement cycle, or leaves the running one
+// alone: one StatementWorkflow per card, for the card's life. It is idempotent,
+// so a set-limit that saved the card but failed here is fixed by running it again.
+func startStatement(ctx context.Context, opts client.Options, card string) error {
+	c, err := client.Dial(opts)
+	if err == nil {
+		defer c.Close()
+		_, err = c.ExecuteWorkflow(ctx, client.StartWorkflowOptions{
+			ID:                       StatementWorkflowID(card),
+			TaskQueue:                TaskQueue,
+			WorkflowIDConflictPolicy: enumspb.WORKFLOW_ID_CONFLICT_POLICY_USE_EXISTING,
+		}, StatementWorkflow, StatementTerms{CardID: card}, Statement{})
+	}
+	if err != nil {
+		return fmt.Errorf("card saved; its statements did not start (run set-limit again): %w", err)
+	}
+	return nil
 }

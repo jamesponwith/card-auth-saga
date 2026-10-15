@@ -76,20 +76,21 @@ Before capture, `--name reverse` voids the hold; with no signal it expires after
 A card that attempts more than 5 auths in 60 seconds is declined regardless of its limit. This
 catches card testing, and it covers declined attempts too (SPEC.md, M10).
 
-Run a card's monthly statement (SPEC.md, M9). `Cycle`/`Grace` are in nanoseconds; leave them out for
-30 and 25 days:
+Each card has a monthly statement cycle (SPEC.md, M9 and M12). With MySQL, `set-limit` starts it
+when it creates the card. To run one by hand, `Cycle`/`Grace`/`Day` are in nanoseconds; leave them out
+for 30 days, 25 days and 1 day:
 
 ```sh
-temporal workflow start --task-queue card-auth --type StatementWorkflow --workflow-id statement:card-1 \
-  --input '{"CardID":"card-1","Cycle":60000000000,"Grace":20000000000}' --input '{}'
+go run . set-limit card-1 100000   # creates the card and starts statement:card-1
+go run . set-apr card-1 1999       # 19.99% APR from the next statement (default 24.99%)
 temporal workflow update execute --workflow-id statement:card-1 --name pay --input '{"ID":"p1","Amount":2500}'
 temporal workflow query --workflow-id statement:card-1 --name statement
 ```
 
-Each cycle closes a statement (balance, minimum due), charges a $25 late fee if the minimum isn't
-paid by the due date, and charges interest at the next close on whatever is still unpaid. The
-workflow then continues as new, so its history covers one cycle. `temporal workflow show` lists
-each run.
+Each cycle samples the card's balance at the end of every day. It charges a $25 late fee if the
+minimum isn't paid by the due date, and at close charges interest on the average daily balance
+unless the last statement was paid in full. The workflow then continues as new, so its history covers
+one cycle. `temporal workflow show` lists each run.
 
 ## Failure drills
 
@@ -97,9 +98,10 @@ each run.
 go test -run TestDrills -v .   # downloads + starts a Temporal dev server; add CAS_MYSQL_DSN for MySQL
 ```
 
-Eight drills against a real server: worker killed mid-hold, duplicate capture/refund signals,
+Nine drills against a real server: worker killed mid-hold, duplicate capture/refund signals,
 activities that commit then time out, Update-with-Start approved (sent twice) and declined,
 updates that land mid-step (a refund during settlement, the window closing mid-refund),
-increments with a split capture, and two statement cycles across ContinueAsNew. Each asserts exact balances, then replays the recorded history.
+increments with a split capture, two statement cycles across ContinueAsNew, and (on MySQL)
+a card created twice with `set-limit` getting a single statement cycle. Each asserts exact balances, then replays the recorded history.
 `CAS_UPDATE_GOLDEN=1` re-records `testdata/history-*.json`, which `go test -short` replays on every
 commit to catch nondeterministic workflow changes.

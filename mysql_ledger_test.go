@@ -268,6 +268,9 @@ func TestMySQLConfig(t *testing.T) {
 	if _, ok, err := l.RewardRate(ctx, "shop"); ok || err != nil {
 		t.Errorf("unknown merchant: ok %v, err %v; want not found", ok, err)
 	}
+	if _, ok, err := l.APR(ctx, "card-1"); ok || err != nil {
+		t.Errorf("unknown card APR: ok %v, err %v; want not found", ok, err)
+	}
 	steps := []struct {
 		name    string
 		set     func() error
@@ -295,5 +298,24 @@ func TestMySQLConfig(t *testing.T) {
 				t.Errorf("%s: RewardRate = %d, %v, %v; want %d", st.name, rate, ok, err, st.rate)
 			}
 		}
+	}
+
+	// A new card gets the default APR; it can be changed, never made negative.
+	for _, st := range []struct {
+		set     int64 // -1: don't set
+		want    int64
+		wantErr bool
+	}{{-1, DefaultAPRBps, false}, {1_999, 1_999, false}, {0, 0, false}, {-5, 0, true}} {
+		if st.set != -1 || st.wantErr {
+			if err := l.SetAPR(ctx, "card-1", st.set); (err != nil) != st.wantErr {
+				t.Fatalf("SetAPR(%d): err = %v, wantErr %v", st.set, err, st.wantErr)
+			}
+		}
+		if bps, ok, err := l.APR(ctx, "card-1"); err != nil || !ok || bps != st.want {
+			t.Errorf("after SetAPR(%d): APR = %d, %v, %v; want %d", st.set, bps, ok, err, st.want)
+		}
+	}
+	if err := l.SetAPR(ctx, "no-such-card", 1_000); err == nil {
+		t.Error("SetAPR on a missing card succeeded")
 	}
 }
