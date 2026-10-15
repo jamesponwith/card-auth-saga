@@ -13,7 +13,8 @@ MySQL DDL commits implicitly, so a migration can't be rolled back if it dies hal
 
 An ordered list of migrations in `migrate.go`, recorded in `schema_migrations(version)`. `OpenMySQL`
 applies the missing ones while holding `GET_LOCK('card-auth-saga:migrate')`. Every statement must be
-re-runnable (`IF NOT EXISTS`, or guarded), so a migration that died halfway completes on the next boot.
+re-runnable (`IF NOT EXISTS`, or an "already exists" error such as a duplicate column treated as
+done), so a migration that died halfway completes on the next boot.
 A database newer than the binary is refused. No migration library: about 60 lines of `database/sql`.
 
 ## Consequences

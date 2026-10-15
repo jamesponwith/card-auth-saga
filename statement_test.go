@@ -14,6 +14,16 @@ import (
 
 const day = 24 * time.Hour
 
+// seeded is a ledger where card-1 has already spent cents.
+func seeded(t *testing.T, cents int64) *MemLedger {
+	t.Helper()
+	l := NewMemLedger()
+	if err := l.Post(t.Context(), "seed", Entry{postedAccount("card-1"), cents}, Entry{openToBuyAccount("card-1"), -cents}); err != nil {
+		t.Fatal(err)
+	}
+	return l
+}
+
 func pay(at time.Duration, id string, amount int64) signal {
 	return signal{at, PayUpdate, Payment{ID: id, Amount: amount}}
 }
@@ -49,10 +59,7 @@ func TestStatementCycle(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			var s testsuite.WorkflowTestSuite
 			env := s.NewTestWorkflowEnvironment()
-			l := NewMemLedger()
-			if err := l.Post(t.Context(), "seed", Entry{postedAccount("card-1"), tt.seedPosted}, Entry{openToBuyAccount("card-1"), -tt.seedPosted}); err != nil {
-				t.Fatal(err)
-			}
+			l := seeded(t, tt.seedPosted)
 			env.RegisterActivity(&Activities{Ledger: l, Config: StaticConfig{}})
 			got := sendSteps(env, tt.steps)
 
@@ -81,10 +88,7 @@ func TestStatementCycle(t *testing.T) {
 func TestStatementCloseWithPaymentsInFlight(t *testing.T) {
 	var s testsuite.WorkflowTestSuite
 	env := s.NewTestWorkflowEnvironment()
-	l := NewMemLedger()
-	if err := l.Post(t.Context(), "seed", Entry{postedAccount("card-1"), 50_000}, Entry{openToBuyAccount("card-1"), -50_000}); err != nil {
-		t.Fatal(err)
-	}
+	l := seeded(t, 50_000)
 	a := &Activities{Ledger: l, Config: StaticConfig{}}
 	env.RegisterActivity(a)
 	// A payment takes two days to post.
@@ -112,10 +116,7 @@ func TestStatementCloseWithPaymentsInFlight(t *testing.T) {
 // A payment resent in a later cycle posts nothing and doesn't count toward
 // that cycle's minimum, so the late fee still lands.
 func TestStatementPaymentResentNextCycle(t *testing.T) {
-	l := NewMemLedger()
-	if err := l.Post(t.Context(), "seed", Entry{postedAccount("card-1"), 50_000}, Entry{openToBuyAccount("card-1"), -50_000}); err != nil {
-		t.Fatal(err)
-	}
+	l := seeded(t, 50_000)
 	cycle := func(last Statement, steps []step) Statement {
 		var s testsuite.WorkflowTestSuite
 		env := s.NewTestWorkflowEnvironment() // same workflow ID every run, as after ContinueAsNew
@@ -157,10 +158,7 @@ func TestStatementAPRFromConfig(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			var s testsuite.WorkflowTestSuite
 			env := s.NewTestWorkflowEnvironment()
-			l := NewMemLedger()
-			if err := l.Post(t.Context(), "seed", Entry{postedAccount("card-1"), 50_000}, Entry{openToBuyAccount("card-1"), -50_000}); err != nil {
-				t.Fatal(err)
-			}
+			l := seeded(t, 50_000)
 			env.RegisterActivity(&Activities{Ledger: l, Config: StaticConfig{APRs: tt.aprs}})
 			sendSteps(env, []step{upd(pay(9*day+12*time.Hour, "p1", 2_500), "ok")})
 
@@ -177,10 +175,7 @@ func TestStatementAPRFromConfig(t *testing.T) {
 func TestStatementCreditDaysCountAsZero(t *testing.T) {
 	var s testsuite.WorkflowTestSuite
 	env := s.NewTestWorkflowEnvironment()
-	l := NewMemLedger()
-	if err := l.Post(t.Context(), "seed", Entry{postedAccount("card-1"), 50_000}, Entry{openToBuyAccount("card-1"), -50_000}); err != nil {
-		t.Fatal(err)
-	}
+	l := seeded(t, 50_000)
 	env.RegisterActivity(&Activities{Ledger: l, Config: StaticConfig{}})
 	sendSteps(env, []step{upd(pay(9*day+12*time.Hour, "p1", 2_500), "ok")})
 	env.RegisterDelayedCallback(func() { // a $600 merchant refund: the card goes into credit

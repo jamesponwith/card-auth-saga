@@ -31,7 +31,7 @@ func main() {
 func run(ctx context.Context, args []string, env func(string) string) error {
 	dsn := env("CAS_MYSQL_DSN")
 	temporalOptions := client.Options{HostPort: env("TEMPORAL_ADDRESS")} // empty: localhost:7233
-	var cmd *adminCmd
+	var cmd adminCmd
 	if len(args) > 0 {
 		var err error
 		if cmd, err = admin(args); err != nil {
@@ -54,7 +54,7 @@ func run(ctx context.Context, args []string, env func(string) string) error {
 		}
 		defer func() { _ = l.Close() }()
 		if cmd != nil {
-			return cmd.run(ctx, l, temporalOptions)
+			return cmd(ctx, l, temporalOptions)
 		}
 		acts = &Activities{Ledger: l, Config: l}
 	}
@@ -73,16 +73,13 @@ func run(ctx context.Context, args []string, env func(string) string) error {
 
 var errUsage = errors.New("usage: card-auth-saga [set-limit <card> <cents> | set-apr <card> <basis-points> | set-rate <merchant> <points-per-dollar>]")
 
-// adminCmd is a parsed admin command: a config change, and for a new or
-// updated card, its statement cycle to start.
-type adminCmd struct {
-	change         func(context.Context, *MySQLLedger) error
-	startStatement string // card ID, for set-limit
-}
+// adminCmd applies a parsed admin command. Temporal options reach set-limit,
+// which also starts the card's statements.
+type adminCmd func(context.Context, *MySQLLedger, client.Options) error
 
 // admin parses an admin command. Bad values such as a negative limit are left
 // to the tables' CHECK constraints.
-func admin(args []string) (*adminCmd, error) {
+func admin(args []string) (adminCmd, error) {
 	if len(args) != 3 || args[1] == "" {
 		return nil, errUsage
 	}
@@ -93,43 +90,35 @@ func admin(args []string) (*adminCmd, error) {
 	}
 	switch args[0] {
 	case "set-limit":
-		return &adminCmd{func(ctx context.Context, l *MySQLLedger) error { return l.SetCreditLimit(ctx, id, n) }, id}, nil
+		return func(ctx context.Context, l *MySQLLedger, opts client.Options) error {
+			if err := l.SetCreditLimit(ctx, id, n); err != nil {
+				return err
+			}
+			return startStatement(ctx, opts, id)
+		}, nil
 	case "set-apr":
-		return &adminCmd{change: func(ctx context.Context, l *MySQLLedger) error { return l.SetAPR(ctx, id, n) }}, nil
+		return func(ctx context.Context, l *MySQLLedger, _ client.Options) error { return l.SetAPR(ctx, id, n) }, nil
 	case "set-rate":
-		return &adminCmd{change: func(ctx context.Context, l *MySQLLedger) error { return l.SetRewardRate(ctx, id, n) }}, nil
+		return func(ctx context.Context, l *MySQLLedger, _ client.Options) error { return l.SetRewardRate(ctx, id, n) }, nil
 	}
 	return nil, errUsage
 }
 
-// run applies the change, then starts the card's statements if it has any.
-// Starting is idempotent, so a set-limit that failed partway is fixed by
-// running it again.
-func (cmd *adminCmd) run(ctx context.Context, l *MySQLLedger, opts client.Options) error {
-	if err := cmd.change(ctx, l); err != nil {
-		return err
-	}
-	if cmd.startStatement == "" {
-		return nil
-	}
+// startStatement starts the card's statement cycle, or leaves the running one
+// alone: one StatementWorkflow per card, for the card's life. It is idempotent,
+// so a set-limit that saved the card but failed here is fixed by running it again.
+func startStatement(ctx context.Context, opts client.Options, card string) error {
 	c, err := client.Dial(opts)
+	if err == nil {
+		defer c.Close()
+		_, err = c.ExecuteWorkflow(ctx, client.StartWorkflowOptions{
+			ID:                       StatementWorkflowID(card),
+			TaskQueue:                TaskQueue,
+			WorkflowIDConflictPolicy: enumspb.WORKFLOW_ID_CONFLICT_POLICY_USE_EXISTING,
+		}, StatementWorkflow, StatementTerms{CardID: card}, Statement{})
+	}
 	if err != nil {
 		return fmt.Errorf("card saved; its statements did not start (run set-limit again): %w", err)
 	}
-	defer c.Close()
-	if err := startStatement(ctx, c, cmd.startStatement); err != nil {
-		return fmt.Errorf("card saved; its statements did not start (run set-limit again): %w", err)
-	}
 	return nil
-}
-
-// startStatement starts the card's statement cycle, or leaves the running one
-// alone: one StatementWorkflow per card, for the card's life.
-func startStatement(ctx context.Context, c client.Client, card string) error {
-	_, err := c.ExecuteWorkflow(ctx, client.StartWorkflowOptions{
-		ID:                       StatementWorkflowID(card),
-		TaskQueue:                TaskQueue,
-		WorkflowIDConflictPolicy: enumspb.WORKFLOW_ID_CONFLICT_POLICY_USE_EXISTING,
-	}, StatementWorkflow, StatementTerms{CardID: card}, Statement{})
-	return err
 }

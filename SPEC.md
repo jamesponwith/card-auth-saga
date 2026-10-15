@@ -142,7 +142,8 @@ Card limits and partner reward rates live in MySQL, not in code:
   unreachable, the limit is still saved and the command says to run it again.
 - **APR per card.** The rate lives in `cards.apr_bps` (default 2499, `CHECK >= 0`), is set with
   `set-apr`, and is read at each close, so a change applies from the next statement. Migration 4 adds
-  the column. It's the first `ALTER`, so it's guarded by an `unless` query (ADR 0005).
+  the column. It's the first `ALTER`; on a re-run, MySQL's duplicate-column error counts as already
+  applied (ADR 0005).
 - **Average daily balance.** The cycle runs day by day. At the end of each day it samples the posted
   balance, counting a credit as 0. On the due day, the late fee posts before that day's sample.
   Interest = Σ daily balances × APR / 365. It's waived if the last statement was paid in full by the
