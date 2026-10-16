@@ -358,7 +358,7 @@ func TestDrills(t *testing.T) {
 			return slices.ContainsFunc(findings, func(f Finding) bool { return f.Check == check && f.Subject == subject })
 		}
 		auditRun, err := c.ExecuteWorkflow(ctx, client.StartWorkflowOptions{ID: d.card + "-audit", TaskQueue: TaskQueue},
-			AuditWorkflow, AuditOptions{StuckAuth: time.Millisecond, StuckStatement: 1_000 * time.Hour})
+			AuditWorkflow, AuditOptions{StuckAuth: time.Millisecond})
 		if err != nil {
 			t.Fatal(err)
 		}

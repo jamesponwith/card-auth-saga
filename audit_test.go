@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"maps"
 	"testing"
 
 	"go.temporal.io/sdk/testsuite"
@@ -19,9 +20,9 @@ func healthyCard(id string) map[string]int64 {
 }
 
 func with(base map[string]int64, changes map[string]int64) map[string]int64 {
-	out := map[string]int64{}
-	for k, v := range base {
-		out[k] = v
+	out := maps.Clone(base)
+	if out == nil {
+		out = map[string]int64{}
 	}
 	for k, v := range changes {
 		out[k] += v

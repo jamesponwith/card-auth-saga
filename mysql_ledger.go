@@ -121,9 +121,8 @@ func (l *MySQLLedger) RecordAttempt(ctx context.Context, card, id string, at tim
 	return n, err
 }
 
-func (l *MySQLLedger) Accounts(ctx context.Context, prefix string) (map[string]int64, error) {
-	escaped := strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`).Replace(prefix)
-	rows, err := l.db.QueryContext(ctx, `SELECT id, balance FROM accounts WHERE id LIKE ?`, escaped+"%")
+func (l *MySQLLedger) Accounts(ctx context.Context) (map[string]int64, error) {
+	rows, err := l.db.QueryContext(ctx, `SELECT id, balance FROM accounts`)
 	if err != nil {
 		return nil, err
 	}

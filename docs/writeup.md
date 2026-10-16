@@ -140,7 +140,6 @@ Each safeguard was removed on purpose to confirm a test notices:
 | Each audit invariant (card money, holds, points, memos, points net, total) | `TestAuditLedger`, one row per break |
 | Stuck auths and failed workflows are found | audit drill: either one missed |
 | Health follows the latest finished audit | audit drill: health ok while an audit has findings, or while the next one runs |
-| Account-prefix wildcards are literal | *ledger accounts* on MySQL: `card:a_1:` also matches `card:ax1:` |
 | An increment claims the hold | *capture during increment rejected*: otherwise a final capture strands the increment |
 
 Two experiments removed code instead. Cancelling the hold timer after capture survived mutation,

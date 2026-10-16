@@ -54,10 +54,10 @@ type AuditReport struct {
 	Findings []Finding
 }
 
-// AuditOptions tune the workflow checks; zero takes the defaults. FailedSince
-// is how far back to look for failed workflows: the interval between audits.
+// AuditOptions tune the workflow checks; zero takes the default. Drills
+// shrink StuckAuth to see a live hold reported.
 type AuditOptions struct {
-	StuckAuth, StuckStatement, FailedSince time.Duration
+	StuckAuth time.Duration
 }
 
 // AuditWorkflow checks the ledger's invariants and the workflows' health, and
@@ -75,8 +75,8 @@ func AuditWorkflow(ctx workflow.Context, opts AuditOptions) (AuditReport, error)
 	var workflows []Finding
 	cut := AuditCutoffs{
 		StuckAuthBefore:      now.Add(-cmp.Or(opts.StuckAuth, DefaultStuckAuth)),
-		StuckStatementBefore: now.Add(-cmp.Or(opts.StuckStatement, DefaultStuckStatement)),
-		FailedAfter:          now.Add(-cmp.Or(opts.FailedSince, AuditInterval)),
+		StuckStatementBefore: now.Add(-DefaultStuckStatement),
+		FailedAfter:          now.Add(-AuditInterval), // since the previous audit
 	}
 	if err := workflow.ExecuteActivity(ctx, a.AuditWorkflows, cut).Get(ctx, &workflows); err != nil {
 		return report, err
@@ -90,7 +90,7 @@ func AuditWorkflow(ctx workflow.Context, opts AuditOptions) (AuditReport, error)
 
 // AuditLedger reads every account and checks the ledger's invariants.
 func (a *Activities) AuditLedger(ctx context.Context) ([]Finding, error) {
-	accounts, err := a.Ledger.Accounts(ctx, "")
+	accounts, err := a.Ledger.Accounts(ctx)
 	if err != nil {
 		return nil, err
 	}
