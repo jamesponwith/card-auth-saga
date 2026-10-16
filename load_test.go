@@ -16,7 +16,6 @@ import (
 	"time"
 
 	enumspb "go.temporal.io/api/enums/v1"
-	"go.temporal.io/api/workflowservice/v1"
 	"go.temporal.io/sdk/client"
 	"go.temporal.io/sdk/testsuite"
 	"go.temporal.io/sdk/worker"
@@ -106,17 +105,24 @@ func TestLoad(t *testing.T) {
 			if approved.Load() != sc.wantApproved {
 				t.Errorf("approved %d, want exactly %d", approved.Load(), sc.wantApproved)
 			}
-			waitForAuths(t, c, prefix)
+			for i := range sc.auths { // every auth has finished: refunds closed, holds settled
+				if err := c.GetWorkflow(ctx, fmt.Sprintf("%s-auth%d", prefix, i), "").Get(ctx, nil); err != nil {
+					t.Error(err)
+				}
+			}
+			var posted int64
 			for i := range sc.cards {
 				card := fmt.Sprintf("%s-c%d", prefix, i)
 				if h := balance(t, l, holdsAccount(card)); h != 0 {
 					t.Errorf("%s holds = %d after every auth settled, want 0", card, h)
 				}
-				if p := balance(t, l, postedAccount(card)); p > sc.limit {
+				p := balance(t, l, postedAccount(card))
+				if p > sc.limit {
 					t.Errorf("%s posted %d over its %d limit", card, p, sc.limit)
 				}
+				posted += p
 			}
-			if posted := sumPosted(t, l, prefix, sc.cards); posted != sc.wantApproved*amount {
+			if posted != sc.wantApproved*amount {
 				t.Errorf("posted %d across the cards, want %d (one capture per approval)", posted, sc.wantApproved*amount)
 			}
 			accounts, err := l.Accounts(ctx)
@@ -155,26 +161,4 @@ func authorizeAndSettle(ctx context.Context, c client.Client, id string, req Aut
 		return dec, decided, err
 	}
 	return dec, decided, ch.Get(ctx, nil)
-}
-
-// waitForAuths waits until none of this scenario's auths is still running.
-func waitForAuths(t *testing.T, c client.Client, prefix string) {
-	t.Helper()
-	query := fmt.Sprintf("WorkflowType = 'AuthorizeWorkflow' AND ExecutionStatus = 'Running' AND WorkflowId STARTS_WITH '%s'", prefix)
-	for deadline := time.Now().Add(2 * time.Minute); time.Now().Before(deadline); time.Sleep(200 * time.Millisecond) {
-		n, err := c.CountWorkflow(context.Background(), &workflowservice.CountWorkflowExecutionsRequest{Query: query})
-		if err == nil && n.GetCount() == 0 {
-			return
-		}
-	}
-	t.Fatalf("auths under %s still running after 2 minutes", prefix)
-}
-
-func sumPosted(t *testing.T, l Ledger, prefix string, cards int) int64 {
-	t.Helper()
-	var sum int64
-	for i := range cards {
-		sum += balance(t, l, postedAccount(fmt.Sprintf("%s-c%d", prefix, i)))
-	}
-	return sum
 }
