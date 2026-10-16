@@ -401,6 +401,9 @@ func (brokenConfig) RewardRate(context.Context, string) (int64, bool, error) {
 func (brokenConfig) APR(context.Context, string) (int64, bool, error) {
 	return 0, false, errors.New("config store down")
 }
+func (brokenConfig) CardStatus(context.Context, string) (string, bool, error) {
+	return "", false, errors.New("config store down")
+}
 
 // A config store outage must fail the auth, not decline the card as unknown.
 func TestConfigOutageIsNotADecline(t *testing.T) {
@@ -448,6 +451,50 @@ func TestRewardRateOutageRetries(t *testing.T) {
 	}
 	if res.Points != 1_200 {
 		t.Errorf("points = %d, want 1200 (3x on $400, after the store recovers)", res.Points)
+	}
+}
+
+// A frozen or closed card declines new auths and increments, but a hold
+// placed while it was active still settles.
+func TestCardStatus(t *testing.T) {
+	tests := []struct {
+		name     string
+		status   string // card-1's status when the auth arrives
+		freezeAt time.Duration
+		steps    []step
+		want     AuthResult
+	}{
+		{"active", CardActive, 0, []step{upd(capture(hr, 40_000), "ok")}, AuthResult{Status: StatusCaptured, Captured: 40_000, Points: 400}},
+		{"frozen declines", CardFrozen, 0, nil, AuthResult{Status: StatusDeclined, Reason: DeclineFrozen}},
+		{"closed declines", CardClosed, 0, nil, AuthResult{Status: StatusDeclined, Reason: DeclineClosed}},
+		{"frozen after the hold: the capture still settles", CardActive, hr / 2, []step{upd(capture(hr, 40_000), "ok")},
+			AuthResult{Status: StatusCaptured, Captured: 40_000, Points: 400}},
+		{"frozen after the hold: no increments", CardActive, hr / 2, []step{upd(increment(hr, "i1", 1_000), "declined"), upd(capture(2*hr, 40_000), "ok")},
+			AuthResult{Status: StatusCaptured, Captured: 40_000, Points: 400}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var s testsuite.WorkflowTestSuite
+			env := s.NewTestWorkflowEnvironment()
+			cfg := card1()
+			cfg.Statuses = map[string]string{"card-1": tt.status}
+			env.RegisterActivity(&Activities{Ledger: NewMemLedger(), Config: cfg})
+			if tt.freezeAt > 0 {
+				env.RegisterDelayedCallback(func() { cfg.Statuses["card-1"] = CardFrozen }, tt.freezeAt)
+			}
+			got := sendSteps(env, tt.steps)
+
+			env.ExecuteWorkflow(AuthorizeWorkflow, auth("card-1", 40_000))
+
+			checkSteps(t, tt.steps, got)
+			var res AuthResult
+			if err := env.GetWorkflowResult(&res); err != nil {
+				t.Fatal(err)
+			}
+			if res != tt.want {
+				t.Errorf("result = %+v, want %+v", res, tt.want)
+			}
+		})
 	}
 }
 

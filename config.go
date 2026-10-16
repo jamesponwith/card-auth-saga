@@ -12,13 +12,23 @@ type Config interface {
 	RewardRate(ctx context.Context, merchant string) (rate int64, ok bool, err error)
 	// APR is the card's annual rate in basis points; ok is false for an unknown card.
 	APR(ctx context.Context, card string) (bps int64, ok bool, err error)
+	// CardStatus is CardActive, CardFrozen or CardClosed; ok is false for an unknown card.
+	CardStatus(ctx context.Context, card string) (status string, ok bool, err error)
 }
+
+// Card statuses (SPEC M16). Closed is final.
+const (
+	CardActive = "active"
+	CardFrozen = "frozen"
+	CardClosed = "closed"
+)
 
 // StaticConfig is a fixed Config, for tests and the in-memory worker.
 type StaticConfig struct {
-	Limits map[string]int64 // card → credit limit, cents
-	Rates  map[string]int64 // merchant → points per $1
-	APRs   map[string]int64 // card → APR, basis points
+	Limits   map[string]int64  // card → credit limit, cents
+	Rates    map[string]int64  // merchant → points per $1
+	APRs     map[string]int64  // card → APR, basis points
+	Statuses map[string]string // card → status; missing is active
 }
 
 func (c StaticConfig) CreditLimit(_ context.Context, card string) (int64, bool, error) {
@@ -34,4 +44,11 @@ func (c StaticConfig) RewardRate(_ context.Context, merchant string) (int64, boo
 func (c StaticConfig) APR(_ context.Context, card string) (int64, bool, error) {
 	bps, ok := c.APRs[card]
 	return bps, ok, nil
+}
+
+func (c StaticConfig) CardStatus(_ context.Context, card string) (string, bool, error) {
+	if s, ok := c.Statuses[card]; ok {
+		return s, true, nil
+	}
+	return CardActive, true, nil
 }

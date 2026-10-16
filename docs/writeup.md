@@ -140,6 +140,10 @@ Each safeguard was removed on purpose to confirm a test notices:
 | Each audit invariant (card money, holds, points, memos, points net, total) | `TestAuditLedger`, one row per break |
 | Stuck auths and failed workflows are found | audit drill: either one missed |
 | Health follows the latest finished audit | audit drill: health ok while an audit has findings, or while the next one runs |
+| Frozen and closed cards decline new auths | *card status*: frozen and closed both approved |
+| Holds placed before a freeze still settle, but can't grow | *frozen after the hold*: an increment granted |
+| A closed card's statements end only once nothing is posted or held | *statement ends for closed card*: ends with a balance, a hold or a credit |
+| Closed is final, and a closed card's limit can't change | *card status transitions*: a closed card reopened or re-limited |
 | An increment claims the hold | *capture during increment rejected*: otherwise a final capture strands the increment |
 
 Two experiments removed code instead. Cancelling the hold timer after capture survived mutation,

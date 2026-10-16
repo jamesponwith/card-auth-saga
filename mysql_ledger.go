@@ -170,10 +170,41 @@ func (l *MySQLLedger) lookup(ctx context.Context, query, key string) (int64, boo
 }
 
 // SetCreditLimit creates or updates a card. A negative limit fails the
-// table's CHECK constraint.
+// table's CHECK constraint, and a closed card can't be changed: a new limit
+// would restart its statements.
 func (l *MySQLLedger) SetCreditLimit(ctx context.Context, card string, limit int64) error {
+	if status, ok, err := l.CardStatus(ctx, card); err != nil {
+		return err
+	} else if ok && status == CardClosed {
+		return fmt.Errorf("card %q is closed", card)
+	}
 	_, err := l.db.ExecContext(ctx, `INSERT INTO cards (id, credit_limit) VALUES (?, ?) AS new
-		ON DUPLICATE KEY UPDATE credit_limit = new.credit_limit`, card, limit)
+		ON DUPLICATE KEY UPDATE credit_limit = IF(cards.status = 'closed', cards.credit_limit, new.credit_limit)`, card, limit)
+	return err
+}
+
+func (l *MySQLLedger) CardStatus(ctx context.Context, card string) (string, bool, error) {
+	var status string
+	err := l.db.QueryRowContext(ctx, `SELECT status FROM cards WHERE id = ?`, card).Scan(&status)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", false, nil
+	}
+	return status, err == nil, err
+}
+
+// SetCardStatus freezes, unfreezes or closes a card. Closed is final: the
+// UPDATE never touches a closed row, so a race can't reopen one either.
+func (l *MySQLLedger) SetCardStatus(ctx context.Context, card, status string) error {
+	cur, ok, err := l.CardStatus(ctx, card)
+	switch {
+	case err != nil:
+		return err
+	case !ok:
+		return fmt.Errorf("no card %q", card)
+	case cur == CardClosed:
+		return fmt.Errorf("card %q is closed", card)
+	}
+	_, err = l.db.ExecContext(ctx, `UPDATE cards SET status = ? WHERE id = ? AND status <> 'closed'`, status, card)
 	return err
 }
 

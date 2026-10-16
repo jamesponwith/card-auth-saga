@@ -208,6 +208,23 @@ on demand with `go run . audit`. It reports findings rather than fixing anything
 - Account IDs are `card:<id>:<kind>` and `partner:<merchant>:points-issued`, so card IDs can't contain
   `:`; `set-limit` rejects them.
 
+## Freezing and closing cards (M16)
+
+`cards.status` is `active`, `frozen` or `closed` (migration 5, `CHECK`), set with
+`go run . freeze|unfreeze|close <card>`.
+
+- **Frozen:** new auths decline with `Reason: Frozen`, and increments decline. Holds already placed
+  carry on: captures, refunds and disputes in progress all finish, because freezing stops new credit,
+  not existing obligations. `unfreeze` lifts it.
+- **Closed:** like frozen, with `Reason: Closed`, and permanent. Freeze, unfreeze and `set-limit` on a
+  closed card are refused, so a closed card can't be reopened by accident. The statement cycle keeps
+  billing until a close finds nothing posted and nothing held, then ends instead of continuing as new.
+  A refund or chargeback that lands after that leaves a credit for a manual payout; the auditor's ledger
+  checks still hold.
+- `PlaceHold` reads the status with the limit, so a status change applies to the next auth. Runs
+  started before this replay unchanged: an old `PlaceHold` result is only `true`/`false`, and statement
+  runs gate the new close step with `GetVersion("end-when-closed")`.
+
 ## Non-goals
 
 - Real card networks (ISO 8583), PCI scope, or real money.
@@ -232,6 +249,7 @@ on demand with `go run . audit`. It reports findings rather than fixing anything
 - **M13**: Disputes (provisional credit, merchant response, analyst review, chargeback or rebill).
 - **M14**: Operate stage: `/healthz` with dependency checks, SDK metrics via expvar, SLO contract (ADR 0006).
 - **M15**: Nightly ledger auditor on a Temporal Schedule.
+- **M16**: Freezing and closing cards.
 
 ## Success criteria
 

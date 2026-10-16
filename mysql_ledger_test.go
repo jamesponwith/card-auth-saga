@@ -319,3 +319,48 @@ func TestMySQLConfig(t *testing.T) {
 		t.Error("SetAPR on a missing card succeeded")
 	}
 }
+
+// Status moves active ⇄ frozen and either way to closed; closed is final, and
+// a closed card's limit can't be set (it would restart its statements).
+func TestCardStatusTransitions(t *testing.T) {
+	l := open(t, freshDB(t))
+	ctx := context.Background()
+	if err := l.SetCreditLimit(ctx, "card-1", 100_000); err != nil {
+		t.Fatal(err)
+	}
+	steps := []struct {
+		to      string
+		want    string // status afterwards
+		wantErr bool
+	}{
+		{"", CardActive, false}, // a new card is active
+		{CardFrozen, CardFrozen, false},
+		{CardFrozen, CardFrozen, false}, // freezing twice is fine
+		{CardActive, CardActive, false},
+		{CardClosed, CardClosed, false},
+		{CardActive, CardClosed, true}, // closed is final
+		{CardFrozen, CardClosed, true},
+	}
+	for _, st := range steps {
+		if st.to != "" {
+			if err := l.SetCardStatus(ctx, "card-1", st.to); (err != nil) != st.wantErr {
+				t.Fatalf("SetCardStatus(%s): err = %v, wantErr %v", st.to, err, st.wantErr)
+			}
+		}
+		if got, ok, err := l.CardStatus(ctx, "card-1"); err != nil || !ok || got != st.want {
+			t.Errorf("after %q: status = %q, %v, %v; want %q", st.to, got, ok, err, st.want)
+		}
+	}
+	if err := l.SetCreditLimit(ctx, "card-1", 200_000); err == nil {
+		t.Error("set a closed card's limit")
+	}
+	if err := l.SetCardStatus(ctx, "no-such-card", CardFrozen); err == nil {
+		t.Error("froze a card that doesn't exist")
+	}
+	if err := l.SetCreditLimit(ctx, "card-2", 1_000); err != nil {
+		t.Fatal(err)
+	}
+	if err := l.SetCardStatus(ctx, "card-2", "lost"); err == nil { // not a status: the CHECK rejects it
+		t.Error("set an active card's status to \"lost\"")
+	}
+}

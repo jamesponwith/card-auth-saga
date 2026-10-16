@@ -98,6 +98,9 @@ for 30 days, 25 days and 1 day:
 ```sh
 go run . set-limit card-1 100000   # creates the card and starts statement:card-1
 go run . set-apr card-1 1999       # 19.99% APR from the next statement (default 24.99%)
+go run . freeze card-1             # new auths decline (Reason Frozen); holds already placed still settle
+go run . unfreeze card-1
+go run . close card-1              # final: declines (Closed); statements end once nothing is owed or held
 temporal workflow update execute --workflow-id statement:card-1 --name pay --input '{"ID":"p1","Amount":2500}'
 temporal workflow query --workflow-id statement:card-1 --name statement
 ```

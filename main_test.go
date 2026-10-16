@@ -24,6 +24,11 @@ func TestAdminArgs(t *testing.T) {
 		{[]string{"delete-card", "card-1", "1"}, "usage"},
 		{[]string{"set-limit", "card:1", "100"}, "can't contain ':'"},
 		{[]string{"set-rate", "shop:eu", "3"}, ""}, // merchants aren't card IDs
+		{[]string{"freeze", "card-1"}, ""},
+		{[]string{"unfreeze", "card-1"}, ""},
+		{[]string{"close", "card-1"}, ""},
+		{[]string{"close"}, "usage"},
+		{[]string{"close", "card-1", "now"}, "usage"},
 	}
 	for _, tt := range tests {
 		t.Run(strings.Join(tt.args, " "), func(t *testing.T) {

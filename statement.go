@@ -193,7 +193,35 @@ func closeDaily(ctx workflow.Context, a *Activities, terms StatementTerms, last 
 		return err
 	}
 	next.MinDue = minDue(next.Balance)
+	// A closed card's statements end once nothing is posted or held. Runs from
+	// before closing existed always continue.
+	if workflow.GetVersion(ctx, "end-when-closed", workflow.DefaultVersion, 1) != workflow.DefaultVersion {
+		var done bool
+		if err := workflow.ExecuteActivity(ctx, a.CardDone, terms.CardID).Get(ctx, &done); err != nil {
+			return err
+		}
+		if done {
+			workflow.GetLogger(ctx).Info("closed card paid off: statements end", "card", terms.CardID, "statement", next.N)
+			return nil
+		}
+	}
 	return workflow.NewContinueAsNewError(ctx, StatementWorkflow, terms, next)
+}
+
+// CardDone reports whether a card is closed with nothing posted or held, so
+// its statements can stop.
+func (a *Activities) CardDone(ctx context.Context, card string) (bool, error) {
+	status, _, err := a.Config.CardStatus(ctx, card)
+	if err != nil || status != CardClosed {
+		return false, err
+	}
+	for _, account := range []string{postedAccount(card), holdsAccount(card)} {
+		b, err := a.Ledger.Balance(ctx, account)
+		if err != nil || b != 0 {
+			return false, err
+		}
+	}
+	return true, nil
 }
 
 // minDue is the larger of the floor and a share of the balance, but never more
