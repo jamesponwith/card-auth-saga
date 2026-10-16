@@ -127,8 +127,7 @@ Pushing a `v*` tag releases and deploys (ADR 0007). `release.yml` runs gorelease
 
 The deploy fails unless `https://<prefix>-worker.fly.dev/healthz` reports `ok` at the tag's version.
 If it doesn't, the script redeploys the image that was running (by digest) and still fails, reporting
-"rolled back to <version>". A release that migrated the schema can't be rolled back, since the older
-worker refuses the newer schema: the script says to fix forward.
+"rolled back to <version>" (ADR 0007).
 
 One-time setup: a Fly.io account with a payment method, then two repo secrets:
 

@@ -46,7 +46,6 @@ flyctl secrets set -a "$worker" --stage >/dev/null \
   CAS_MYSQL_DSN="root:$CAS_MYSQL_PASSWORD@tcp($mysql.internal:3306)/cas"
 
 url="https://$worker.fly.dev/healthz"
-body=""
 # smoke: does the public /healthz report ok at version $1? It means the worker
 # reached Temporal and MySQL, and the latest audit (if any) was clean.
 smoke() {
@@ -63,7 +62,7 @@ smoke() {
 # What the worker runs now, by digest (immutable), to roll back to.
 prev_image=$(flyctl image show -a "$worker" --json 2>/dev/null |
   jq -r 'first(.[] | select(.Digest)) | "\(.Registry)/\(.Repository)@\(.Digest)"' 2>/dev/null || true)
-prev_version=$(curl -fsS --max-time 10 "$url" 2>/dev/null | grep -o '"version":"[^"]*"' | cut -d'"' -f4 || true)
+prev_version=$(curl -fsS --max-time 10 "$url" 2>/dev/null | jq -r '.version // empty' 2>/dev/null || true)
 
 deploy "$worker" worker.toml "$root" --dockerfile "$root/Dockerfile" --build-arg VERSION="$VERSION"
 if smoke "$VERSION"; then
@@ -80,8 +79,6 @@ deploy "$worker" worker.toml --image "$prev_image"
 if smoke "$prev_version"; then
   echo "rolled back to $prev_version; $VERSION is not deployed" >&2
 else
-  # Migrations only move forward, and a worker refuses a schema newer than it
-  # knows (ADR 0005): if $VERSION migrated, the old image can't run. Fix forward.
   echo "ROLLBACK FAILED: $prev_version isn't healthy either (last: ${body:-no response})." >&2
   echo "If $VERSION ran a migration, $prev_version refuses the newer schema: fix forward with a new release." >&2
 fi
