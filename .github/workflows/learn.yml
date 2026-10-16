@@ -1,6 +1,7 @@
-# Learn: weekly DORA-lite snapshot committed back to the repo. The git
-# history of docs/dora.json is the trend line; docs/dora.html renders the
-# latest snapshot. Insight → new bd issues → Intent. The flywheel turns.
+# Learn: weekly DORA-lite + agent-effectiveness snapshot committed back to the
+# repo. The git history of docs/dora.json is the trend line; docs/dora.html
+# renders the latest snapshot. Deploy metrics come from the production
+# deployments release.yml records. Insight → new bd issues → Intent.
 name: learn
 
 on:
@@ -19,7 +20,11 @@ jobs:
       - uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
-      - run: go run ./tools/dora -repo "$GITHUB_REPOSITORY" -out docs/dora.json
+      # The template's canonical collector, by module path, as operate.yml runs
+      # the prober: one copy, so every flywheel repo measures the same way.
+      # Pinned, not @latest: the module proxy can serve a stale "latest" for a
+      # while after a template change. Bump it deliberately.
+      - run: go run github.com/jamesponwith/flywheel-template/tools/dora@v0.0.0-20261016232855-0bc108fb0070 -repo "$GITHUB_REPOSITORY" -out docs/dora.json -prs 50
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       - run: |

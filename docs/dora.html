@@ -10,11 +10,17 @@ h1{color:#7ee787;font-size:16px;font-weight:600}h1::before{content:"$ ";color:#8
 .card b{display:block;font-size:22px;color:#7ee787;font-weight:600}
 .card span{color:#8b949e}
 footer{color:#30363d}
+h2{color:#7ee787;font-size:15px;font-weight:600;margin-top:2.5rem}h2::before{content:"$ ";color:#8b949e}
+.note{color:#8b949e;margin:.25rem 0 0}
+.card em{display:block;color:#484f4a;font-style:normal;font-size:12px;margin-top:.4rem}
 #meta{color:#8b949e}
 </style>
 <h1>DORA-lite</h1>
 <div id="meta"></div>
 <div class="grid" id="g"></div>
+<h2>agent effectiveness</h2>
+<p class="note">DORA measures the software. These measure how it got written.</p>
+<div class="grid" id="a"></div>
 <footer>weekly snapshot by learn.yml · trend = git history of dora.json</footer>
 <script>
 function fmt(v, unit){ return v ? v.toFixed(1) + unit : "n/a"; }
@@ -22,15 +28,42 @@ fetch("dora.json").then(function(r){ return r.json(); }).then(function(d){
   document.getElementById("meta").textContent = d.repo + " · " + d.generated_at;
   var df = d.deploy_frequency, lt = d.lead_time_hours,
       cf = d.change_failure_rate, mt = d.mttr_hours;
+  // Snapshots from before deployments counted releases; newer ones say which.
+  var what = df.source === "deployments" ? "deploys" : "releases";
+  var total = df.total !== undefined ? df.total : df.releases_total,
+      last30 = df.last_30d !== undefined ? df.last_30d : df.releases_last_30d,
+      attempts = cf.attempts !== undefined ? cf.attempts : cf.releases,
+      failures = cf.incidents + (cf.failed_deploys || 0);
   document.getElementById("g").innerHTML =
     "<div class='card'><b>" + fmt(df.per_week, "/wk") + "</b><span>deploy frequency<br>" +
-      df.releases_total + " releases, " + df.releases_last_30d + " in 30d</span></div>" +
+      total + " " + what + ", " + last30 + " in 30d</span></div>" +
     "<div class='card'><b>" + fmt(lt.median, "h") + "</b><span>lead time (median)<br>" +
       lt.samples + " samples</span></div>" +
-    "<div class='card'><b>" + (cf.releases ? (cf.rate * 100).toFixed(0) + "%" : "n/a") +
-      "</b><span>change-failure rate<br>" + cf.incidents + " incidents / " +
-      cf.releases + " releases</span></div>" +
+    "<div class='card'><b>" + (attempts ? (cf.rate * 100).toFixed(0) + "%" : "n/a") +
+      "</b><span>change-failure rate<br>" + failures + " failures / " +
+      attempts + " " + what + "</span></div>" +
     "<div class='card'><b>" + fmt(mt.median, "h") + "</b><span>MTTR (median)<br>" +
       mt.samples + " samples</span></div>";
+
+  // Agent metrics are optional: snapshots predating Learn v2 have no `agent`
+  // key, and the page must still render rather than throwing.
+  var a = d.agent;
+  if (!a) {
+    document.getElementById("a").innerHTML =
+      "<div class='card'><b>n/a</b><span>not yet collected<em>run tools/dora with -prs</em></span></div>";
+    return;
+  }
+  function pct(x){ return (x * 100).toFixed(0) + "%"; }
+  document.getElementById("a").innerHTML =
+    "<div class='card'><b>" + (a.final_gate_pass.total ? pct(a.final_gate_pass.rate) : "n/a") +
+      "</b><span>final gate pass<br>" + a.final_gate_pass.green + " / " +
+      a.final_gate_pass.total + " PRs green on the first CI run</span></div>" +
+    "<div class='card'><b>" + (a.rework_commits_after_open.measurable === false ? "<em>n/a</em>" : a.rework_commits_after_open.median) +
+      "</b><span>rework<br>" + (a.rework_commits_after_open.why || "commits pushed after the PR opened") + "</span></div>" +
+    "<div class='card'><b>" + (a.review_round_trips.measurable === false ? "<em>n/a</em>" : a.review_round_trips.median) +
+      "</b><span>review round-trips<br>" + (a.review_round_trips.why || "median reviews per PR") + "</span></div>" +
+    "<div class='card'><b>" + (a.autonomous_prs.opened ? pct(a.autonomous_prs.clean_rate) : "n/a") +
+      "</b><span>autonomous, no later commits<br>" + a.autonomous_prs.merged_without_further_commits + " / " +
+      a.autonomous_prs.opened + " agent PRs merged untouched</span></div>";
 });
 </script>
