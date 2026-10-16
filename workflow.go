@@ -462,6 +462,10 @@ func (a *Activities) PlaceHold(ctx context.Context, req AuthRequest) (bool, erro
 		return false, temporal.NewNonRetryableApplicationError("card closed", DeclineClosed, nil)
 	}
 	// Velocity first: card testing makes many small auths, each under the limit.
+	// ponytail: an attempt that reads the clock first but records later can be
+	// missed by a racing attempt's count, so a burst could slip one or two past
+	// the cap (the load test's 400-at-once burst admits exactly 5). Serialize
+	// each card's attempts under a row lock if the cap must be exact.
 	n, err := a.Ledger.RecordAttempt(ctx, req.CardID, activity.GetInfo(ctx).WorkflowExecution.ID, time.Now(), VelocityWindow)
 	if err != nil {
 		return false, err
