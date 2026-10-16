@@ -7,7 +7,7 @@ on:
 
 jobs:
   lint:
-    runs-on: ubuntu-26.04
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-go@v7
@@ -16,7 +16,7 @@ jobs:
       - uses: golangci/golangci-lint-action@v9
 
   unit:
-    runs-on: ubuntu-26.04
+    runs-on: ubuntu-latest
     services:
       mysql:
         image: mysql:8.4
