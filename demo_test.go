@@ -6,6 +6,7 @@ package main
 // Opt-in: CAS_DEMO=1; CAS_DEMO_PACE paces each line for the recording.
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
@@ -22,9 +23,7 @@ import (
 	"go.temporal.io/sdk/testsuite"
 )
 
-const (
-	bold, dim, cyan, green, yellow, red, reset = "\033[1m", "\033[2m", "\033[36m", "\033[32m", "\033[33m", "\033[31m", "\033[0m"
-)
+const bold, dim, cyan, green, yellow, red, reset = "\033[1m", "\033[2m", "\033[36m", "\033[32m", "\033[33m", "\033[31m", "\033[0m"
 
 func TestDemo(t *testing.T) {
 	if os.Getenv("CAS_DEMO") == "" {
@@ -38,7 +37,7 @@ func TestDemo(t *testing.T) {
 		fmt.Printf(format+"\n", args...)
 		time.Sleep(pace)
 	}
-	l := &narratedLedger{Ledger: NewMemLedger(), say: say, crashOn: "capture:20000"}
+	l := &narratedLedger{Ledger: NewMemLedger(), say: say, crashOn: "capture:20000", seen: map[string]bool{}}
 	cfg := StaticConfig{
 		Limits: map[string]int64{"card-1": 100_000, "card-2": 100_000},
 		Rates:  map[string]int64{"booking": 5},
@@ -50,16 +49,15 @@ func TestDemo(t *testing.T) {
 	env := s.NewTestWorkflowEnvironment()
 	env.RegisterActivity(&Activities{Ledger: l, Config: cfg})
 	start := env.Now()
-	step := func(at time.Duration, what string, name string, arg any, after func(any, error)) {
+	step := func(at time.Duration, what string, name string, arg any) {
 		env.RegisterDelayedCallback(func() {
 			say("%s▶ %-4s %s%s", bold, "+"+compact(env.Now().Sub(start)), what, reset)
 			env.UpdateWorkflow(name, what, &testsuite.TestUpdateCallback{
 				OnReject:   func(err error) { say("  %s✗ rejected: %v%s", red, err, reset) },
-				OnComplete: func(r any, err error) { after(r, err) },
+				OnComplete: func(any, error) {},
 			}, arg)
 		}, at)
 	}
-	quiet := func(any, error) {}
 	env.RegisterDelayedCallback(func() {
 		say("%s▶ authorize%s card-1 · $400 at booking %s(limit $1,000 · 5 pts/$)%s", bold, reset, dim, reset)
 		env.UpdateWorkflow(AuthorizeUpdate, "auth", &testsuite.TestUpdateCallback{
@@ -70,13 +68,13 @@ func TestDemo(t *testing.T) {
 			},
 		})
 	}, 0)
-	step(hr, "hotel adds $100", IncrementUpdate, Increment{ID: "i1", Amount: 10_000}, quiet)
-	step(day, "first shipment: capture $200", CaptureSignal, Capture{Amount: 20_000, Partial: true}, quiet)
-	step(2*day, "last shipment: capture $250", CaptureSignal, Capture{Amount: 25_000}, quiet)
-	step(3*day, "refund r1 $50", RefundSignal, Refund{ID: "r1", Amount: 5_000}, quiet)
-	step(4*day, "dispute d1 $100", DisputeUpdate, Dispute{ID: "d1", Amount: 10_000}, quiet)
-	step(5*day, "merchant contests d1", MerchantResponseUpdate, MerchantResponse{DisputeID: "d1"}, quiet)
-	step(6*day, "analyst rules for the cardholder", ResolveDisputeUpdate, Ruling{DisputeID: "d1", CardholderWins: true}, quiet)
+	step(hr, "hotel adds $100", IncrementUpdate, Increment{ID: "i1", Amount: 10_000})
+	step(day, "first shipment: capture $200", CaptureSignal, Capture{Amount: 20_000, Partial: true})
+	step(2*day, "last shipment: capture $250", CaptureSignal, Capture{Amount: 25_000})
+	step(3*day, "refund r1 $50", RefundSignal, Refund{ID: "r1", Amount: 5_000})
+	step(4*day, "dispute d1 $100", DisputeUpdate, Dispute{ID: "d1", Amount: 10_000})
+	step(5*day, "merchant contests d1", MerchantResponseUpdate, MerchantResponse{DisputeID: "d1"})
+	step(6*day, "analyst rules for the cardholder", ResolveDisputeUpdate, Ruling{DisputeID: "d1", CardholderWins: true})
 
 	env.ExecuteWorkflow(AuthorizeWorkflow, AuthRequest{CardID: "card-1", Amount: 40_000, Merchant: "booking", RefundWindow: 10 * day})
 	var res AuthResult
@@ -88,20 +86,18 @@ func TestDemo(t *testing.T) {
 
 	// Card testing: six auths in a second on another card.
 	say("%s▶ six $1 auths in a second on card-2%s", bold, reset)
-	l.mute = true
 	var reasons []string
 	for i := range 6 {
 		env := s.NewTestWorkflowEnvironment()
-		env.RegisterActivity(&Activities{Ledger: l, Config: cfg})
+		env.RegisterActivity(&Activities{Ledger: l.Ledger, Config: cfg}) // unnarrated
 		env.SetStartWorkflowOptions(client.StartWorkflowOptions{ID: fmt.Sprintf("burst-%d", i)})
 		env.ExecuteWorkflow(AuthorizeWorkflow, AuthRequest{CardID: "card-2", Amount: 100, Merchant: "shop", HoldFor: time.Minute})
 		var r AuthResult
 		if err := env.GetWorkflowResult(&r); err != nil {
 			t.Fatal(err)
 		}
-		reasons = append(reasons, cmpOr(r.Reason, "approved"))
+		reasons = append(reasons, cmp.Or(r.Reason, "approved"))
 	}
-	l.mute = false
 	say("  %s · %s6th declined: %s%s", strings.Join(reasons[:5], " · "), red, reasons[5], reset)
 
 	accounts, err := l.Accounts(context.Background())
@@ -112,13 +108,6 @@ func TestDemo(t *testing.T) {
 		t.Fatalf("audit: %v", findings)
 	}
 	say("%s✓ audit: ledger Σ = 0 · 0 findings%s", green, reset)
-}
-
-func cmpOr(a, b string) string {
-	if a != "" {
-		return a
-	}
-	return b
 }
 
 // compact is a duration as the demo prints it: 1h, 2d.
@@ -135,11 +124,9 @@ type narratedLedger struct {
 	Ledger
 	say     func(string, ...any)
 	crashOn string
-	mute    bool
 
-	mu      sync.Mutex
-	seen    map[string]bool
-	crashed bool
+	mu   sync.Mutex
+	seen map[string]bool
 }
 
 func (n *narratedLedger) Post(ctx context.Context, key string, entries ...Entry) error {
@@ -149,14 +136,11 @@ func (n *narratedLedger) Post(ctx context.Context, key string, entries ...Entry)
 
 func (n *narratedLedger) PostWithin(ctx context.Context, key string, capped []string, limit int64, entries ...Entry) (bool, error) {
 	ok, err := n.Ledger.PostWithin(ctx, key, capped, limit, entries...)
-	if err != nil || !ok || n.mute {
+	if err != nil || !ok {
 		return ok, err
 	}
 	n.mu.Lock()
 	defer n.mu.Unlock()
-	if n.seen == nil {
-		n.seen = map[string]bool{}
-	}
 	_, step, _ := strings.Cut(key, ":")
 	if n.seen[key] {
 		n.say("  %s%-15s%s %salready posted · idempotent no-op%s", cyan, label(step), reset, yellow, reset)
@@ -170,8 +154,7 @@ func (n *narratedLedger) PostWithin(ctx context.Context, key string, capped []st
 		}
 	}
 	n.say("  %s%-15s%s %s", cyan, label(step), reset, strings.Join(parts, " · "))
-	if step == n.crashOn && !n.crashed {
-		n.crashed = true
+	if step == n.crashOn { // first write only: a retry returns at seen above
 		n.say("  %s✗ crash after the write%s %s— Temporal retries the activity%s", red, reset, dim, reset)
 		return false, errors.New("injected crash after the write")
 	}
@@ -201,16 +184,8 @@ func short(e Entry) string {
 	if strings.HasSuffix(e.Account, "points") || strings.HasSuffix(e.Account, "points-issued") {
 		return fmt.Sprintf("%s %+d pts", name, e.Amount)
 	}
-	sign := ""
 	if e.Amount < 0 {
-		sign = "-"
+		return fmt.Sprintf("%s -$%d", name, -e.Amount/100)
 	}
-	return fmt.Sprintf("%s %s$%d", name, sign, abs(e.Amount)/100)
-}
-
-func abs(n int64) int64 {
-	if n < 0 {
-		return -n
-	}
-	return n
+	return fmt.Sprintf("%s $%d", name, e.Amount/100)
 }
