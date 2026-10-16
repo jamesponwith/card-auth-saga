@@ -26,6 +26,10 @@ func OpenMySQL(ctx context.Context, dsn string) (*MySQLLedger, error) {
 	if err != nil {
 		return nil, err
 	}
+	// database/sql keeps 2 idle connections by default, so a worker running
+	// dozens of activities at once would open (and handshake) a new MySQL
+	// connection for most queries. Keep enough idle to cover the concurrency.
+	db.SetMaxIdleConns(64)
 	if err := db.PingContext(ctx); err != nil {
 		return nil, errors.Join(err, db.Close())
 	}

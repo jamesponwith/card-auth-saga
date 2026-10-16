@@ -176,25 +176,33 @@ shared MySQL database during development, and found nothing.
 
 ## Under load
 
-`CAS_LOAD=1 go test -run TestLoad` drives the real worker against a Temporal dev server and MySQL 8.4.
-Each approved auth is also captured. Typical numbers over three runs on an Apple M5 Pro:
+`CAS_LOAD=1 go test -run TestLoad` drives the real worker against a Temporal dev server and MySQL 8.4,
+at 50-way concurrency. Each approved auth is also captured. Typical numbers from three runs on an
+Apple M5 Pro:
 
 | Scenario | Throughput | Decision p50 / p99 | Approved |
 |---|---|---|---|
-| Spread: 400 auths over 100 cards | ~120 auths/s, each also captured | ~175 / ~470 ms | all 400 |
-| Hot card: 400 at once on one card | ~285 auths/s | ~145 / ~360 ms | exactly 5 |
-| Limit contention: 100 auths over 20 cards, limits cover 3 each | ~145 auths/s | ~140 / ~395 ms | exactly 60 |
+| Spread: 400 auths over 100 cards | ~140 auths/s, each also captured | ~130 / ~570–770 ms | all 400 |
+| Hot card: 400 at once on one card | ~300–470 auths/s | ~85 / ~240–340 ms | exactly 5 |
+| Limit contention: 100 auths over 20 cards, limits cover 3 each | ~200 auths/s | ~110 / ~320 ms | exactly 60 |
 
-The counts are the point. Under 50-way concurrency, the velocity check admits exactly 5 of 400
-simultaneous attempts on one card, the ledger's row locks admit exactly the 3 that each limit covers,
-and the auditor finds nothing afterwards. The burst case does have a theoretical gap: an attempt that
-reads the clock first but records later can be missed by a racing count. It's noted in `PlaceHold`
-with its fix, a per-card lock.
+The counts are the point. The velocity check admits exactly 5 of 400 simultaneous attempts on one card,
+the ledger's row locks admit exactly the 3 that each limit covers, and the auditor finds nothing
+afterwards. The burst case does have a theoretical gap: an attempt that reads the clock first but
+records later can be missed by a racing count. It's noted in `PlaceHold` with its fix, a per-card lock.
 
-A ~150ms decision is over a card network's ~100ms budget. Most of it is the dev server's SQLite
-persistence and three round trips per decision (start, `PlaceHold`, update reply). The first levers would be
-making `PlaceHold` a local activity, which skips a task-queue round trip, and a production Temporal
-cluster.
+Two changes took decisions from ~150–180ms to these numbers:
+
+- **`PlaceHold` as a local activity** (`GetVersion("local-place-hold")`). It's the only step a
+  decision waits on, and it now runs inside the workflow task instead of a round trip through the
+  activity task queue. With everything else equal, median decision latency fell by 30–45%: spread
+  ~180 → ~130ms, hot card ~160 → ~85ms, contention ~150 → ~110ms. p99 was the same or better.
+- **A real connection pool.** `database/sql` keeps only 2 idle connections by default, so under load
+  most queries opened and authenticated a new MySQL connection. Keeping 64 idle raised hot-card
+  throughput from ~350 to ~470 auths/s and cut its p99 tail.
+
+The rest of the decision time is mostly the dev server's SQLite persistence. A production Temporal
+cluster is the next lever.
 
 ## How it was built
 
