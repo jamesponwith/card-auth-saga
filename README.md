@@ -117,8 +117,9 @@ curl localhost:8080/debug/vars   # the Temporal SDK's metrics under "temporal", 
 ```
 
 `/healthz` reports `ok` only if Temporal and MySQL both answer. Release builds stamp the version.
-`docs/slo.yml` is ready. Probing stays off until the url points at a real deployment, because probing
-an address that isn't deployed would file incidents that never close.
+`docs/slo.yml` and `.github/workflows/operate.yml` are ready, but probing stays manual until the url
+points at a real deployment, because probing an address that isn't deployed would file incidents
+that never close. Run it by hand with `gh workflow run operate`.
 
 ## Failure drills
 
