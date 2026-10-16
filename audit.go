@@ -265,11 +265,6 @@ func lastAuditFindings(ctx context.Context, c client.Client) ([]Finding, error) 
 	return nil, nil
 }
 
-// runningAuths counts the AuthorizeWorkflows still running on a card.
-func (a *Activities) runningAuths(ctx context.Context, card string) (int64, error) {
-	return a.countWorkflows(ctx, fmt.Sprintf("WorkflowType = 'AuthorizeWorkflow' AND ExecutionStatus = 'Running' AND %s = '%s'", CardIDAttribute.GetName(), card))
-}
-
 // untaggedAuths counts running auths from before CardID tagging, which a
 // card-scoped query can't see.
 func (a *Activities) untaggedAuths(ctx context.Context) (int64, error) {

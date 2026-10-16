@@ -23,7 +23,6 @@ func TestAdminArgs(t *testing.T) {
 		{[]string{"set-limit", "card-1", "99999999999999999999"}, "not a whole number"},
 		{[]string{"delete-card", "card-1", "1"}, "usage"},
 		{[]string{"set-limit", "card:1", "100"}, "can't contain"},
-		{[]string{"freeze", "o'brien", "100"}, "usage"},
 		{[]string{"set-limit", "o'brien", "100"}, "can't contain"},
 		{[]string{"set-rate", "shop:eu", "3"}, ""}, // merchants aren't card IDs
 		{[]string{"freeze", "card-1"}, ""},

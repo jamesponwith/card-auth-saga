@@ -226,15 +226,8 @@ func (a *Activities) CardDone(ctx context.Context, card string) (bool, error) {
 	}
 	// An auth still running could post a refund or chargeback after the final
 	// statement; so could one from before CardID tagging, which can't be seen.
-	for _, count := range []func(context.Context) (int64, error){
-		func(ctx context.Context) (int64, error) { return a.runningAuths(ctx, card) },
-		a.untaggedAuths,
-	} {
-		if n, err := count(ctx); err != nil || n > 0 {
-			return false, err
-		}
-	}
-	return true, nil
+	n, err := a.countWorkflows(ctx, fmt.Sprintf("WorkflowType = 'AuthorizeWorkflow' AND ExecutionStatus = 'Running' AND (%[1]s = '%[2]s' OR %[1]s IS NULL)", CardIDAttribute.GetName(), card))
+	return n == 0 && err == nil, err
 }
 
 // minDue is the larger of the floor and a share of the balance, but never more
