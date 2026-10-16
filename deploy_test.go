@@ -4,6 +4,7 @@ import (
 	"os"
 	osexec "os/exec" // "exec" is a MySQL test helper in this package
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 )
@@ -91,5 +92,43 @@ exit 0
 	}
 	if _, err := run(healthy, "FLY_API_TOKEN=x", "VERSION=v1"); err == nil {
 		t.Error("deployed without CAS_MYSQL_PASSWORD")
+	}
+}
+
+// Every flag deploy.sh passes to flyctl exists in the flyctl that's installed:
+// the stub above accepts anything, and the first real deploy failed on a flag
+// (deploy --region) that flyctl doesn't have. Skipped where flyctl isn't
+// installed, such as CI; run it after bumping the version in release.yml.
+func TestDeployScriptFlyctlFlags(t *testing.T) {
+	if _, err := osexec.LookPath("flyctl"); err != nil {
+		t.Skip("flyctl not installed")
+	}
+	script, err := os.ReadFile("deploy/fly/deploy.sh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	cmd := regexp.MustCompile(`flyctl ((?:apps|volumes|secrets) \w+|deploy|status)\b([^|;&\n]*)`)
+	flag := regexp.MustCompile(`--[a-z][a-z-]*`)
+	// deploy.sh's own deploy helper passes its extra arguments to flyctl deploy.
+	helper := regexp.MustCompile(`(?m)^deploy "\$\w+" \S+()(.*)$`)
+	calls := cmd.FindAllStringSubmatch(string(script), -1)
+	for _, m := range helper.FindAllStringSubmatch(string(script), -1) {
+		calls = append(calls, []string{m[0], "deploy", m[2]})
+	}
+	checked := 0
+	for _, m := range calls {
+		help, err := osexec.Command("flyctl", append(strings.Fields(m[1]), "--help")...).CombinedOutput()
+		if err != nil {
+			t.Fatalf("flyctl %s --help: %v", m[1], err)
+		}
+		for _, f := range flag.FindAllString(m[2], -1) {
+			checked++
+			if !regexp.MustCompile(`\s` + regexp.QuoteMeta(f) + `\b`).Match(help) {
+				t.Errorf("flyctl %s has no %s flag", m[1], f)
+			}
+		}
+	}
+	if checked < 12 {
+		t.Errorf("checked only %d flags; the command pattern no longer matches deploy.sh", checked)
 	}
 }

@@ -26,7 +26,7 @@ deploy() { # app, config, extra flags...
   shift 2
   # One machine per app: MySQL and Temporal are bound to their volume, and two
   # workers would be fine but buy nothing here.
-  flyctl deploy "$@" -a "$app" -c "$root/deploy/fly/$config" --region "$region" --ha=false --yes
+  flyctl deploy "$@" -a "$app" -c "$root/deploy/fly/$config" --primary-region "$region" --ha=false --yes
 }
 
 mysql=$prefix-mysql temporal=$prefix-temporal worker=$prefix-worker
