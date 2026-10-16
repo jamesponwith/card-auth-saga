@@ -129,19 +129,14 @@ func (l *MySQLLedger) RecordAttempt(ctx context.Context, card, id string, at tim
 	if _, err := tx.ExecContext(ctx, `SELECT card FROM attempt_locks WHERE card = ? FOR UPDATE`, card); err != nil {
 		return 0, err
 	}
+	// A new attempt lands just after the card's last one, at the earliest; a
+	// retry hits IGNORE and keeps its first time.
+	if _, err := tx.ExecContext(ctx, `INSERT IGNORE INTO attempts (card, auth_id, at_us)
+		SELECT ?, ?, GREATEST(?, COALESCE(MAX(at_us), 0) + 1) FROM attempts WHERE card = ?`, card, id, at.UnixMicro(), card); err != nil {
+		return 0, err
+	}
 	var atUs int64
-	err = tx.QueryRowContext(ctx, `SELECT at_us FROM attempts WHERE card = ? AND auth_id = ?`, card, id).Scan(&atUs)
-	switch {
-	case errors.Is(err, sql.ErrNoRows): // a new attempt: just after the card's last one, at the earliest
-		var last int64
-		if err := tx.QueryRowContext(ctx, `SELECT COALESCE(MAX(at_us), 0) FROM attempts WHERE card = ?`, card).Scan(&last); err != nil {
-			return 0, err
-		}
-		atUs = max(at.UnixMicro(), last+1)
-		if _, err := tx.ExecContext(ctx, `INSERT INTO attempts (card, auth_id, at_us) VALUES (?, ?, ?)`, card, id, atUs); err != nil {
-			return 0, err
-		}
-	case err != nil:
+	if err := tx.QueryRowContext(ctx, `SELECT at_us FROM attempts WHERE card = ? AND auth_id = ?`, card, id).Scan(&atUs); err != nil {
 		return 0, err
 	}
 	var n int
