@@ -27,7 +27,8 @@ echo "flyctl $*" >> "$STUB/calls"
 case "$1 $2" in
   "status -a") [ -e "$STUB/app-$3" ] || exit 1 ;;
   "apps create") touch "$STUB/app-$3" ;;
-  "volumes list") for f in "$STUB"/vol-"$4"-*; do [ -e "$f" ] && echo "{\"name\": \"${f##*-$4-}\"}"; done ;;
+  "volumes list") # a JSON array, as flyctl prints it
+    echo "["; sep=""; for f in "$STUB"/vol-"$4"-*; do [ -e "$f" ] && { n=${f##*-$4-}; echo "$sep{\"name\": \"$n\", \"id\": \"vol_$n\"}"; sep=","; }; done; echo "]" ;;
   "volumes create") touch "$STUB/vol-$5-$3" ;;
   "image show")
     [ -s "$STUB/current" ] && echo "[{\"Registry\":\"registry.fly.io\",\"Repository\":\"$4\",\"Digest\":\"sha256:$(cat "$STUB/current")\"}]" || echo "[]" ;;
@@ -126,40 +127,132 @@ echo "{\"status\":\"$status\",\"uptime_s\":3,\"version\":\"$v\"}"
 	}
 }
 
-// Every flag deploy.sh passes to flyctl exists in the flyctl that's installed:
-// the stub above accepts anything, and the first real deploy failed on a flag
-// (deploy --region) that flyctl doesn't have. Skipped where flyctl isn't
-// installed, such as CI; run it after bumping the version in release.yml.
+// Every flag the deploy scripts pass to flyctl exists in the flyctl that's
+// installed: the stubs accept anything, and the first real deploy failed on a
+// flag (deploy --region) that flyctl doesn't have. Skipped where flyctl isn't
+// installed, such as CI; run it after bumping the pinned version.
 func TestDeployScriptFlyctlFlags(t *testing.T) {
 	if _, err := osexec.LookPath("flyctl"); err != nil {
 		t.Skip("flyctl not installed")
 	}
-	script, err := os.ReadFile("deploy/fly/deploy.sh")
-	if err != nil {
-		t.Fatal(err)
-	}
-	cmd := regexp.MustCompile(`flyctl ((?:apps|volumes|secrets|image) \w+|deploy|status)\b([^|;&\n]*)`)
+	cmd := regexp.MustCompile(`flyctl ((?:volumes snapshots|apps|volumes|secrets|image|ssh) \w+|deploy|status)\b([^|;&\n]*)`)
 	flag := regexp.MustCompile(`--[a-z][a-z-]*`)
 	// deploy.sh's own deploy helper passes its extra arguments to flyctl deploy.
 	helper := regexp.MustCompile(`(?m)^deploy "\$\w+" \S+()(.*)$`)
-	calls := cmd.FindAllStringSubmatch(string(script), -1)
-	for _, m := range helper.FindAllStringSubmatch(string(script), -1) {
-		calls = append(calls, []string{m[0], "deploy", m[2]})
-	}
 	checked := 0
-	for _, m := range calls {
-		help, err := osexec.Command("flyctl", append(strings.Fields(m[1]), "--help")...).CombinedOutput()
+	for _, script := range []string{"deploy/fly/deploy.sh", "deploy/fly/restore-drill.sh"} {
+		src, err := os.ReadFile(script)
 		if err != nil {
-			t.Fatalf("flyctl %s --help: %v", m[1], err)
+			t.Fatal(err)
 		}
-		for _, f := range flag.FindAllString(m[2], -1) {
-			checked++
-			if !regexp.MustCompile(`\s` + regexp.QuoteMeta(f) + `\b`).Match(help) {
-				t.Errorf("flyctl %s has no %s flag", m[1], f)
+		calls := cmd.FindAllStringSubmatch(string(src), -1)
+		for _, m := range helper.FindAllStringSubmatch(string(src), -1) {
+			calls = append(calls, []string{m[0], "deploy", m[2]})
+		}
+		for _, m := range calls {
+			help, err := osexec.Command("flyctl", append(strings.Fields(m[1]), "--help")...).CombinedOutput()
+			if err != nil {
+				t.Fatalf("%s: flyctl %s --help: %v", script, m[1], err)
+			}
+			for _, f := range flag.FindAllString(m[2], -1) {
+				checked++
+				if !regexp.MustCompile(`\s` + regexp.QuoteMeta(f) + `\b`).Match(help) {
+					t.Errorf("%s: flyctl %s has no %s flag", script, m[1], f)
+				}
 			}
 		}
 	}
-	if checked < 12 {
-		t.Errorf("checked only %d flags; the command pattern no longer matches deploy.sh", checked)
+	if checked < 25 {
+		t.Errorf("checked only %d flags; the command pattern no longer matches the scripts", checked)
+	}
+}
+
+// restore-drill.sh against a stand-in flyctl whose ssh answers the drill's
+// checks: it passes on a good restore, fails on a broken one, takes a snapshot
+// when a volume has none, and always destroys the drill apps and only those.
+func TestRestoreDrillScript(t *testing.T) {
+	for _, tool := range []string{"bash", "jq"} {
+		if _, err := osexec.LookPath(tool); err != nil {
+			t.Skip("needs " + tool)
+		}
+	}
+	stub := t.TempDir()
+	bin := filepath.Join(stub, "bin")
+	flyctl := `#!/usr/bin/env bash
+echo "flyctl $*" >> "$STUB/calls"
+case "$1 $2" in
+  "volumes list") echo "[{\"name\":\"mysql_data\",\"id\":\"vol_m\"},{\"name\":\"temporal_data\",\"id\":\"vol_t\"}]" ;;
+  "volumes snapshots")
+    case "$3" in
+      list) [ -e "$STUB/snap-$4" ] && echo "[{\"id\":\"snap_$4\",\"status\":\"created\",\"created_at\":\"2026-10-16T00:00:00Z\"}]" || echo "[]" ;;
+      create) touch "$STUB/snap-$4" ;;
+    esac ;;
+  "image show") echo "[{\"Registry\":\"registry.fly.io\",\"Repository\":\"$4\",\"Digest\":\"sha256:abc\"}]" ;;
+  "ssh console")
+    cmd=${*: -1}
+    case "$cmd" in
+      *"COALESCE(SUM(balance)"*) echo "${LEDGER_SUM:-0}" ;;
+      *"HAVING s <> 0"*) echo 0 ;;
+      *"MAX(version)"*) echo 6 ;;
+      *"COUNT(*) FROM accounts"*) echo 42 ;;
+      *"workflow count"*) echo "Total: 7" ;;
+      *"search-attribute list"*) echo "CardID  Keyword" ;;
+    esac ;;
+esac
+exit 0
+`
+	if err := os.MkdirAll(bin, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(bin, "flyctl"), []byte(flyctl), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	drill := func(env ...string) (calls, out string, err error) {
+		_ = os.Remove(filepath.Join(stub, "calls"))
+		cmd := osexec.Command("bash", "deploy/fly/restore-drill.sh")
+		cmd.Env = append([]string{"PATH=" + bin + ":" + os.Getenv("PATH"), "STUB=" + stub,
+			"FLY_API_TOKEN=x", "CAS_MYSQL_PASSWORD=pw", "SNAPSHOT_WAIT=2", "CHECK_TRIES=1"}, env...)
+		o, err := cmd.CombinedOutput()
+		c, _ := os.ReadFile(filepath.Join(stub, "calls"))
+		return string(c), string(o), err
+	}
+	destroyed := func(calls string) []string {
+		var apps []string
+		for _, line := range strings.Split(calls, "\n") {
+			if rest, ok := strings.CutPrefix(line, "flyctl apps destroy "); ok {
+				apps = append(apps, strings.Fields(rest)[0])
+			}
+		}
+		return apps
+	}
+
+	calls, out, err := drill()
+	if err != nil || !strings.Contains(out, "restore drill passed: 42 accounts, 7 workflows restored") {
+		t.Errorf("good restore: err %v:\n%s", err, out)
+	}
+	if strings.Count(calls, "volumes snapshots create") != 2 {
+		t.Errorf("volumes without snapshots: want one taken for each:\n%s", calls)
+	}
+	if !strings.Contains(calls, "--snapshot-id snap_vol_m") || !strings.Contains(calls, "--image registry.fly.io/cas-jamesponwith-mysql@sha256:abc") {
+		t.Errorf("restore didn't use the snapshot and production's image:\n%s", calls)
+	}
+	for _, app := range destroyed(calls) {
+		if !strings.Contains(app, "-drill-") {
+			t.Fatalf("destroyed %s, which isn't a drill app", app)
+		}
+	}
+	if n := len(destroyed(calls)); n != 2 {
+		t.Errorf("destroyed %d apps, want the 2 drill apps", n)
+	}
+
+	calls, out, err = drill("LEDGER_SUM=5") // a restored ledger that doesn't balance
+	if err == nil || !strings.Contains(out, "FAIL ledger sums to zero") {
+		t.Errorf("broken restore: err %v, want the drill to fail:\n%s", err, out)
+	}
+	if strings.Contains(calls, "volumes snapshots create") {
+		t.Errorf("took new snapshots although the volumes have some:\n%s", calls)
+	}
+	if n := len(destroyed(calls)); n != 2 {
+		t.Errorf("after a failed drill, destroyed %d apps, want the 2 drill apps", n)
 	}
 }
