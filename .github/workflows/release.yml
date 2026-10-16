@@ -1,4 +1,5 @@
-# Release: semver tag → goreleaser → binaries + changelog on GitHub Releases.
+# Release: semver tag → goreleaser → binaries + changelog on GitHub Releases,
+# then deploy that version to Fly and smoke-test it (ADR 0007).
 # Tag from a green main only: `git tag v0.1.0 && git push origin v0.1.0`.
 name: release
 
@@ -25,3 +26,24 @@ jobs:
           args: release --clean
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  deploy:
+    needs: release
+    runs-on: ubuntu-latest
+    concurrency:
+      group: deploy # one deploy at a time; a newer tag waits, never cancels mid-deploy
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+      - uses: superfly/flyctl-actions/setup-flyctl@1.5
+        with:
+          version: 0.4.118 # the version deploy/fly/deploy.sh was written against
+      # MySQL, Temporal, then the worker at this version; fails unless the
+      # public /healthz reports ok at it.
+      - run: deploy/fly/deploy.sh
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+          CAS_MYSQL_PASSWORD: ${{ secrets.CAS_MYSQL_PASSWORD }}
+          VERSION: ${{ github.ref_name }}
+          FLY_APP_PREFIX: ${{ vars.FLY_APP_PREFIX }}
+          FLY_REGION: ${{ vars.FLY_REGION }}

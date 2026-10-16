@@ -259,6 +259,7 @@ on demand with `go run . audit`. It reports findings rather than fixing anything
 - **M14**: Operate stage: `/healthz` with dependency checks, SDK metrics via expvar, SLO contract (ADR 0006).
 - **M15**: Nightly ledger auditor on a Temporal Schedule.
 - **M16**: Freezing and closing cards.
+- **M17**: Deploy to Fly.io on release tags (ADR 0007).
 
 ## Success criteria
 

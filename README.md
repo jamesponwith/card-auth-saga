@@ -116,6 +116,29 @@ minimum isn't paid by the due date, and at close charges interest on the average
 unless the last statement was paid in full. The workflow then continues as new, so its history covers
 one cycle. `temporal workflow show` lists each run.
 
+## Deploy
+
+Pushing a `v*` tag releases and deploys (ADR 0007). `release.yml` runs goreleaser, then
+`deploy/fly/deploy.sh` brings up three Fly apps on the private network:
+
+- **MySQL 8.4**, on a volume.
+- **Temporal**: the pinned, checksummed CLI server, persisted to SQLite on a volume.
+- **The worker**, whose `/healthz` is public.
+
+The deploy fails unless `https://<prefix>-worker.fly.dev/healthz` reports `ok` at the tag's version.
+
+One-time setup: a Fly.io account with a payment method, then two repo secrets:
+
+```sh
+fly tokens create org | gh secret set FLY_API_TOKEN
+openssl rand -base64 24 | gh secret set CAS_MYSQL_PASSWORD
+git tag v0.2.0 && git push origin v0.2.0      # release and deploy
+```
+
+App names default to `cas-jamesponwith-{mysql,temporal,worker}` and the region to `iad`. Override them
+with the `FLY_APP_PREFIX` and `FLY_REGION` repo variables, and update `docs/slo.yml`'s url to match.
+`go test -run TestDeployScript` checks the script's logic against a stub `flyctl`.
+
 ## Operate
 
 The worker serves the flywheel's Operate contract on `CAS_HTTP_ADDR` (default `:8080`, ADR 0006):
@@ -125,10 +148,13 @@ curl localhost:8080/healthz      # {"status":"ok","version":"v1.2.3","uptime_s":
 curl localhost:8080/debug/vars   # the Temporal SDK's metrics under "temporal", one series per name and tags
 ```
 
+Set `CAS_DEBUG_ADDR` to give `/debug/vars` a port of its own. The Fly deployment does this
+(`:9091`, private network only), so only `/healthz` is public.
+
 `/healthz` reports `ok` only if Temporal and MySQL both answer. Release builds stamp the version.
-`docs/slo.yml` and `.github/workflows/operate.yml` are ready, but probing stays manual until the url
-points at a real deployment, because probing an address that isn't deployed would file incidents
-that never close. Run it by hand with `gh workflow run operate`.
+`docs/slo.yml` points at the Fly worker. Probing stays manual until a deploy is verified, because probing
+an address that isn't up would file incidents that never close. Run it by hand with
+`gh workflow run operate`; once a release is live, restore the schedule in `operate.yml`.
 
 ## Audit
 

@@ -6,7 +6,7 @@
 
 # What to probe. Must serve the /healthz contract: 200 + JSON
 # {"status":"ok","version":"v0.1.0","uptime_s":123}
-url: https://example.invalid/healthz
+url: https://cas-jamesponwith-worker.fly.dev/healthz # deploy/fly (ADR 0007); the prefix is the FLY_APP_PREFIX repo variable
 
 # How long a breach must persist before it is an incident, and how long a
 # recovery must hold before the incident is closed. Both exist to stop a single

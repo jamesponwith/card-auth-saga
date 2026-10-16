@@ -14,11 +14,20 @@ import (
 var temporalMetrics = expvar.NewMap("temporal")
 
 // opsHandler serves the Operate stage's endpoints: /healthz (the contract in
-// healthz.go, which tools/watch probes) and /debug/vars (expvar, including the
-// Temporal SDK's metrics).
-func opsHandler(started time.Time, status func() string) http.Handler {
+// healthz.go, which tools/watch probes) and, unless the metrics have a port of
+// their own, /debug/vars (expvar, including the Temporal SDK's metrics).
+func opsHandler(started time.Time, status func() string, withDebug bool) http.Handler {
 	mux := http.NewServeMux()
 	mux.Handle("GET /healthz", Healthz(started, status))
+	if withDebug {
+		mux.Handle("GET /debug/vars", expvar.Handler())
+	}
+	return mux
+}
+
+// debugHandler serves /debug/vars alone, for a port kept off the internet.
+func debugHandler() http.Handler {
+	mux := http.NewServeMux()
 	mux.Handle("GET /debug/vars", expvar.Handler())
 	return mux
 }
