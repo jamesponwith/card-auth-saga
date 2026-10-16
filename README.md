@@ -139,7 +139,13 @@ git tag v0.2.0 && git push origin v0.2.0      # release and deploy
 
 App names default to `cas-jamesponwith-{mysql,temporal,worker}` and the region to `iad`. Override them
 with the `FLY_APP_PREFIX` and `FLY_REGION` repo variables, and update `docs/slo.yml`'s url to match.
-`go test -run TestDeployScript` checks the script's logic against a stub `flyctl`.
+`go test -run 'TestDeployScript|TestRestoreDrill'` checks both scripts' logic against a stub `flyctl`.
+
+Both volumes take daily snapshots, kept 14 days. Once a month, `restore-drill.yml` runs
+`deploy/fly/restore-drill.sh`. It restores the latest snapshot of each volume into throwaway apps on
+production's exact images, checks that the ledger balances, that the schema matches production and
+that Temporal still holds its workflows, then destroys the throwaway apps. Run it any time with
+`gh workflow run restore-drill`.
 
 ## Operate
 

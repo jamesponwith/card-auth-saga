@@ -21,6 +21,10 @@ ensure_app() {
 ensure_volume() { # app, volume, size in GB
   flyctl volumes list -a "$1" --json | grep -q "\"name\": *\"$2\"" ||
     flyctl volumes create "$2" -a "$1" --region "$region" --size "$3" --yes
+  # Daily snapshots kept two weeks; restore-drill.sh proves they restore.
+  local id
+  id=$(flyctl volumes list -a "$1" --json | jq -r --arg n "$2" 'first(.[] | select(.name == $n)) | .id')
+  flyctl volumes update "$id" -a "$1" --scheduled-snapshots=true --snapshot-retention 14 >/dev/null
 }
 deploy() { # app, config, extra flags...
   local app=$1 config=$2

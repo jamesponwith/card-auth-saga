@@ -1,0 +1,37 @@
+# Restore drill: once a month, restore the latest snapshot of each production
+# volume into throwaway apps, check the data, and tear them down (ADR 0007).
+# A backup nobody has restored isn't one.
+name: restore-drill
+
+on:
+  schedule:
+    - cron: "17 9 3 * *" # 09:17 UTC on the 3rd of each month
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: restore-drill
+  cancel-in-progress: false
+
+jobs:
+  drill:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      # The same verified flyctl install as release.yml's deploy.
+      - run: |
+          curl -fsSL -o /tmp/flyctl.tgz "https://github.com/superfly/flyctl/releases/download/v${FLYCTL_VERSION}/flyctl_${FLYCTL_VERSION}_Linux_x86_64.tar.gz"
+          echo "${FLYCTL_SHA256}  /tmp/flyctl.tgz" | sha256sum -c -
+          sudo tar -xzf /tmp/flyctl.tgz -C /usr/local/bin flyctl
+          flyctl version
+        env:
+          FLYCTL_VERSION: 0.4.118
+          FLYCTL_SHA256: 0f2fabbb29904a7bac8bd96009314d26751084c33e098fcc393e2dac6c472f60
+      - run: deploy/fly/restore-drill.sh
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+          CAS_MYSQL_PASSWORD: ${{ secrets.CAS_MYSQL_PASSWORD }}
+          FLY_APP_PREFIX: ${{ vars.FLY_APP_PREFIX }}
+          FLY_REGION: ${{ vars.FLY_REGION }}
