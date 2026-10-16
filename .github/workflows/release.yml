@@ -30,6 +30,11 @@ jobs:
   deploy:
     needs: release
     runs-on: ubuntu-latest
+    # A GitHub deployment per run, marked success or failure with the job: the
+    # Learn stage measures deploy frequency, lead time and failed deploys from it.
+    environment:
+      name: production
+      url: https://${{ vars.FLY_APP_PREFIX || 'cas-jamesponwith' }}-worker.fly.dev/healthz
     concurrency:
       group: deploy # one deploy at a time; a newer tag waits, never cancels mid-deploy
       cancel-in-progress: false
