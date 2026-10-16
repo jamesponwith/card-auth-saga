@@ -154,6 +154,9 @@ Each safeguard was removed on purpose to confirm a test notices:
 | Holds placed before a freeze still settle, but can't grow | *frozen after the hold*: an increment granted |
 | A closed card's statements end only once nothing is posted or held | *statement ends for closed card*: ends with a balance, a hold or a credit |
 | Closed is final, and a closed card's limit can't change | *card status transitions*: a closed card reopened or re-limited |
+| Every auth tags itself with its card | *auth tags CardID*; audit drill: an orphan reported for a card whose auth is running |
+| Orphaned holds are found, but not while untagged auths run | audit drill: a stray hold missed, or reported despite an untagged auth |
+| A closed card's statements wait for its last running auth | audit drill: statements end with an auth still open |
 | An increment claims the hold | *capture during increment rejected*: otherwise a final capture strands the increment |
 
 Two experiments removed code instead. Cancelling the hold timer after capture survived mutation,
@@ -170,6 +173,11 @@ always runs the handler first, so it can't produce that order.
 
 A note on the test environment: it caps "retry forever" at 10 attempts so a unit test can't hang,
 so the outage test fails 8 times. That's past the saga's limit of 5, and under the test cap.
+
+The first version of the orphaned-hold check queried visibility once per card holding money, with
+a 2-second recheck each. It passed on the in-memory ledger and timed out against the shared MySQL
+database, which held every test's cards. Now it lists running auths once, compares that set with every
+card holding money, and rechecks the suspects together.
 
 The auditor's first real run checked the 778 accounts that every test and drill had written to the
 shared MySQL database during development, and found nothing.

@@ -14,6 +14,7 @@ import (
 	"go.temporal.io/api/serviceerror"
 	"go.temporal.io/api/workflowservice/v1"
 	"go.temporal.io/sdk/client"
+	"go.temporal.io/sdk/converter"
 	"go.temporal.io/sdk/temporal"
 	"go.temporal.io/sdk/workflow"
 )
@@ -40,6 +41,7 @@ const (
 	CheckStuckAuth      = "stuck-auth"
 	CheckStuckStatement = "stuck-statement"
 	CheckFailedWorkflow = "failed-workflow"
+	CheckOrphanedHold   = "orphaned-hold"
 )
 
 // Finding is one broken invariant. Subject is a card ID or a workflow, empty
@@ -63,7 +65,8 @@ type AuditOptions struct {
 // AuditWorkflow checks the ledger's invariants and the workflows' health, and
 // reports what it finds. It changes nothing: a finding is for a human.
 func AuditWorkflow(ctx workflow.Context, opts AuditOptions) (AuditReport, error) {
-	ctx = withLedger(ctx)
+	// Reading the whole ledger and every running auth takes a while.
+	ctx = workflow.WithStartToCloseTimeout(withLedger(ctx), 10*time.Minute)
 	var a *Activities
 	now := workflow.Now(ctx)
 	report := AuditReport{At: now}
@@ -176,13 +179,16 @@ func (a *Activities) AuditWorkflows(ctx context.Context, cut AuditCutoffs) ([]Fi
 	if a.Temporal == nil {
 		return nil, nil
 	}
+	findings, err := a.orphanedHolds(ctx)
+	if err != nil {
+		return nil, err
+	}
 	ts := func(t time.Time) string { return "'" + t.UTC().Format(time.RFC3339Nano) + "'" }
 	checks := []struct{ check, query string }{
 		{CheckStuckAuth, "WorkflowType = 'AuthorizeWorkflow' AND ExecutionStatus = 'Running' AND StartTime < " + ts(cut.StuckAuthBefore)},
 		{CheckStuckStatement, "WorkflowType = 'StatementWorkflow' AND ExecutionStatus = 'Running' AND StartTime < " + ts(cut.StuckStatementBefore)},
 		{CheckFailedWorkflow, "(ExecutionStatus = 'Failed' OR ExecutionStatus = 'TimedOut') AND CloseTime > " + ts(cut.FailedAfter)},
 	}
-	var findings []Finding
 	for _, ch := range checks {
 		var token []byte
 		for {
@@ -257,4 +263,89 @@ func lastAuditFindings(ctx context.Context, c client.Client) ([]Finding, error) 
 		return report.Findings, nil
 	}
 	return nil, nil
+}
+
+// untaggedAuths counts running auths from before CardID tagging, which a
+// card-scoped query can't see.
+func (a *Activities) untaggedAuths(ctx context.Context) (int64, error) {
+	return a.countWorkflows(ctx, fmt.Sprintf("WorkflowType = 'AuthorizeWorkflow' AND ExecutionStatus = 'Running' AND %s IS NULL", CardIDAttribute.GetName()))
+}
+
+func (a *Activities) countWorkflows(ctx context.Context, query string) (int64, error) {
+	res, err := a.Temporal.CountWorkflow(ctx, &workflowservice.CountWorkflowExecutionsRequest{Query: query})
+	return res.GetCount(), err
+}
+
+// orphanRecheck is how long suspected orphaned holds wait before they are
+// checked again: long enough for a just-started auth to reach visibility.
+var orphanRecheck = 2 * time.Second
+
+// orphanedHolds finds cards holding money with no auth running on them: a
+// hold nothing will ever capture or release. It lists the running auths once
+// (not one query per card), and reports only cards that look orphaned on two
+// passes orphanRecheck apart, so an auth that settled or started mid-audit
+// isn't one.
+func (a *Activities) orphanedHolds(ctx context.Context) ([]Finding, error) {
+	if n, err := a.untaggedAuths(ctx); err != nil || n > 0 {
+		return nil, err // auths from before tagging can't be attributed yet
+	}
+	first, err := a.unclaimedHolds(ctx)
+	if err != nil || len(first) == 0 {
+		return nil, err
+	}
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case <-time.After(orphanRecheck):
+	}
+	second, err := a.unclaimedHolds(ctx)
+	if err != nil {
+		return nil, err
+	}
+	var findings []Finding
+	for _, card := range slices.Sorted(maps.Keys(second)) {
+		if first[card] > 0 {
+			findings = append(findings, Finding{CheckOrphanedHold, card, fmt.Sprintf("holds %d with no auth running", second[card])})
+		}
+	}
+	return findings, nil
+}
+
+// unclaimedHolds is each card holding money with no running auth, and how much.
+// ponytail: reads every account and lists every running auth in memory;
+// page both by card when the ledger outgrows a worker.
+func (a *Activities) unclaimedHolds(ctx context.Context) (map[string]int64, error) {
+	running := map[string]bool{}
+	query := "WorkflowType = 'AuthorizeWorkflow' AND ExecutionStatus = 'Running'"
+	for token := []byte(nil); ; {
+		res, err := a.Temporal.ListWorkflow(ctx, &workflowservice.ListWorkflowExecutionsRequest{Query: query, NextPageToken: token})
+		if err != nil {
+			return nil, err
+		}
+		for _, w := range res.GetExecutions() {
+			if p := w.GetSearchAttributes().GetIndexedFields()[CardIDAttribute.GetName()]; p != nil {
+				var card string
+				if err := converter.GetDefaultDataConverter().FromPayload(p, &card); err != nil {
+					return nil, err
+				}
+				running[card] = true
+			}
+		}
+		if token = res.GetNextPageToken(); len(token) == 0 {
+			break
+		}
+	}
+	accounts, err := a.Ledger.Accounts(ctx)
+	if err != nil {
+		return nil, err
+	}
+	unclaimed := map[string]int64{}
+	for id, b := range accounts {
+		rest, ok := strings.CutPrefix(id, "card:")
+		card, isHolds := strings.CutSuffix(rest, ":holds")
+		if ok && isHolds && b > 0 && !strings.Contains(card, ":") && !running[card] {
+			unclaimed[card] = b
+		}
+	}
+	return unclaimed, nil
 }

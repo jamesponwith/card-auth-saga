@@ -208,8 +208,8 @@ func closeDaily(ctx workflow.Context, a *Activities, terms StatementTerms, last 
 	return workflow.NewContinueAsNewError(ctx, StatementWorkflow, terms, next)
 }
 
-// CardDone reports whether a card is closed with nothing posted or held, so
-// its statements can stop.
+// CardDone reports whether a card is closed with nothing posted or held and
+// no auth still running on it, so its statements can stop.
 func (a *Activities) CardDone(ctx context.Context, card string) (bool, error) {
 	status, _, err := a.Config.CardStatus(ctx, card)
 	if err != nil || status != CardClosed {
@@ -221,7 +221,13 @@ func (a *Activities) CardDone(ctx context.Context, card string) (bool, error) {
 			return false, err
 		}
 	}
-	return true, nil
+	if a.Temporal == nil { // unit tests: no visibility to ask
+		return true, nil
+	}
+	// An auth still running could post a refund or chargeback after the final
+	// statement; so could one from before CardID tagging, which can't be seen.
+	n, err := a.countWorkflows(ctx, fmt.Sprintf("WorkflowType = 'AuthorizeWorkflow' AND ExecutionStatus = 'Running' AND (%[1]s = '%[2]s' OR %[1]s IS NULL)", CardIDAttribute.GetName(), card))
+	return n == 0 && err == nil, err
 }
 
 // minDue is the larger of the floor and a share of the balance, but never more
