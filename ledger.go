@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"errors"
+	"maps"
 	"slices"
 	"sync"
 	"time"
@@ -27,6 +28,9 @@ type Ledger interface {
 	// It reports whether the posting is in the ledger (true for a replayed key).
 	PostWithin(ctx context.Context, key string, capped []string, limit int64, entries ...Entry) (bool, error)
 	Balance(ctx context.Context, account string) (int64, error)
+	// Accounts is every account with its balance, for the audit.
+	// ponytail: loads them all at once; page by ID when the ledger outgrows memory.
+	Accounts(ctx context.Context) (map[string]int64, error)
 	// RecordAttempt notes auth attempt id on card at `at`, once per id, and
 	// counts the card's attempts in the window ending at this attempt's first
 	// recorded time, this one included. A retry gets the same count.
@@ -127,6 +131,12 @@ func (l *MemLedger) Balance(_ context.Context, account string) (int64, error) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	return l.balances[account], nil
+}
+
+func (l *MemLedger) Accounts(context.Context) (map[string]int64, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return maps.Clone(l.balances), nil
 }
 
 // Total sums every balance. A correct ledger always returns 0.

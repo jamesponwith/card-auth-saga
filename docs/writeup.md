@@ -71,6 +71,7 @@ history:
 | Statement cycles | 1s cycles of ten 100ms days: pay $10 in the first (sent twice, one update ID), then pay nothing | One payment; $25 fee on day 4; $3.47 interest on the daily balances; next statement $518.47; the closed run replays |
 | Disputes | Seconds-long deadlines: one dispute contested and won, one the merchant never answers, one contested and lost | $250 charged back, $50 rebilled, 150 points kept; the history replays |
 | Worker process | `run` as `main` calls it: ops port taken, then started, probed, cancelled | Refuses to start without its ops port; `/healthz` ok with the version; SDK metrics served; stops on cancel and closes the port |
+| Audit | A live hold and a failing workflow; the audit command; the schedule created twice and triggered, then triggered again with no worker | Both named; the command exits with the failure; one schedule; `/healthz` degraded by its findings, and still degraded while the next audit runs |
 | Card lifecycle (MySQL) | `set-limit` a new card, then raise its limit | One running statement cycle, same run both times |
 | Updates mid-step | Every write stalls 1.5s; a refund update is sent the moment its capture returns, twice with one update ID, and the 1s window closes while it posts | One refund; points clawed back; a new update ID for the same refund is rejected |
 
@@ -136,6 +137,9 @@ Each safeguard was removed on purpose to confirm a test notices:
 | The worker listens before starting work | worker drill: starts without its ops port, invisible to the prober |
 | The SDK reports into the served metrics | worker drill: `/debug/vars` has no Temporal series |
 | Metrics series: sorted tags, gauges set, timers totalled | `TestExpvarMetrics` |
+| Each audit invariant (card money, holds, points, memos, points net, total) | `TestAuditLedger`, one row per break |
+| Stuck auths and failed workflows are found | audit drill: either one missed |
+| Health follows the latest finished audit | audit drill: health ok while an audit has findings, or while the next one runs |
 | An increment claims the hold | *capture during increment rejected*: otherwise a final capture strands the increment |
 
 Two experiments removed code instead. Cancelling the hold timer after capture survived mutation,
@@ -152,6 +156,9 @@ always runs the handler first, so it can't produce that order.
 
 A note on the test environment: it caps "retry forever" at 10 attempts so a unit test can't hang,
 so the outage test fails 8 times. That's past the saga's limit of 5, and under the test cap.
+
+The auditor's first real run checked the 778 accounts that every test and drill had written to the
+shared MySQL database during development, and found nothing.
 
 ## How it was built
 

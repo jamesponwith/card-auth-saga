@@ -203,3 +203,19 @@ func TestRecordAttempt(t *testing.T) {
 		}
 	})
 }
+
+// Accounts lists every account with its balance.
+func TestLedgerAccounts(t *testing.T) {
+	forEachLedger(t, func(t *testing.T, l Ledger, n func(string) string) {
+		if err := l.Post(context.Background(), n("k"), Entry{n("a"), 300}, Entry{n("b"), -300}); err != nil {
+			t.Fatal(err)
+		}
+		all, err := l.Accounts(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if all[n("a")] != 300 || all[n("b")] != -300 {
+			t.Errorf("Accounts = %v, want a = 300 and b = -300", all)
+		}
+	})
+}

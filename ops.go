@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"expvar"
+	"fmt"
 	"net/http"
 	"time"
 
@@ -22,8 +23,9 @@ func opsHandler(started time.Time, status func() string) http.Handler {
 	return mux
 }
 
-// workerHealth reports "ok" when the worker can reach everything it needs, or
-// "degraded: <dependency>: <error>" for the first it can't. ping checks the
+// workerHealth reports "ok" when the worker can reach everything it needs and
+// the latest scheduled audit was clean, or "degraded: <what>: <why>" for the
+// first that isn't. ping checks the
 // ledger's database; nil means the ledger is in memory.
 func workerHealth(c client.Client, ping func(context.Context) error) func() string {
 	return func() string {
@@ -36,6 +38,13 @@ func workerHealth(c client.Client, ping func(context.Context) error) func() stri
 			if err := ping(ctx); err != nil {
 				return "degraded: mysql: " + err.Error()
 			}
+		}
+		findings, err := lastAuditFindings(ctx, c)
+		switch {
+		case err != nil:
+			return "degraded: audit: " + err.Error()
+		case len(findings) > 0:
+			return fmt.Sprintf("degraded: audit: %d findings, first %s %s: %s", len(findings), findings[0].Check, findings[0].Subject, findings[0].Detail)
 		}
 		return "ok"
 	}

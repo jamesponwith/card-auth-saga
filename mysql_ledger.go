@@ -121,6 +121,24 @@ func (l *MySQLLedger) RecordAttempt(ctx context.Context, card, id string, at tim
 	return n, err
 }
 
+func (l *MySQLLedger) Accounts(ctx context.Context) (map[string]int64, error) {
+	rows, err := l.db.QueryContext(ctx, `SELECT id, balance FROM accounts`)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }() // Err below reports what matters
+	out := map[string]int64{}
+	for rows.Next() {
+		var id string
+		var b int64
+		if err := rows.Scan(&id, &b); err != nil {
+			return nil, err
+		}
+		out[id] = b
+	}
+	return out, rows.Err()
+}
+
 func (l *MySQLLedger) Balance(ctx context.Context, account string) (int64, error) {
 	var b int64
 	err := l.db.QueryRowContext(ctx, `SELECT balance FROM accounts WHERE id = ?`, account).Scan(&b)

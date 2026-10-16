@@ -185,6 +185,29 @@ more than was captured.
 - The `disputes` query lists each dispute and its stage. Money steps retry until the ledger answers,
   because a provisional credit or rebill has nothing to compensate with.
 
+## Ledger auditor (M15)
+
+`AuditWorkflow` runs on a Temporal Schedule (`ledger-audit`, every 24h, overlapping runs skipped), and
+on demand with `go run . audit`. It reports findings rather than fixing anything.
+
+| Check | Rule |
+|---|---|
+| Card money | holds + posted + open-to-buy nets to 0, per card |
+| Holds | never negative, per card |
+| Points | a card's points are never negative; card points + partner points-issued net to 0 |
+| Payment memos | each card's `paid:s<N>` accounts + `payments` net to 0 |
+| Whole ledger | every account sums to 0 |
+| Stuck auths | no `AuthorizeWorkflow` running past its longest life (hold + refunds + both dispute deadlines: 120 days) |
+| Stuck statements | no `StatementWorkflow` run older than two cycles (60 days) |
+| Failures | no workflow failed or timed out since the previous audit (the last 24h) |
+
+- The workflow's result is the report, and each finding is logged. While the most recent scheduled
+  audit has findings, `/healthz` reports `degraded: audit: <n> findings`, so the Operate prober files
+  the incident with no new integration.
+- The worker creates the schedule on boot if it's missing, and leaves an existing one alone.
+- Account IDs are `card:<id>:<kind>` and `partner:<merchant>:points-issued`, so card IDs can't contain
+  `:`; `set-limit` rejects them.
+
 ## Non-goals
 
 - Real card networks (ISO 8583), PCI scope, or real money.
@@ -208,6 +231,7 @@ more than was captured.
 - **M12**: Statements start with the card; per-card APR; average-daily-balance interest.
 - **M13**: Disputes (provisional credit, merchant response, analyst review, chargeback or rebill).
 - **M14**: Operate stage: `/healthz` with dependency checks, SDK metrics via expvar, SLO contract (ADR 0006).
+- **M15**: Nightly ledger auditor on a Temporal Schedule.
 
 ## Success criteria
 
