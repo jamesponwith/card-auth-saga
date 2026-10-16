@@ -203,3 +203,34 @@ func TestRecordAttempt(t *testing.T) {
 		}
 	})
 }
+
+// Accounts lists balances by ID prefix; LIKE wildcards in the prefix are literal.
+func TestLedgerAccounts(t *testing.T) {
+	forEachLedger(t, func(t *testing.T, l Ledger, n func(string) string) {
+		ctx := context.Background()
+		for key, e := range map[string][]Entry{
+			"k1": {{n("card:a_1:posted"), 300}, {n("card:a_1:open-to-buy"), -300}},
+			"k2": {{n("card:ax1:posted"), 50}, {n("card:ax1:open-to-buy"), -50}},
+			"k3": {{n("partner:shop:points-issued"), -7}, {n("card:a_1:points"), 7}},
+		} {
+			if err := l.Post(ctx, n(key), e...); err != nil {
+				t.Fatal(err)
+			}
+		}
+		got, err := l.Accounts(ctx, n("card:a_1:"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		want := map[string]int64{n("card:a_1:posted"): 300, n("card:a_1:open-to-buy"): -300, n("card:a_1:points"): 7}
+		if fmt.Sprint(got) != fmt.Sprint(want) {
+			t.Errorf("Accounts(card:a_1:) = %v, want %v (no card:ax1 via _)", got, want)
+		}
+		all, err := l.Accounts(ctx, n(""))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(all) != 6 {
+			t.Errorf("Accounts(all) has %d accounts, want 6: %v", len(all), all)
+		}
+	})
+}

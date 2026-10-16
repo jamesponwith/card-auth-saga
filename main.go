@@ -8,6 +8,7 @@
 //	card-auth-saga set-limit <card> <cents>       create or update a card, and start its statements (MySQL)
 //	card-auth-saga set-apr <card> <basis-points>  set a card's APR, from its next statement (MySQL)
 //	card-auth-saga set-rate <merchant> <points>   set a partner's points per $1 (MySQL)
+//	card-auth-saga audit                          run the ledger audit now; exits non-zero on findings
 package main
 
 import (
@@ -21,6 +22,7 @@ import (
 	"os"
 	ossignal "os/signal" // "signal" is a test helper type in this package
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -40,6 +42,9 @@ func main() {
 func run(ctx context.Context, args []string, env func(string) string) error {
 	dsn := env("CAS_MYSQL_DSN")
 	temporalOptions := client.Options{HostPort: env("TEMPORAL_ADDRESS")} // empty: localhost:7233
+	if len(args) == 1 && args[0] == "audit" {
+		return audit(ctx, temporalOptions)
+	}
 	var cmd adminCmd
 	if len(args) > 0 {
 		var err error
@@ -88,13 +93,18 @@ func run(ctx context.Context, args []string, env func(string) string) error {
 	w := worker.New(c, TaskQueue, worker.Options{})
 	w.RegisterWorkflow(AuthorizeWorkflow)
 	w.RegisterWorkflow(StatementWorkflow)
+	w.RegisterWorkflow(AuditWorkflow)
+	acts.Temporal = c
 	w.RegisterActivity(acts)
+	if err := ensureAuditSchedule(ctx, c); err != nil {
+		return fmt.Errorf("audit schedule: %w", err)
+	}
 	stopped := make(chan any)
 	go func() { <-ctx.Done(); close(stopped) }()
 	return w.Run(stopped) // until ctx is cancelled: SIGINT or SIGTERM in main
 }
 
-var errUsage = errors.New("usage: card-auth-saga [set-limit <card> <cents> | set-apr <card> <basis-points> | set-rate <merchant> <points-per-dollar>]")
+var errUsage = errors.New("usage: card-auth-saga [set-limit <card> <cents> | set-apr <card> <basis-points> | set-rate <merchant> <points-per-dollar> | audit]")
 
 // adminCmd applies a parsed admin command. Temporal options reach set-limit,
 // which also starts the card's statements.
@@ -107,6 +117,9 @@ func admin(args []string) (adminCmd, error) {
 		return nil, errUsage
 	}
 	id := args[1]
+	if args[0] != "set-rate" && strings.Contains(id, ":") { // account IDs are card:<id>:<kind>
+		return nil, fmt.Errorf("%s: card ID %q can't contain ':'", args[0], id)
+	}
 	n, err := strconv.ParseInt(args[2], 10, 64)
 	if err != nil {
 		return nil, fmt.Errorf("%s: %q is not a whole number", args[0], args[2])
@@ -144,4 +157,34 @@ func startStatement(ctx context.Context, opts client.Options, card string) error
 		return fmt.Errorf("card saved; its statements did not start (run set-limit again): %w", err)
 	}
 	return nil
+}
+
+// audit runs the ledger audit now and prints what it finds. It needs a running
+// worker; the error on findings makes the command exit non-zero.
+func audit(ctx context.Context, opts client.Options) error {
+	c, err := client.Dial(opts)
+	if err != nil {
+		return fmt.Errorf("dial temporal: %w", err)
+	}
+	defer c.Close()
+	run, err := c.ExecuteWorkflow(ctx, client.StartWorkflowOptions{
+		ID: AuditScheduleID + "-manual", TaskQueue: TaskQueue,
+		WorkflowIDConflictPolicy: enumspb.WORKFLOW_ID_CONFLICT_POLICY_USE_EXISTING, // one at a time
+	}, AuditWorkflow, AuditOptions{})
+	if err != nil {
+		return err
+	}
+	var report AuditReport
+	if err := run.Get(ctx, &report); err != nil {
+		return fmt.Errorf("audit: %w", err)
+	}
+	if len(report.Findings) == 0 {
+		fmt.Println("audit: clean")
+		return nil
+	}
+	lines := make([]string, len(report.Findings))
+	for i, f := range report.Findings {
+		lines[i] = fmt.Sprintf("  %s %s: %s", f.Check, f.Subject, f.Detail)
+	}
+	return fmt.Errorf("audit: %d findings\n%s", len(report.Findings), strings.Join(lines, "\n"))
 }

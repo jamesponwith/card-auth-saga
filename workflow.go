@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"go.temporal.io/sdk/activity"
+	"go.temporal.io/sdk/client"
 	"go.temporal.io/sdk/temporal"
 	"go.temporal.io/sdk/workflow"
 )
@@ -426,8 +427,9 @@ func (s *authState) refund(ctx workflow.Context, r Refund) error {
 // Activities do the I/O the workflow can't: every ledger read and write.
 // Each posting is keyed by "<workflow ID>:<step>", so a retried activity posts once.
 type Activities struct {
-	Ledger Ledger
-	Config Config // credit limits and partner reward rates
+	Ledger   Ledger
+	Config   Config        // credit limits and partner reward rates
+	Temporal client.Client // for the audit's visibility queries; nil skips them
 }
 
 func stepKey(ctx context.Context, step string) string {

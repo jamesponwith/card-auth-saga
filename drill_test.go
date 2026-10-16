@@ -16,6 +16,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -338,6 +339,97 @@ func TestDrills(t *testing.T) {
 		}
 	})
 
+	t.Run("audit", func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute) // fail, don't hang
+		defer cancel()
+		d := newDrill(t, c, "audit", nil)
+		d.acts.Temporal = c
+		w := d.startWorker()
+		held := d.start(AuthRequest{Amount: 1_000}) // a live hold: "stuck" once the threshold is tiny
+		d.waitBalance(holdsAccount(d.card), 1_000)
+		bad, err := c.ExecuteWorkflow(ctx, client.StartWorkflowOptions{ID: d.card + "-bad", TaskQueue: TaskQueue},
+			AuthorizeWorkflow, AuthRequest{CardID: d.card, Amount: 0}) // fails: non-positive amount
+		if err != nil {
+			t.Fatal(err)
+		}
+		_ = bad.Get(ctx, nil)
+
+		has := func(findings []Finding, check, subject string) bool {
+			return slices.ContainsFunc(findings, func(f Finding) bool { return f.Check == check && f.Subject == subject })
+		}
+		auditRun, err := c.ExecuteWorkflow(ctx, client.StartWorkflowOptions{ID: d.card + "-audit", TaskQueue: TaskQueue},
+			AuditWorkflow, AuditOptions{StuckAuth: time.Millisecond, StuckStatement: 1_000 * time.Hour})
+		if err != nil {
+			t.Fatal(err)
+		}
+		var report AuditReport
+		if err := auditRun.Get(ctx, &report); err != nil {
+			t.Fatal(err)
+		}
+		if !has(report.Findings, CheckStuckAuth, held.GetID()) || !has(report.Findings, CheckFailedWorkflow, bad.GetID()) {
+			t.Errorf("findings %v, want the held auth stuck and %s failed", report.Findings, bad.GetID())
+		}
+		workflowChecks := []string{CheckStuckAuth, CheckStuckStatement, CheckFailedWorkflow}
+		for _, f := range report.Findings {
+			if f.Subject == d.card && !slices.Contains(workflowChecks, f.Check) {
+				t.Errorf("ledger finding on a healthy card: %v", f)
+			}
+		}
+
+		// The audit command reports the failure and exits non-zero.
+		env := envOf(map[string]string{"TEMPORAL_ADDRESS": srv.FrontendHostPort()})
+		if err := run(ctx, []string{"audit"}, env); err == nil || !strings.Contains(err.Error(), bad.GetID()) {
+			t.Errorf("audit command = %v, want the failed workflow named", err)
+		}
+
+		// The schedule: created once, and its latest run drives /healthz.
+		for range 2 {
+			if err := ensureAuditSchedule(ctx, c); err != nil {
+				t.Fatalf("ensureAuditSchedule: %v", err)
+			}
+		}
+		h := c.ScheduleClient().GetHandle(ctx, AuditScheduleID)
+		t.Cleanup(func() { // the schedule, and any audit it left running
+			bg := context.Background()
+			if desc, err := h.Describe(bg); err == nil {
+				for _, a := range desc.Info.RecentActions {
+					if r := a.StartWorkflowResult; r != nil {
+						_ = c.TerminateWorkflow(bg, r.WorkflowID, r.FirstExecutionRunID, "drill done")
+					}
+				}
+			}
+			_ = h.Delete(bg)
+		})
+		if got := workerHealth(c, nil)(); got != "ok" {
+			t.Errorf("health before any scheduled audit = %q, want ok", got)
+		}
+		if err := h.Trigger(ctx, client.ScheduleTriggerOptions{}); err != nil {
+			t.Fatal(err)
+		}
+		deadline := time.Now().Add(30 * time.Second)
+		health := ""
+		for time.Now().Before(deadline) && !strings.HasPrefix(health, "degraded: audit: ") {
+			health = workerHealth(c, nil)()
+			time.Sleep(200 * time.Millisecond)
+		}
+		if !strings.HasPrefix(health, "degraded: audit: ") {
+			t.Errorf("health after an audit with findings = %q, want degraded: audit", health)
+		}
+		// While the next audit is still running (here: no worker to run it),
+		// the last finished one stands.
+		w.Stop()
+		if err := h.Trigger(ctx, client.ScheduleTriggerOptions{}); err != nil {
+			t.Fatal(err)
+		}
+		for desc, err := h.Describe(ctx); err == nil && len(desc.Info.RecentActions) < 2; desc, err = h.Describe(ctx) {
+			time.Sleep(100 * time.Millisecond)
+		}
+		if got := workerHealth(c, nil)(); !strings.HasPrefix(got, "degraded: audit: ") {
+			t.Errorf("health while the next audit runs = %q, want the last audit's findings", got)
+		}
+		_ = c.TerminateWorkflow(ctx, held.GetID(), "", "drill done")
+	})
+
 	t.Run("update with start declined", func(t *testing.T) {
 		d := newDrill(t, c, "uws-decline", nil)
 		d.startWorker()
@@ -389,6 +481,7 @@ func (d *drill) startWorker() worker.Worker {
 	w := worker.New(d.c, TaskQueue, worker.Options{Identity: "drill-worker"})
 	w.RegisterWorkflow(AuthorizeWorkflow)
 	w.RegisterWorkflow(StatementWorkflow)
+	w.RegisterWorkflow(AuditWorkflow)
 	w.RegisterActivity(d.acts)
 	if err := w.Start(); err != nil {
 		d.t.Fatal(err)
@@ -540,6 +633,7 @@ func (d *drill) replay(run client.WorkflowRun) {
 	r := worker.NewWorkflowReplayer()
 	r.RegisterWorkflow(AuthorizeWorkflow)
 	r.RegisterWorkflow(StatementWorkflow)
+	r.RegisterWorkflow(AuditWorkflow)
 	if err := r.ReplayWorkflowHistory(nil, &h); err != nil {
 		d.t.Errorf("replay: %v", err)
 	}
@@ -611,6 +705,7 @@ func TestReplayGoldenHistories(t *testing.T) {
 			r := worker.NewWorkflowReplayer()
 			r.RegisterWorkflow(AuthorizeWorkflow)
 			r.RegisterWorkflow(StatementWorkflow)
+			r.RegisterWorkflow(AuditWorkflow)
 			if err := r.ReplayWorkflowHistoryFromJSONFile(nil, f); err != nil {
 				t.Error(err)
 			}
