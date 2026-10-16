@@ -2,12 +2,14 @@
 # into `incident`-labelled issues, which learn.yml reads for change-failure rate
 # and MTTR. Incidents close themselves when the target recovers.
 #
-# Manual-only until docs/slo.yml's url names a real deployment (ADR 0006):
-# probing an address nothing serves files incidents that never close, which
-# corrupts the DORA numbers. Then restore a schedule, e.g. cron "*/10 * * * *".
+# docs/slo.yml points at the Fly deployment (ADR 0007), verified live at v0.1.1
+# before this schedule went on. If the deployment goes away, take the schedule
+# off first: probing an address nothing serves files incidents that never close.
 name: operate
 
 on:
+  schedule:
+    - cron: "*/30 * * * *" # every 30 minutes, the template's cadence
   workflow_dispatch:
 
 permissions:
