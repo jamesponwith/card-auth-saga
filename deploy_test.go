@@ -54,13 +54,12 @@ exit 0
 	}
 	secrets := []string{"FLY_API_TOKEN=x", "CAS_MYSQL_PASSWORD=p@ss w0rd", "VERSION=v0.2.0"}
 	healthy := `{"status":"ok","uptime_s":3,"version":"0.2.0"}`
-	count := func(calls, s string) int { return strings.Count(calls, s) }
 
 	calls, err := run(healthy, secrets...)
 	if err != nil {
 		t.Fatalf("first deploy: %v", err)
 	}
-	if n := count(calls, "apps create") + count(calls, "volumes create"); n != 5 {
+	if n := strings.Count(calls, "apps create") + strings.Count(calls, "volumes create"); n != 5 {
 		t.Errorf("first deploy created %d apps and volumes, want 5 (3 apps, 2 volumes):\n%s", n, calls)
 	}
 	order := []string{"-a cas-jamesponwith-mysql -c", "-a cas-jamesponwith-temporal -c", "-a cas-jamesponwith-worker -c"}
@@ -77,8 +76,8 @@ exit 0
 	}
 
 	calls, err = run(healthy, secrets...)
-	if err != nil || count(calls, "create") != 0 || count(calls, " deploy ") != 3 {
-		t.Errorf("second deploy: err %v, %d creates, %d deploys; want none created, 3 deployed", err, count(calls, "create"), count(calls, " deploy "))
+	if err != nil || strings.Count(calls, "create") != 0 || strings.Count(calls, " deploy ") != 3 {
+		t.Errorf("second deploy: err %v, %d creates, %d deploys; want none created, 3 deployed", err, strings.Count(calls, "create"), strings.Count(calls, " deploy "))
 	}
 
 	for name, health := range map[string]string{

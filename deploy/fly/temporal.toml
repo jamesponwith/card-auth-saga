@@ -5,5 +5,4 @@
   destination = "/data"
 
 [[vm]]
-  size = "shared-cpu-1x"
   memory = "1gb"

@@ -11,5 +11,4 @@
   destination = "/var/lib/mysql"
 
 [[vm]]
-  size = "shared-cpu-1x"
   memory = "1gb"

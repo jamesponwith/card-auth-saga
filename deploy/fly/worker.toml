@@ -1,23 +1,16 @@
 # The worker (ADR 0007). Its only public port serves /healthz and /debug/vars
 # for the Operate prober. It must keep running to poll Temporal, so machines
 # never auto-stop. TEMPORAL_ADDRESS and CAS_MYSQL_DSN are Fly secrets.
-[env]
-  CAS_HTTP_ADDR = ":8080"
-
 [http_service]
   internal_port = 8080
   force_https = true
   auto_stop_machines = "off"
-  auto_start_machines = true
-  min_machines_running = 1
 
   [[http_service.checks]]
     grace_period = "30s"
     interval = "30s"
     timeout = "5s"
-    method = "GET"
     path = "/healthz"
 
 [[vm]]
-  size = "shared-cpu-1x"
   memory = "512mb"

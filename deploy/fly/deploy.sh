@@ -5,18 +5,17 @@
 #
 #   FLY_API_TOKEN, CAS_MYSQL_PASSWORD   from GitHub Actions secrets
 #   VERSION                             the release tag (v0.2.0) or version (0.2.0)
-#   FLY_APP_PREFIX, FLY_REGION, FLY_ORG optional; see the defaults below
+#   FLY_APP_PREFIX, FLY_REGION          optional; see the defaults below
 set -euo pipefail
 : "${FLY_API_TOKEN:?}" "${CAS_MYSQL_PASSWORD:?}" "${VERSION:?}"
 VERSION=${VERSION#v} # a tag (v0.2.0) or a version (0.2.0): goreleaser stamps without the v
 prefix=${FLY_APP_PREFIX:-cas-jamesponwith}
 region=${FLY_REGION:-iad}
-org=${FLY_ORG:-personal}
 cd "$(dirname "$0")/../.."
 root=$PWD # every path below is absolute: build contexts, Dockerfiles, configs
 
 ensure_app() {
-  flyctl status -a "$1" >/dev/null 2>&1 || flyctl apps create "$1" --org "$org"
+  flyctl status -a "$1" >/dev/null 2>&1 || flyctl apps create "$1" --org personal
 }
 ensure_volume() { # app, volume, size in GB
   flyctl volumes list -a "$1" --json | grep -q "\"name\": *\"$2\"" ||
