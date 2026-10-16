@@ -164,6 +164,28 @@ so the outage test fails 8 times. That's past the saga's limit of 5, and under t
 The auditor's first real run checked the 778 accounts that every test and drill had written to the
 shared MySQL database during development, and found nothing.
 
+## Under load
+
+`CAS_LOAD=1 go test -run TestLoad` drives the real worker against a Temporal dev server and MySQL 8.4.
+Each approved auth is also captured. Typical numbers over three runs on an Apple M5 Pro:
+
+| Scenario | Throughput | Decision p50 / p99 | Approved |
+|---|---|---|---|
+| Spread: 400 auths over 100 cards | ~120 auths/s, each also captured | ~175 / ~470 ms | all 400 |
+| Hot card: 400 at once on one card | ~285 auths/s | ~145 / ~360 ms | exactly 5 |
+| Limit contention: 100 auths over 20 cards, limits cover 3 each | ~145 auths/s | ~140 / ~395 ms | exactly 60 |
+
+The counts are the point. Under 50-way concurrency, the velocity check admits exactly 5 of 400
+simultaneous attempts on one card, the ledger's row locks admit exactly the 3 that each limit covers,
+and the auditor finds nothing afterwards. The burst case does have a theoretical gap: an attempt that
+reads the clock first but records later can be missed by a racing count. It's noted in `PlaceHold`
+with its fix, a per-card lock.
+
+A ~150ms decision is over a card network's ~100ms budget. Most of it is the dev server's SQLite
+persistence and three round trips per decision (start, `PlaceHold`, update reply). The first levers would be
+making `PlaceHold` a local activity, which skips a task-queue round trip, and a production Temporal
+cluster.
+
 ## How it was built
 
 Each milestone in SPEC.md went through the agentic flywheel: a tracked issue, a branch, a fast pre-commit

@@ -137,6 +137,15 @@ go run . audit                     # run it now: prints "audit: clean", or the f
 temporal schedule describe --schedule-id ledger-audit
 ```
 
+## Load test
+
+```sh
+CAS_LOAD=1 go test -run TestLoad -v .   # needs CAS_MYSQL_DSN; numbers and invariants in docs/writeup.md
+```
+
+It measures auths per second and decision latency, spread across cards and concentrated on one, and
+checks that exactly the right number are approved and that the audit is clean afterwards.
+
 ## Failure drills
 
 ```sh
