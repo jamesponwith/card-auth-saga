@@ -128,7 +128,17 @@ func AuthorizeWorkflow(ctx workflow.Context, req AuthRequest) (AuthResult, error
 	// Waiting authorize updates run in the same workflow task that ends
 	// deciding, so they answer before a decline or error closes the workflow.
 	var held bool
-	s.holdErr = workflow.ExecuteActivity(ctx, s.a.PlaceHold, req).Get(ctx, &held)
+	if workflow.GetVersion(ctx, "local-place-hold", workflow.DefaultVersion, 1) == workflow.DefaultVersion {
+		s.holdErr = workflow.ExecuteActivity(ctx, s.a.PlaceHold, req).Get(ctx, &held)
+	} else {
+		// The decision waits on this step alone, so run it in the workflow
+		// worker: no round trip through the activity task queue.
+		lctx := workflow.WithLocalActivityOptions(ctx, workflow.LocalActivityOptions{
+			StartToCloseTimeout: activityTimeout,
+			RetryPolicy:         &temporal.RetryPolicy{MaximumAttempts: 5},
+		})
+		s.holdErr = workflow.ExecuteLocalActivity(lctx, s.a.PlaceHold, req).Get(ctx, &held)
+	}
 	var declined *temporal.ApplicationError
 	if errors.As(s.holdErr, &declined) && slices.Contains([]string{DeclineVelocity, DeclineUnknownCard, DeclineFrozen, DeclineClosed}, declined.Type()) {
 		s.holdErr, s.reason = nil, declined.Type()

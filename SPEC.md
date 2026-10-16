@@ -51,6 +51,8 @@ carries on with the hold.
   No second hold is placed.
 - If `PlaceHold` fails (bad amount), the update returns that error rather than hanging.
 - The update has no arguments and no side effects, so old histories without it still replay.
+- `PlaceHold`, the one step the decision waits on, runs as a local activity in the workflow worker
+  (`GetVersion("local-place-hold")`; earlier runs replay on the remote activity).
 
 ## Capture, reverse, refund as updates (M7)
 
