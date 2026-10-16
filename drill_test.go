@@ -288,7 +288,13 @@ func TestDrills(t *testing.T) {
 			t.Fatal(err)
 		}
 		addr := ln.Addr().String()
-		env := envOf(map[string]string{"TEMPORAL_ADDRESS": srv.FrontendHostPort(), "CAS_HTTP_ADDR": addr})
+		dln, err := net.Listen("tcp", "127.0.0.1:0") // and one for the metrics, kept off the public port
+		if err != nil {
+			t.Fatal(err)
+		}
+		debugAddr := dln.Addr().String()
+		_ = dln.Close()
+		env := envOf(map[string]string{"TEMPORAL_ADDRESS": srv.FrontendHostPort(), "CAS_HTTP_ADDR": addr, "CAS_DEBUG_ADDR": debugAddr})
 		if err := run(context.Background(), nil, env); err == nil || !strings.Contains(err.Error(), "ops endpoint") {
 			t.Errorf("run with the ops port taken = %v, want it to refuse to start", err)
 		}
@@ -309,9 +315,15 @@ func TestDrills(t *testing.T) {
 		if health["status"] != "ok" || health["version"] != Version {
 			t.Errorf("/healthz = %v, want ok and version %s", health, Version)
 		}
-		// The worker's Temporal client reports into the served metrics.
+		// The metrics aren't on the public port; the worker's Temporal client
+		// reports into them on the private one.
+		if res, err := http.Get("http://" + addr + "/debug/vars"); err != nil || res.StatusCode != http.StatusNotFound {
+			t.Errorf("/debug/vars on the public port = %v, %v; want 404", res, err)
+		} else {
+			_ = res.Body.Close()
+		}
 		var vars struct{ Temporal map[string]any }
-		if res, err := http.Get("http://" + addr + "/debug/vars"); err != nil {
+		if res, err := http.Get("http://" + debugAddr + "/debug/vars"); err != nil {
 			t.Error(err)
 		} else {
 			_ = json.NewDecoder(res.Body).Decode(&vars)

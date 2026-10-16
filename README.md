@@ -148,6 +148,9 @@ curl localhost:8080/healthz      # {"status":"ok","version":"v1.2.3","uptime_s":
 curl localhost:8080/debug/vars   # the Temporal SDK's metrics under "temporal", one series per name and tags
 ```
 
+Set `CAS_DEBUG_ADDR` to give `/debug/vars` a port of its own. The Fly deployment does this
+(`:9091`, private network only), so only `/healthz` is public.
+
 `/healthz` reports `ok` only if Temporal and MySQL both answer. Release builds stamp the version.
 `docs/slo.yml` points at the Fly worker. Probing stays manual until a deploy is verified, because probing
 an address that isn't up would file incidents that never close. Run it by hand with

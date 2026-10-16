@@ -1,6 +1,10 @@
-# The worker (ADR 0007). Its only public port serves /healthz and /debug/vars
-# for the Operate prober. It must keep running to poll Temporal, so machines
-# never auto-stop. TEMPORAL_ADDRESS and CAS_MYSQL_DSN are Fly secrets.
+# The worker (ADR 0007). Its only public port serves /healthz, for the Operate
+# prober; /debug/vars has a port of its own, reachable only on the private
+# network (<app>.internal:9091). It must keep running to poll Temporal, so
+# machines never auto-stop. TEMPORAL_ADDRESS and CAS_MYSQL_DSN are Fly secrets.
+[env]
+  CAS_DEBUG_ADDR = ":9091"
+
 [http_service]
   internal_port = 8080
   force_https = true

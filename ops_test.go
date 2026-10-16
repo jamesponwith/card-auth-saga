@@ -17,7 +17,7 @@ import (
 // Temporal metrics map.
 func TestOpsHandler(t *testing.T) {
 	temporalMetrics.Add("ops_test_probe", 1)
-	srv := httptest.NewServer(opsHandler(time.Now(), func() string { return "degraded: mysql: down" }))
+	srv := httptest.NewServer(opsHandler(time.Now(), func() string { return "degraded: mysql: down" }, true))
 	defer srv.Close()
 	get := func(path string) (int, string) {
 		t.Helper()
@@ -56,5 +56,32 @@ func TestWorkerHealthTemporalDown(t *testing.T) {
 	}
 	if pinged {
 		t.Error("checked MySQL after Temporal failed; the first failure is the one to report")
+	}
+}
+
+// With the metrics on a port of their own, the public handler serves /healthz
+// and nothing else: a deployment can publish it without its internals.
+func TestOpsHandlerWithoutDebug(t *testing.T) {
+	public := httptest.NewServer(opsHandler(time.Now(), func() string { return "ok" }, false))
+	defer public.Close()
+	private := httptest.NewServer(debugHandler())
+	defer private.Close()
+	for _, tt := range []struct {
+		port, url, path string
+		want            int
+	}{
+		{"public", public.URL, "/healthz", http.StatusOK},
+		{"public", public.URL, "/debug/vars", http.StatusNotFound},
+		{"private", private.URL, "/debug/vars", http.StatusOK},
+		{"private", private.URL, "/healthz", http.StatusNotFound},
+	} {
+		res, err := http.Get(tt.url + tt.path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_ = res.Body.Close()
+		if res.StatusCode != tt.want {
+			t.Errorf("%s on the %s port = %d, want %d", tt.path, tt.port, res.StatusCode, tt.want)
+		}
 	}
 }

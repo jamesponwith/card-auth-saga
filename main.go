@@ -1,8 +1,9 @@
 // Command card-auth-saga runs the Temporal worker for the card authorization
 // saga against a local server (`temporal server start-dev`, or TEMPORAL_ADDRESS).
 // Set CAS_MYSQL_DSN to keep the ledger and card config in MySQL; otherwise both
-// live in memory. The worker serves /healthz and /debug/vars on CAS_HTTP_ADDR
-// (default :8080) for the Operate stage (ADR 0006).
+// live in memory. The worker serves /healthz on CAS_HTTP_ADDR (default :8080)
+// for the Operate stage (ADR 0006), and /debug/vars there too unless
+// CAS_DEBUG_ADDR gives the metrics a port of their own.
 //
 //	card-auth-saga                                run the worker
 //	card-auth-saga set-limit <card> <cents>       create or update a card, and start its statements (MySQL)
@@ -91,9 +92,21 @@ func run(ctx context.Context, args []string, env func(string) string) error {
 	if err != nil {
 		return fmt.Errorf("ops endpoint: %w", err)
 	}
-	ops := &http.Server{Handler: opsHandler(time.Now(), workerHealth(c, ping)), ReadHeaderTimeout: 5 * time.Second}
+	// CAS_DEBUG_ADDR gives the metrics a port of their own, so a deployment can
+	// publish /healthz without publishing its internals (deploy/fly/worker.toml).
+	debugAddr := env("CAS_DEBUG_ADDR")
+	ops := &http.Server{Handler: opsHandler(time.Now(), workerHealth(c, ping), debugAddr == ""), ReadHeaderTimeout: 5 * time.Second}
 	go func() { _ = ops.Serve(ln) }()  // returns ErrServerClosed on Close
 	defer func() { _ = ops.Close() }() // nothing on a health and metrics port needs draining
+	if debugAddr != "" {
+		dln, err := net.Listen("tcp", debugAddr)
+		if err != nil {
+			return fmt.Errorf("debug endpoint: %w", err)
+		}
+		debug := &http.Server{Handler: debugHandler(), ReadHeaderTimeout: 5 * time.Second}
+		go func() { _ = debug.Serve(dln) }()
+		defer func() { _ = debug.Close() }()
+	}
 	w := worker.New(c, TaskQueue, worker.Options{})
 	w.RegisterWorkflow(AuthorizeWorkflow)
 	w.RegisterWorkflow(StatementWorkflow)
