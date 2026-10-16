@@ -1,0 +1,7 @@
+.git
+.beads
+.beads.gate.lock
+dist
+docs
+testdata
+*.test

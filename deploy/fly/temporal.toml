@@ -1,0 +1,9 @@
+# Temporal (ADR 0007): deploy/temporal/Dockerfile, history in SQLite on a
+# volume. No [services]: reachable only as <app>.internal:7233.
+[mounts]
+  source = "temporal_data"
+  destination = "/data"
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "1gb"
