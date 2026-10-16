@@ -28,7 +28,8 @@ Operate → Learn.
 
 - `docs/slo.yml` is the contract: probe url, latency budget, and how long a
   breach must persist before it is an incident. Point `url` at the real
-  deployment before enabling `.github/workflows/operate.yml` (ADR 0006).
+  deployment before enabling `.github/workflows/operate.yml` (ADR 0006). It points at the Fly
+  worker (ADR 0007), and the probe runs every 30 minutes.
 - `healthz.go` comes from the template byte-for-byte; the worker serves it on
   `CAS_HTTP_ADDR` (default `:8080`) and reports `degraded` when Temporal or
   MySQL is unreachable. The version it reports is how Learn attributes an

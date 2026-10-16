@@ -152,9 +152,10 @@ Set `CAS_DEBUG_ADDR` to give `/debug/vars` a port of its own. The Fly deployment
 (`:9091`, private network only), so only `/healthz` is public.
 
 `/healthz` reports `ok` only if Temporal and MySQL both answer. Release builds stamp the version.
-`docs/slo.yml` points at the Fly worker. Probing stays manual until a deploy is verified, because probing
-an address that isn't up would file incidents that never close. Run it by hand with
-`gh workflow run operate`; once a release is live, restore the schedule in `operate.yml`.
+`docs/slo.yml` points at the Fly worker, and `operate.yml` probes it every 30 minutes, opening an
+`incident` issue on a sustained breach and closing it on recovery. Run it by hand with
+`gh workflow run operate`. If the deployment goes away, take the schedule off first: probing an
+address nothing serves files incidents that never close.
 
 ## Audit
 

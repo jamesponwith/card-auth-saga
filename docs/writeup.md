@@ -214,6 +214,18 @@ Two changes took decisions from ~150–180ms to these numbers:
 The rest of the decision time is mostly the dev server's SQLite persistence. A production Temporal
 cluster is the next lever.
 
+## In production
+
+A `v*` tag deploys to Fly.io (ADR 0007): MySQL, a single-process Temporal persisted to SQLite on a
+volume, and the worker, with only `/healthz` public. The first deploy, `v0.1.0`, created the MySQL app and
+then failed on `flyctl deploy --region`, a flag flyctl doesn't have. The deploy script's unit test stubs
+flyctl and accepts any flag, so it couldn't notice. `v0.1.1` fixed the flag and added a test that checks
+every flag the script uses against the real flyctl's `--help`.
+
+`v0.1.1` came up healthy. Before switching on the Operate probe, I ran a real transaction against it:
+a card created with the worker's own `set-limit`, an auth approved and captured through a `fly proxy`
+tunnel to the private Temporal, the card's statement cycle running, and the production audit clean.
+
 ## How it was built
 
 Each milestone in SPEC.md went through the agentic flywheel: a tracked issue, a branch, a fast pre-commit
