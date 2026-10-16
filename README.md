@@ -135,7 +135,8 @@ that never close. Run it by hand with `gh workflow run operate`.
 Every 24 hours a Temporal Schedule (`ledger-audit`, created by the worker on boot) runs `AuditWorkflow`
 (SPEC.md, M15). It checks each card's money nets to zero, that holds and points are never negative,
 that payment memos and points net to zero, and that the whole ledger sums to zero. It also checks that
-no auth or statement run is stuck and that no workflow failed since the last audit. Findings are the
+no auth or statement run is stuck, that no workflow failed since the last audit, and that no card
+holds money with no auth running on it. Findings are the
 workflow's result, and `/healthz` reports `degraded: audit: …` while the latest one has any:
 
 ```sh

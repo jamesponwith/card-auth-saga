@@ -29,6 +29,8 @@ import (
 	"time"
 
 	enumspb "go.temporal.io/api/enums/v1"
+	"go.temporal.io/api/operatorservice/v1"
+	"go.temporal.io/api/serviceerror"
 	"go.temporal.io/sdk/client"
 	"go.temporal.io/sdk/worker"
 )
@@ -98,6 +100,9 @@ func run(ctx context.Context, args []string, env func(string) string) error {
 	w.RegisterWorkflow(AuditWorkflow)
 	acts.Temporal = c
 	w.RegisterActivity(acts)
+	if err := ensureCardIDAttribute(ctx, c, temporalOptions.Namespace); err != nil {
+		return fmt.Errorf("search attribute: %w", err)
+	}
 	if err := ensureAuditSchedule(ctx, c); err != nil {
 		return fmt.Errorf("audit schedule: %w", err)
 	}
@@ -126,8 +131,9 @@ func admin(args []string) (adminCmd, error) {
 		return nil, errUsage
 	}
 	id := args[1]
-	if args[0] != "set-rate" && strings.Contains(id, ":") { // account IDs are card:<id>:<kind>
-		return nil, fmt.Errorf("%s: card ID %q can't contain ':'", args[0], id)
+	// Account IDs are card:<id>:<kind>, and the audit quotes card IDs in visibility queries.
+	if args[0] != "set-rate" && strings.ContainsAny(id, `:'"\`) {
+		return nil, fmt.Errorf("%s: card ID %q can't contain : ' \" or \\", args[0], id)
 	}
 	n, err := strconv.ParseInt(args[2], 10, 64)
 	if err != nil {
@@ -196,4 +202,18 @@ func audit(ctx context.Context, opts client.Options) error {
 		lines[i] = fmt.Sprintf("  %s %s: %s", f.Check, f.Subject, f.Detail)
 	}
 	return fmt.Errorf("audit: %d findings\n%s", len(report.Findings), strings.Join(lines, "\n"))
+}
+
+// ensureCardIDAttribute registers the CardID search attribute, which every
+// new auth sets on itself: without it, their first workflow task would fail.
+func ensureCardIDAttribute(ctx context.Context, c client.Client, namespace string) error {
+	_, err := c.OperatorService().AddSearchAttributes(ctx, &operatorservice.AddSearchAttributesRequest{
+		Namespace:        cmp.Or(namespace, client.DefaultNamespace),
+		SearchAttributes: map[string]enumspb.IndexedValueType{CardIDAttribute.GetName(): enumspb.INDEXED_VALUE_TYPE_KEYWORD},
+	})
+	var exists *serviceerror.AlreadyExists
+	if errors.As(err, &exists) {
+		return nil
+	}
+	return err
 }

@@ -28,6 +28,10 @@ const (
 	VelocityWindow      = time.Minute
 )
 
+// CardIDAttribute tags each AuthorizeWorkflow with its card, for card-scoped
+// visibility queries. The worker registers it on boot.
+var CardIDAttribute = temporal.NewSearchAttributeKeyKeyword("CardID")
+
 // activityTimeout bounds one activity attempt. A var so the timeout drill can shrink it.
 var activityTimeout = 10 * time.Second
 
@@ -121,6 +125,12 @@ func AuthorizeWorkflow(ctx workflow.Context, req AuthRequest) (AuthResult, error
 	s := &authState{req: req, root: ctx, phase: phaseDeciding, held: req.Amount, seen: map[string]bool{}, increments: map[string]bool{}, disputes: map[string]*disputeState{}}
 	// Runs started before multiple captures replay on the single-capture path.
 	s.v = workflow.GetVersion(ctx, "multi-capture", workflow.DefaultVersion, 1)
+	// Tag the auth with its card, so card-scoped visibility queries find it.
+	if workflow.GetVersion(ctx, "card-id-attribute", workflow.DefaultVersion, 1) != workflow.DefaultVersion {
+		if err := workflow.UpsertTypedSearchAttributes(ctx, CardIDAttribute.ValueSet(req.CardID)); err != nil {
+			return AuthResult{}, err
+		}
+	}
 	if err := errors.Join(s.registerUpdates(ctx), s.registerDisputes(ctx)); err != nil {
 		return AuthResult{}, err
 	}

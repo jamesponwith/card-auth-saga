@@ -208,8 +208,8 @@ func closeDaily(ctx workflow.Context, a *Activities, terms StatementTerms, last 
 	return workflow.NewContinueAsNewError(ctx, StatementWorkflow, terms, next)
 }
 
-// CardDone reports whether a card is closed with nothing posted or held, so
-// its statements can stop.
+// CardDone reports whether a card is closed with nothing posted or held and
+// no auth still running on it, so its statements can stop.
 func (a *Activities) CardDone(ctx context.Context, card string) (bool, error) {
 	status, _, err := a.Config.CardStatus(ctx, card)
 	if err != nil || status != CardClosed {
@@ -218,6 +218,19 @@ func (a *Activities) CardDone(ctx context.Context, card string) (bool, error) {
 	for _, account := range []string{postedAccount(card), holdsAccount(card)} {
 		b, err := a.Ledger.Balance(ctx, account)
 		if err != nil || b != 0 {
+			return false, err
+		}
+	}
+	if a.Temporal == nil { // unit tests: no visibility to ask
+		return true, nil
+	}
+	// An auth still running could post a refund or chargeback after the final
+	// statement; so could one from before CardID tagging, which can't be seen.
+	for _, count := range []func(context.Context) (int64, error){
+		func(ctx context.Context) (int64, error) { return a.runningAuths(ctx, card) },
+		a.untaggedAuths,
+	} {
+		if n, err := count(ctx); err != nil || n > 0 {
 			return false, err
 		}
 	}

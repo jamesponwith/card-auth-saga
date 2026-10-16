@@ -498,6 +498,27 @@ func TestCardStatus(t *testing.T) {
 	}
 }
 
+// Each auth tags itself with its card, so card-scoped visibility finds it.
+func TestAuthTagsCardID(t *testing.T) {
+	var s testsuite.WorkflowTestSuite
+	env := s.NewTestWorkflowEnvironment()
+	env.RegisterActivity(&Activities{Ledger: NewMemLedger(), Config: card1()})
+	var tagged []string
+	env.OnUpsertTypedSearchAttributes(mock.Anything).Run(func(args mock.Arguments) {
+		card, _ := args.Get(0).(temporal.SearchAttributes).GetKeyword(CardIDAttribute)
+		tagged = append(tagged, card)
+	}).Return(nil)
+
+	env.ExecuteWorkflow(AuthorizeWorkflow, auth("card-1", 100_001)) // declined: tagged all the same
+
+	if err := env.GetWorkflowError(); err != nil {
+		t.Fatal(err)
+	}
+	if fmt.Sprint(tagged) != "[card-1]" {
+		t.Errorf("CardID upserts = %v, want [card-1]", tagged)
+	}
+}
+
 // A partner rate change after settlement must not change what a refund claws
 // back, or a full refund would leave the card with negative points.
 func TestRewardRateFixedAtSettlement(t *testing.T) {

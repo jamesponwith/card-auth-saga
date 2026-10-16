@@ -35,7 +35,8 @@ func TestDrills(t *testing.T) {
 		t.Skip("drills start a Temporal dev server; run without -short")
 	}
 	ctx := context.Background()
-	srv, err := testsuite.StartDevServer(ctx, testsuite.DevServerOptions{LogLevel: "error", ClientOptions: &client.Options{Identity: "drill-client"}})
+	srv, err := testsuite.StartDevServer(ctx, testsuite.DevServerOptions{LogLevel: "error", ClientOptions: &client.Options{Identity: "drill-client"},
+		ExtraArgs: []string{"--search-attribute", "CardID=Keyword"}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -376,6 +377,44 @@ func TestDrills(t *testing.T) {
 			}
 		}
 
+		// Orphaned holds: money held on a card with no auth running on it.
+		oldRecheck := orphanRecheck
+		orphanRecheck = 100 * time.Millisecond
+		t.Cleanup(func() { orphanRecheck = oldRecheck })
+		orphan := d.card + "-orphan"
+		if err := d.l.Post(ctx, orphan+":stray-hold", Entry{holdsAccount(orphan), 700}, Entry{openToBuyAccount(orphan), -700}); err != nil {
+			t.Fatal(err)
+		}
+		orphans, err := d.acts.orphanedHolds(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !has(orphans, CheckOrphanedHold, orphan) || has(orphans, CheckOrphanedHold, d.card) {
+			t.Errorf("orphaned holds = %v, want %s and not %s (its auth is running)", orphans, orphan, d.card)
+		}
+		// A closed card's statements wait for its last running auth.
+		closed := &Activities{Ledger: NewMemLedger(), Config: StaticConfig{Statuses: map[string]string{d.card: CardClosed}}, Temporal: c}
+		if done, err := closed.CardDone(ctx, d.card); err != nil || done {
+			t.Errorf("CardDone with an auth running = %v, %v; want false", done, err)
+		}
+
+		// An untagged auth (from before CardID): it can't be attributed, so the
+		// orphan check stands down and closed cards keep their statements.
+		untagged, err := c.ExecuteWorkflow(ctx, client.StartWorkflowOptions{ID: d.card + "-untagged", TaskQueue: "no-worker-polls-this"},
+			AuthorizeWorkflow, AuthRequest{CardID: orphan, Amount: 1})
+		if err != nil {
+			t.Fatal(err)
+		}
+		for n := int64(0); n == 0; time.Sleep(100 * time.Millisecond) {
+			if n, err = d.acts.untaggedAuths(ctx); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if orphans, err := d.acts.orphanedHolds(ctx); err != nil || len(orphans) > 0 {
+			t.Errorf("orphaned holds with an untagged auth running = %v, %v; want none reported", orphans, err)
+		}
+		_ = c.TerminateWorkflow(ctx, untagged.GetID(), "", "drill done")
+
 		// The audit command reports the failure and exits non-zero.
 		env := envOf(map[string]string{"TEMPORAL_ADDRESS": srv.FrontendHostPort()})
 		if err := run(ctx, []string{"audit"}, env); err == nil || !strings.Contains(err.Error(), bad.GetID()) {
@@ -428,6 +467,13 @@ func TestDrills(t *testing.T) {
 			t.Errorf("health while the next audit runs = %q, want the last audit's findings", got)
 		}
 		_ = c.TerminateWorkflow(ctx, held.GetID(), "", "drill done")
+		var done bool
+		for deadline := time.Now().Add(10 * time.Second); time.Now().Before(deadline) && !done; time.Sleep(100 * time.Millisecond) {
+			done, err = closed.CardDone(ctx, d.card) // visibility catches up with the termination
+		}
+		if !done || err != nil {
+			t.Errorf("CardDone after the last auth ended = %v, %v; want true", done, err)
+		}
 	})
 
 	t.Run("update with start declined", func(t *testing.T) {

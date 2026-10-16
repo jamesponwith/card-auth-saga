@@ -202,13 +202,17 @@ on demand with `go run . audit`. It reports findings rather than fixing anything
 | Stuck auths | no `AuthorizeWorkflow` running past its longest life (hold + refunds + both dispute deadlines: 120 days) |
 | Stuck statements | no `StatementWorkflow` run older than two cycles (60 days) |
 | Failures | no workflow failed or timed out since the previous audit (the last 24h) |
+| Orphaned holds | no card holds money while no auth runs on it (checked twice, 2s apart, so an auth settling mid-audit isn't reported) |
 
 - The workflow's result is the report, and each finding is logged. While the most recent scheduled
   audit has findings, `/healthz` reports `degraded: audit: <n> findings`, so the Operate prober files
   the incident with no new integration.
 - The worker creates the schedule on boot if it's missing, and leaves an existing one alone.
-- Account IDs are `card:<id>:<kind>` and `partner:<merchant>:points-issued`, so card IDs can't contain
-  `:`; `set-limit` rejects them.
+- Account IDs are `card:<id>:<kind>` and `partner:<merchant>:points-issued`, and the audit quotes card
+  IDs in visibility queries. So card IDs can't contain `:`, quotes or `\`, and `set-limit` rejects them.
+- Each `AuthorizeWorkflow` tags itself with a `CardID` search attribute
+  (`GetVersion("card-id-attribute")`), which the worker registers on boot. Auths started before
+  tagging can't be attributed to a card, so while any is running the orphan check stands down.
 
 ## Freezing and closing cards (M16)
 
@@ -220,9 +224,9 @@ on demand with `go run . audit`. It reports findings rather than fixing anything
   not existing obligations. `unfreeze` lifts it.
 - **Closed:** like frozen, with `Reason: Closed`, and permanent. Freeze, unfreeze and `set-limit` on a
   closed card are refused, so a closed card can't be reopened by accident. The statement cycle keeps
-  billing until a close finds nothing posted and nothing held, then ends instead of continuing as new.
-  A refund or chargeback that lands after that leaves a credit for a manual payout; the auditor's ledger
-  checks still hold.
+  billing until a close finds nothing posted, nothing held and no auth still running on the card, then
+  ends instead of continuing as new. Waiting for the last auth means a refund or chargeback can't land
+  after the final statement.
 - `PlaceHold` reads the status with the limit, so a status change applies to the next auth. Runs
   started before this replay unchanged: an old `PlaceHold` result is only `true`/`false`, and statement
   runs gate the new close step with `GetVersion("end-when-closed")`.

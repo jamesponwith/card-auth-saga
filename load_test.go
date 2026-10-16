@@ -26,7 +26,7 @@ func TestLoad(t *testing.T) {
 		t.Skip("set CAS_LOAD=1 and CAS_MYSQL_DSN to run the load test")
 	}
 	ctx := context.Background()
-	srv, err := testsuite.StartDevServer(ctx, testsuite.DevServerOptions{LogLevel: "error"})
+	srv, err := testsuite.StartDevServer(ctx, testsuite.DevServerOptions{LogLevel: "error", ExtraArgs: []string{"--search-attribute", "CardID=Keyword"}})
 	if err != nil {
 		t.Fatal(err)
 	}
