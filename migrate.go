@@ -60,6 +60,9 @@ var migrations = [][]string{
 	{ // 5: freezing and closing cards
 		`ALTER TABLE cards ADD COLUMN status VARCHAR(16) NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'frozen', 'closed'))`,
 	},
+	{ // 6: one lock row per card, serializing its velocity attempts
+		`CREATE TABLE IF NOT EXISTS attempt_locks (card VARCHAR(191) PRIMARY KEY)`,
+	},
 }
 
 // mysqlDupColumn is ADD COLUMN on a column that exists: MySQL has no
