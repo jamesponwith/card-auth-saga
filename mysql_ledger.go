@@ -127,7 +127,7 @@ func (l *MySQLLedger) Accounts(ctx context.Context, prefix string) (map[string]i
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }() // Err below reports what matters
 	out := map[string]int64{}
 	for rows.Next() {
 		var id string
