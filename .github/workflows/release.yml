@@ -14,13 +14,13 @@ jobs:
   release:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0 # goreleaser derives the changelog from git history
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
-      - uses: goreleaser/goreleaser-action@v6
+      - uses: goreleaser/goreleaser-action@v7
         with:
           version: "~> v2"
           args: release --clean
@@ -34,10 +34,17 @@ jobs:
       group: deploy # one deploy at a time; a newer tag waits, never cancels mid-deploy
       cancel-in-progress: false
     steps:
-      - uses: actions/checkout@v4
-      - uses: superfly/flyctl-actions/setup-flyctl@1.5
-        with:
-          version: 0.4.118 # the version deploy/fly/deploy.sh was written against
+      - uses: actions/checkout@v7
+      # flyctl pinned to the version deploy/fly/deploy.sh was written against,
+      # checked against its release checksum (setup-flyctl still runs on Node 20).
+      - run: |
+          curl -fsSL -o /tmp/flyctl.tgz "https://github.com/superfly/flyctl/releases/download/v${FLYCTL_VERSION}/flyctl_${FLYCTL_VERSION}_Linux_x86_64.tar.gz"
+          echo "${FLYCTL_SHA256}  /tmp/flyctl.tgz" | sha256sum -c -
+          sudo tar -xzf /tmp/flyctl.tgz -C /usr/local/bin flyctl
+          flyctl version
+        env:
+          FLYCTL_VERSION: 0.4.118
+          FLYCTL_SHA256: 0f2fabbb29904a7bac8bd96009314d26751084c33e098fcc393e2dac6c472f60
       # MySQL, Temporal, then the worker at this version; fails unless the
       # public /healthz reports ok at it.
       - run: deploy/fly/deploy.sh
