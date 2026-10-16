@@ -79,7 +79,11 @@ on() { # app, command
   return 1
 }
 sql() { # app, query: one value, no headers
-  on "$1" "env MYSQL_PWD=$CAS_MYSQL_PASSWORD mysql -uroot -N -B cas -e \"$2\"" | tail -1 | tr -d '[:space:]'
+  # The query rides base64-encoded, so its quotes survive flyctl ssh's own
+  # command parsing and the remote shell.
+  local q
+  q=$(printf %s "$2" | base64 | tr -d '\n')
+  on "$1" "env MYSQL_PWD=$CAS_MYSQL_PASSWORD sh -c \"echo $q | base64 -d | mysql -uroot -N -B cas\"" | tail -1 | tr -d '[:space:]'
 }
 
 restore "$mysql" mysql_data 3 mysql.toml "$drill-mysql"
@@ -89,7 +93,7 @@ failed=0
 check() { # name, got, want
   if [ "$2" = "$3" ]; then echo "ok   $1: $2"; else echo "FAIL $1: got '$2', want '$3'" >&2; failed=1; fi
 }
-cards_off='SELECT COUNT(*) FROM (SELECT SUBSTRING_INDEX(SUBSTRING_INDEX(id, ':', 2), ':', -1) AS card, SUM(balance) AS s FROM accounts WHERE id LIKE 'card:%' AND (id LIKE '%:holds' OR id LIKE '%:posted' OR id LIKE '%:open-to-buy') GROUP BY card HAVING s <> 0) x'
+cards_off="SELECT COUNT(*) FROM (SELECT SUBSTRING_INDEX(SUBSTRING_INDEX(id, ':', 2), ':', -1) AS card, SUM(balance) AS s FROM accounts WHERE id LIKE 'card:%' AND (id LIKE '%:holds' OR id LIKE '%:posted' OR id LIKE '%:open-to-buy') GROUP BY card HAVING s <> 0) x"
 check "ledger sums to zero" "$(sql "$drill-mysql" 'SELECT COALESCE(SUM(balance), 0) FROM accounts')" 0
 check "every card's money nets to zero" "$(sql "$drill-mysql" "$cards_off")" 0
 check "schema version matches production" "$(sql "$drill-mysql" 'SELECT MAX(version) FROM schema_migrations')" "$(sql "$mysql" 'SELECT MAX(version) FROM schema_migrations')"

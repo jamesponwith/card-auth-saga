@@ -190,6 +190,10 @@ case "$1 $2" in
   "image show") echo "[{\"Registry\":\"registry.fly.io\",\"Repository\":\"$4\",\"Digest\":\"sha256:abc\"}]" ;;
   "ssh console")
     cmd=${*: -1}
+    if [[ "$cmd" == *"base64 -d"* ]]; then # a query sent base64-encoded, as sql() does
+      q=${cmd#*echo }; cmd=$(echo "${q%% *}" | base64 -d)
+      [[ "$cmd" == *"'card:%'"* || "$cmd" != *card* ]] || { echo "quotes lost in: $cmd" >&2; exit 1; }
+    fi
     case "$cmd" in
       *"COALESCE(SUM(balance)"*) echo "${LEDGER_SUM:-0}" ;;
       *"HAVING s <> 0"*) echo 0 ;;
