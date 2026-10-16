@@ -12,21 +12,31 @@ designed carefully? The answer turned out to be "the orchestration, but not the 
 
 ## Shape
 
-- **One workflow per authorization** (`AuthorizeWorkflow`). An `authorize` update, sent with
-  Update-with-Start, returns approve/decline as soon as the hold is placed. The hold then takes
-  increments and partial captures until a final capture, a reversal, or a 7-day timer closes it.
-  After a capture it takes refunds for 30 days. Each of these is a validated update, or a signal
-  for fire-and-forget callers. The timers are durable: a worker can die mid-wait and the workflow
-  continues on another one.
-- **One workflow per card for statements** (`StatementWorkflow`). Each run is one cycle: late fee at
-  the due date, interest and a new statement at close. Then it continues as new, so history never
-  grows past a cycle.
-- **A double-entry ledger** (MySQL, `database/sql`). Every posting sums to zero, and every posting is
-  keyed `<workflow ID>:<step>` with a unique index, so a retried activity hits the duplicate key and
-  becomes a no-op.
-- **Compensations, not mutations.** Reversal, a capture that fails, and refunds each post new
-  balancing entries. History is never edited.
-- **Rewards in points**, funded by the brand partner's account, so points balance the same way money does.
+- **One workflow per authorization** (`AuthorizeWorkflow`), which lives as long as the transaction:
+  - An `authorize` update, sent with Update-with-Start, returns approve or decline as soon as the
+    hold is placed, with a reason: over the limit, velocity, frozen, closed, or unknown card.
+  - The hold takes increments and partial captures until a final capture, a reversal, or a 7-day
+    timer closes it.
+  - After capture it takes refunds and disputes. A dispute credits the card provisionally, waits on
+    the merchant and then an analyst, and ends in a chargeback or a rebill.
+  - Each of these is a validated update, or a signal for callers that don't wait for an answer.
+- **One workflow per card for statements** (`StatementWorkflow`), started when the card is created.
+  Each run is one cycle: daily balance samples, a late fee on the due day, and interest on the average
+  daily balance at close. Then it continues as new, so history never grows past a cycle. A closed
+  card's cycle ends once nothing is owed.
+- **A nightly auditor** (`AuditWorkflow` on a Temporal Schedule) checks the ledger's invariants and
+  looks for stuck or failed workflows. The worker's `/healthz` reports any findings, so the Operate
+  stage's prober turns them into incidents.
+- **A double-entry ledger** (MySQL, `database/sql`, versioned migrations). Every posting sums to zero,
+  and every posting is keyed `<workflow ID>:<step>` with a unique index, so a retried activity hits the
+  duplicate key and becomes a no-op. Card limits, APRs, partner rates and card status live in tables
+  next to it.
+- **Compensations, not mutations.** Reversals, failed captures, refunds, provisional credits and rebills
+  each post new balancing entries. History is never edited.
+- **Rewards in points**, funded by the brand partner's account, so points balance the same way money
+  does. Clawbacks chain so that a full return always lands on exactly zero points.
+- **Four version gates and eleven recorded histories.** Every change to a workflow's commands was gated
+  with `GetVersion`, and replays of histories recorded before each change catch any that weren't.
 
 ## What Temporal did not solve
 

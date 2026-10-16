@@ -1,12 +1,18 @@
 # card-auth-saga
 
-A Temporal-orchestrated card authorization → capture/reversal saga in Go, posting
-to a double-entry MySQL ledger with rewards accrual. Built inside the
+A card issuer's backend on Temporal, in Go: authorizations with instant decisions, captures,
+refunds and disputes; monthly statements with interest; rewards; fraud velocity checks; and a
+double-entry MySQL ledger audited nightly. Built inside the
 [agentic flywheel](https://github.com/jamesponwith/agentic-flywheel):
-Intent → Build → Validate → Release → Learn.
+Intent → Build → Validate → Release → Operate → Learn.
 
-![A $400 hold, a $250 capture that survives a crash after its write without double-posting, rewards
-earned and clawed back on a $50 refund, a resent refund ignored, and the ledger balancing to zero](docs/demo.gif)
+![One card's story, printed from the real ledger postings. A $400 hold approved instantly, raised
+$100 by the hotel, and captured in two shipments. The last capture survives a crash after its write
+without posting twice. Rewards accrue, a $50 refund and a $100 chargeback claw them back, a sixth
+rapid auth on another card is declined for velocity, and the audit finds the ledger balanced](docs/demo.gif)
+
+The demo is real: `vhs docs/demo.tape` re-records it from `TestDemo`, which prints each posting as
+the workflow makes it.
 
 Start with [SPEC.md](SPEC.md) for the design and [docs/writeup.md](docs/writeup.md) for what it
 took to keep the money straight. Decisions live in [docs/adr/](docs/adr/).
