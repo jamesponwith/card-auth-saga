@@ -222,6 +222,11 @@ then failed on `flyctl deploy --region`, a flag flyctl doesn't have. The deploy 
 flyctl and accepts any flag, so it couldn't notice. `v0.1.1` fixed the flag and added a test that checks
 every flag the script uses against the real flyctl's `--help`.
 
+A deploy that fails its smoke test now rolls back: the script records the running worker's image
+digest before deploying, and redeploys it if the new version never reports `ok`. Deploying by digest was
+proved on production by redeploying the running image. A schema migration is the one thing it can't
+undo, because the old worker refuses the newer schema, so for that case it says to fix forward.
+
 `v0.1.1` came up healthy. Before switching on the Operate probe, I ran a real transaction against it:
 a card created with the worker's own `set-limit`, an auth approved and captured through a `fly proxy`
 tunnel to the private Temporal, the card's statement cycle running, and the production audit clean.

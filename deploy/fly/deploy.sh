@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Deploy the stack to Fly (ADR 0007): MySQL, then Temporal, then the worker at
-# VERSION, then prove it with a /healthz smoke test. Idempotent: apps, volumes
-# and secrets are created only if missing. Run by release.yml on a v* tag.
+# VERSION, then prove it with a /healthz smoke test. If the worker fails it,
+# redeploy the image that was running and fail anyway. Idempotent: apps,
+# volumes and secrets are created only if missing. Run by release.yml on a tag.
 #
 #   FLY_API_TOKEN, CAS_MYSQL_PASSWORD   from GitHub Actions secrets
 #   VERSION                             the release tag (v0.2.0) or version (0.2.0)
@@ -43,18 +44,45 @@ ensure_app "$worker"
 flyctl secrets set -a "$worker" --stage >/dev/null \
   TEMPORAL_ADDRESS="$temporal.internal:7233" \
   CAS_MYSQL_DSN="root:$CAS_MYSQL_PASSWORD@tcp($mysql.internal:3306)/cas"
-deploy "$worker" worker.toml "$root" --dockerfile "$root/Dockerfile" --build-arg VERSION="$VERSION"
 
-# Prove it: the public /healthz must report ok and this release, which means
-# the worker reached Temporal and MySQL and the audit (if any) was clean.
 url="https://$worker.fly.dev/healthz"
-for _ in $(seq 1 "${SMOKE_TRIES:-30}"); do
-  body=$(curl -fsS --max-time 10 "$url" || true)
-  if echo "$body" | grep -q '"status":"ok"' && echo "$body" | grep -q "\"version\":\"$VERSION\""; then
-    echo "deployed $VERSION: $body"
-    exit 0
-  fi
-  sleep "${SMOKE_WAIT:-10}"
-done
+body=""
+# smoke: does the public /healthz report ok at version $1? It means the worker
+# reached Temporal and MySQL, and the latest audit (if any) was clean.
+smoke() {
+  for _ in $(seq 1 "${SMOKE_TRIES:-30}"); do
+    body=$(curl -fsS --max-time 10 "$url" || true)
+    if echo "$body" | grep -q '"status":"ok"' && echo "$body" | grep -q "\"version\":\"$1\""; then
+      return 0
+    fi
+    sleep "${SMOKE_WAIT:-10}"
+  done
+  return 1
+}
+
+# What the worker runs now, by digest (immutable), to roll back to.
+prev_image=$(flyctl image show -a "$worker" --json 2>/dev/null |
+  jq -r 'first(.[] | select(.Digest)) | "\(.Registry)/\(.Repository)@\(.Digest)"' 2>/dev/null || true)
+prev_version=$(curl -fsS --max-time 10 "$url" 2>/dev/null | grep -o '"version":"[^"]*"' | cut -d'"' -f4 || true)
+
+deploy "$worker" worker.toml "$root" --dockerfile "$root/Dockerfile" --build-arg VERSION="$VERSION"
+if smoke "$VERSION"; then
+  echo "deployed $VERSION: $body"
+  exit 0
+fi
 echo "FAIL: $url never reported ok at $VERSION; last: ${body:-no response}" >&2
+if [ -z "$prev_image" ] || [ -z "$prev_version" ]; then
+  echo "no earlier release to roll back to" >&2
+  exit 1
+fi
+echo "rolling back to $prev_version ($prev_image)" >&2
+deploy "$worker" worker.toml --image "$prev_image"
+if smoke "$prev_version"; then
+  echo "rolled back to $prev_version; $VERSION is not deployed" >&2
+else
+  # Migrations only move forward, and a worker refuses a schema newer than it
+  # knows (ADR 0005): if $VERSION migrated, the old image can't run. Fix forward.
+  echo "ROLLBACK FAILED: $prev_version isn't healthy either (last: ${body:-no response})." >&2
+  echo "If $VERSION ran a migration, $prev_version refuses the newer schema: fix forward with a new release." >&2
+fi
 exit 1

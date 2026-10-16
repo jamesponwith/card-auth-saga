@@ -9,13 +9,15 @@ import (
 	"testing"
 )
 
-// deploy/fly/deploy.sh against a stand-in flyctl (which remembers apps and
-// volumes) and curl (which returns a canned /healthz): it creates what's
-// missing and nothing else, deploys in dependency order, and succeeds only
-// once the public /healthz reports ok at this version.
+// deploy/fly/deploy.sh against a stand-in flyctl and curl that model a worker
+// serving a version: flyctl remembers apps and volumes, a deploy changes the
+// running version (built at VERSION, or an earlier image by digest), and curl
+// serves /healthz for whatever runs, degraded if that version is in $STUB/bad.
 func TestDeployScript(t *testing.T) {
-	if _, err := osexec.LookPath("bash"); err != nil {
-		t.Skip("needs bash")
+	for _, tool := range []string{"bash", "jq"} {
+		if _, err := osexec.LookPath(tool); err != nil {
+			t.Skip("needs " + tool)
+		}
 	}
 	stub := t.TempDir()
 	bin := filepath.Join(stub, "bin")
@@ -27,10 +29,25 @@ case "$1 $2" in
   "apps create") touch "$STUB/app-$3" ;;
   "volumes list") for f in "$STUB"/vol-"$4"-*; do [ -e "$f" ] && echo "{\"name\": \"${f##*-$4-}\"}"; done ;;
   "volumes create") touch "$STUB/vol-$5-$3" ;;
+  "image show")
+    [ -s "$STUB/current" ] && echo "[{\"Registry\":\"registry.fly.io\",\"Repository\":\"$4\",\"Digest\":\"sha256:$(cat "$STUB/current")\"}]" || echo "[]" ;;
+  "deploy "*)
+    for a in "$@"; do
+      case "$a" in
+        VERSION=*) echo "${a#VERSION=}" > "$STUB/current" ;;
+        *@sha256:*) echo "${a##*@sha256:}" > "$STUB/current" ;;
+      esac
+    done ;;
 esac
 exit 0
 `,
-		"curl": "#!/usr/bin/env bash\necho \"$HEALTH\"\n",
+		"curl": `#!/usr/bin/env bash
+[ -s "$STUB/current" ] || exit 22 # nothing serving yet
+v=$(cat "$STUB/current")
+status=ok
+grep -qx "$v" "$STUB/bad" 2>/dev/null && status="degraded: mysql: refused"
+echo "{\"status\":\"$status\",\"uptime_s\":3,\"version\":\"$v\"}"
+`,
 	} {
 		if err := os.MkdirAll(bin, 0o755); err != nil {
 			t.Fatal(err)
@@ -39,33 +56,42 @@ exit 0
 			t.Fatal(err)
 		}
 	}
-	run := func(health string, env ...string) (calls string, err error) {
+	// deploy runs deploy.sh at version, with these versions unhealthy, and
+	// returns the flyctl calls, the output, and the version left running.
+	deploy := func(version string, bad []string, env ...string) (calls, out, running string, err error) {
 		_ = os.Remove(filepath.Join(stub, "calls"))
+		if err := os.WriteFile(filepath.Join(stub, "bad"), []byte(strings.Join(bad, "\n")+"\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
 		cmd := osexec.Command("bash", "deploy/fly/deploy.sh")
 		cmd.Env = append([]string{
-			"PATH=" + bin + ":" + os.Getenv("PATH"), "STUB=" + stub, "HEALTH=" + health,
-			"SMOKE_TRIES=2", "SMOKE_WAIT=0",
+			"PATH=" + bin + ":" + os.Getenv("PATH"), "STUB=" + stub,
+			"SMOKE_TRIES=2", "SMOKE_WAIT=0", "VERSION=" + version,
 		}, env...)
-		out, err := cmd.CombinedOutput()
+		o, err := cmd.CombinedOutput()
 		c, _ := os.ReadFile(filepath.Join(stub, "calls"))
-		if err != nil {
-			t.Logf("deploy.sh: %s", out)
-		}
-		return string(c), err
+		r, _ := os.ReadFile(filepath.Join(stub, "current"))
+		return string(c), string(o), strings.TrimSpace(string(r)), err
 	}
-	secrets := []string{"FLY_API_TOKEN=x", "CAS_MYSQL_PASSWORD=p@ss w0rd", "VERSION=v0.2.0"}
-	healthy := `{"status":"ok","uptime_s":3,"version":"0.2.0"}`
+	secrets := []string{"FLY_API_TOKEN=x", "CAS_MYSQL_PASSWORD=p@ss w0rd"}
 
-	calls, err := run(healthy, secrets...)
-	if err != nil {
-		t.Fatalf("first deploy: %v", err)
+	// A bad first deploy has nothing to roll back to.
+	_, out, _, err := deploy("v0.1.0", []string{"0.1.0"}, secrets...)
+	if err == nil || !strings.Contains(out, "no earlier release to roll back to") {
+		t.Errorf("bad first deploy: err %v, want a failure with nothing to roll back to:\n%s", err, out)
 	}
-	if n := strings.Count(calls, "apps create") + strings.Count(calls, "volumes create"); n != 5 {
-		t.Errorf("first deploy created %d apps and volumes, want 5 (3 apps, 2 volumes):\n%s", n, calls)
+	_ = os.Remove(filepath.Join(stub, "current"))
+
+	// First deploy: creates the stack, in dependency order, built at the tag.
+	calls, out, running, err := deploy("v0.2.0", nil, secrets...)
+	if err != nil || running != "0.2.0" {
+		t.Fatalf("first deploy: err %v, running %q:\n%s", err, running, out)
 	}
-	order := []string{"-a cas-jamesponwith-mysql -c", "-a cas-jamesponwith-temporal -c", "-a cas-jamesponwith-worker -c"}
+	if n := strings.Count(calls, "apps create") + strings.Count(calls, "volumes create"); n != 0 {
+		t.Errorf("first deploy created %d more apps or volumes, want 0 (the bad first deploy made them):\n%s", n, calls)
+	}
 	last := -1
-	for _, app := range order {
+	for _, app := range []string{"-a cas-jamesponwith-mysql -c", "-a cas-jamesponwith-temporal -c", "-a cas-jamesponwith-worker -c"} {
 		i := strings.Index(calls, app)
 		if i < last {
 			t.Errorf("deploy order wrong: want MySQL, then Temporal, then the worker:\n%s", calls)
@@ -76,21 +102,26 @@ exit 0
 		t.Errorf("worker not built at version 0.2.0 (tag v0.2.0):\n%s", calls)
 	}
 
-	calls, err = run(healthy, secrets...)
-	if err != nil || strings.Count(calls, "create") != 0 || strings.Count(calls, " deploy ") != 3 {
-		t.Errorf("second deploy: err %v, %d creates, %d deploys; want none created, 3 deployed", err, strings.Count(calls, "create"), strings.Count(calls, " deploy "))
+	// A healthy upgrade: no rollback.
+	calls, out, running, err = deploy("v0.3.0", nil, secrets...)
+	if err != nil || running != "0.3.0" || strings.Contains(calls, "--image") {
+		t.Errorf("good upgrade: err %v, running %q, rolled back %v:\n%s", err, running, strings.Contains(calls, "--image"), out)
 	}
 
-	for name, health := range map[string]string{
-		"degraded":    `{"status":"degraded: mysql: refused","uptime_s":3,"version":"0.2.0"}`,
-		"old version": `{"status":"ok","uptime_s":3,"version":"0.1.0"}`,
-		"no response": "",
-	} {
-		if _, err := run(health, secrets...); err == nil {
-			t.Errorf("%s /healthz: deploy succeeded, want the smoke test to fail it", name)
-		}
+	// A broken release rolls back to the digest that was running, and still fails.
+	calls, out, running, err = deploy("v0.4.0", []string{"0.4.0"}, secrets...)
+	if err == nil || running != "0.3.0" || !strings.Contains(calls, "--image registry.fly.io/cas-jamesponwith-worker@sha256:0.3.0") ||
+		!strings.Contains(out, "rolled back to 0.3.0") {
+		t.Errorf("bad upgrade: err %v, running %q, want a failed job with 0.3.0 back by digest:\n%s\ncalls:\n%s", err, running, out, calls)
 	}
-	if _, err := run(healthy, "FLY_API_TOKEN=x", "VERSION=v1"); err == nil {
+
+	// If the old version can't come back either (a migration it refuses), say so.
+	_, out, _, err = deploy("v0.5.0", []string{"0.5.0", "0.3.0"}, secrets...)
+	if err == nil || !strings.Contains(out, "ROLLBACK FAILED") || !strings.Contains(out, "fix forward") {
+		t.Errorf("failed rollback: err %v, want ROLLBACK FAILED and fix-forward advice:\n%s", err, out)
+	}
+
+	if _, _, _, err := deploy("v1", nil, "FLY_API_TOKEN=x"); err == nil {
 		t.Error("deployed without CAS_MYSQL_PASSWORD")
 	}
 }
@@ -107,7 +138,7 @@ func TestDeployScriptFlyctlFlags(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	cmd := regexp.MustCompile(`flyctl ((?:apps|volumes|secrets) \w+|deploy|status)\b([^|;&\n]*)`)
+	cmd := regexp.MustCompile(`flyctl ((?:apps|volumes|secrets|image) \w+|deploy|status)\b([^|;&\n]*)`)
 	flag := regexp.MustCompile(`--[a-z][a-z-]*`)
 	// deploy.sh's own deploy helper passes its extra arguments to flyctl deploy.
 	helper := regexp.MustCompile(`(?m)^deploy "\$\w+" \S+()(.*)$`)
