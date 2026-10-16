@@ -57,10 +57,13 @@ var migrations = [][]string{
 	{ // 4: each card's APR, read at every statement close
 		`ALTER TABLE cards ADD COLUMN apr_bps BIGINT NOT NULL DEFAULT 2499 CHECK (apr_bps >= 0)`,
 	},
+	{ // 5: freezing and closing cards
+		`ALTER TABLE cards ADD COLUMN status VARCHAR(16) NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'frozen', 'closed'))`,
+	},
 }
 
 // mysqlDupColumn is ADD COLUMN on a column that exists: MySQL has no
-// ADD COLUMN IF NOT EXISTS, so a re-run of migration 4 lands here.
+// ADD COLUMN IF NOT EXISTS, so a re-run of an ADD COLUMN lands here.
 const mysqlDupColumn = 1060
 
 const migrateLock = "card-auth-saga:migrate"

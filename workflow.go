@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"time"
 
 	"go.temporal.io/sdk/activity"
@@ -45,6 +46,8 @@ const (
 	DeclineOverLimit   = "OverLimit"
 	DeclineVelocity    = "Velocity"
 	DeclineUnknownCard = "UnknownCard"
+	DeclineFrozen      = "Frozen"
+	DeclineClosed      = "Closed"
 )
 
 // Decision is the authorize update's answer.
@@ -127,7 +130,7 @@ func AuthorizeWorkflow(ctx workflow.Context, req AuthRequest) (AuthResult, error
 	var held bool
 	s.holdErr = workflow.ExecuteActivity(ctx, s.a.PlaceHold, req).Get(ctx, &held)
 	var declined *temporal.ApplicationError
-	if errors.As(s.holdErr, &declined) && (declined.Type() == DeclineVelocity || declined.Type() == DeclineUnknownCard) {
+	if errors.As(s.holdErr, &declined) && slices.Contains([]string{DeclineVelocity, DeclineUnknownCard, DeclineFrozen, DeclineClosed}, declined.Type()) {
 		s.holdErr, s.reason = nil, declined.Type()
 	} else if s.holdErr == nil && !held {
 		s.reason = DeclineOverLimit
@@ -450,6 +453,14 @@ func (a *Activities) PlaceHold(ctx context.Context, req AuthRequest) (bool, erro
 	if !known {
 		return false, temporal.NewNonRetryableApplicationError("unknown card", DeclineUnknownCard, nil)
 	}
+	switch status, _, err := a.Config.CardStatus(ctx, req.CardID); {
+	case err != nil:
+		return false, err
+	case status == CardFrozen:
+		return false, temporal.NewNonRetryableApplicationError("card frozen", DeclineFrozen, nil)
+	case status == CardClosed:
+		return false, temporal.NewNonRetryableApplicationError("card closed", DeclineClosed, nil)
+	}
 	// Velocity first: card testing makes many small auths, each under the limit.
 	n, err := a.Ledger.RecordAttempt(ctx, req.CardID, activity.GetInfo(ctx).WorkflowExecution.ID, time.Now(), VelocityWindow)
 	if err != nil {
@@ -466,6 +477,10 @@ func (a *Activities) PlaceHold(ctx context.Context, req AuthRequest) (bool, erro
 func (a *Activities) IncreaseHold(ctx context.Context, req AuthRequest, i Increment) (bool, error) {
 	limit, _, err := a.Config.CreditLimit(ctx, req.CardID) // a card removed since has limit 0: declined
 	if err != nil {
+		return false, err
+	}
+	status, _, err := a.Config.CardStatus(ctx, req.CardID)
+	if err != nil || status != CardActive { // frozen or closed since the auth: no new credit
 		return false, err
 	}
 	return a.hold(ctx, "hold:"+i.ID, req.CardID, i.Amount, limit)

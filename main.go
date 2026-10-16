@@ -8,6 +8,7 @@
 //	card-auth-saga set-limit <card> <cents>       create or update a card, and start its statements (MySQL)
 //	card-auth-saga set-apr <card> <basis-points>  set a card's APR, from its next statement (MySQL)
 //	card-auth-saga set-rate <merchant> <points>   set a partner's points per $1 (MySQL)
+//	card-auth-saga freeze|unfreeze|close <card>   decline new auths; closing is final (MySQL)
 //	card-auth-saga audit                          run the ledger audit now; exits non-zero on findings
 package main
 
@@ -21,6 +22,7 @@ import (
 	"net/http"
 	"os"
 	ossignal "os/signal" // "signal" is a test helper type in this package
+	"slices"
 	"strconv"
 	"strings"
 	"syscall"
@@ -104,7 +106,7 @@ func run(ctx context.Context, args []string, env func(string) string) error {
 	return w.Run(stopped) // until ctx is cancelled: SIGINT or SIGTERM in main
 }
 
-var errUsage = errors.New("usage: card-auth-saga [set-limit <card> <cents> | set-apr <card> <basis-points> | set-rate <merchant> <points-per-dollar> | audit]")
+var errUsage = errors.New("usage: card-auth-saga [set-limit <card> <cents> | set-apr <card> <basis-points> | set-rate <merchant> <points-per-dollar> | freeze|unfreeze|close <card> | audit]")
 
 // adminCmd applies a parsed admin command. Temporal options reach set-limit,
 // which also starts the card's statements.
@@ -113,7 +115,14 @@ type adminCmd func(context.Context, *MySQLLedger, client.Options) error
 // admin parses an admin command. Bad values such as a negative limit are left
 // to the tables' CHECK constraints.
 func admin(args []string) (adminCmd, error) {
-	if len(args) != 3 || args[1] == "" {
+	statuses := map[string]string{"freeze": CardFrozen, "unfreeze": CardActive, "close": CardClosed}
+	if status, ok := statuses[args[0]]; ok && len(args) == 2 && args[1] != "" {
+		id := args[1]
+		return func(ctx context.Context, l *MySQLLedger, _ client.Options) error {
+			return l.SetCardStatus(ctx, id, status)
+		}, nil
+	}
+	if len(args) != 3 || args[1] == "" || !slices.Contains([]string{"set-limit", "set-apr", "set-rate"}, args[0]) {
 		return nil, errUsage
 	}
 	id := args[1]

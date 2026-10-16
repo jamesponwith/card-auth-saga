@@ -192,6 +192,51 @@ func TestStatementCreditDaysCountAsZero(t *testing.T) {
 	}
 }
 
+// A closed card's statements stop once nothing is posted or held; until then,
+// and for every other card, the cycle continues as new.
+func TestStatementEndsForClosedCard(t *testing.T) {
+	tests := []struct {
+		name         string
+		status       string
+		posted, held int64
+		wantEnd      bool
+	}{
+		{"closed and paid off: ends", CardClosed, 0, 0, true},
+		{"closed with a balance: keeps billing", CardClosed, 5_000, 0, false},
+		{"closed with a hold still open: keeps going", CardClosed, 0, 2_000, false},
+		{"closed with a credit: keeps going", CardClosed, -1_000, 0, false},
+		{"frozen and paid off: keeps going", CardFrozen, 0, 0, false},
+		{"active and paid off: keeps going", CardActive, 0, 0, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var s testsuite.WorkflowTestSuite
+			env := s.NewTestWorkflowEnvironment()
+			l := NewMemLedger()
+			if err := l.Post(t.Context(), "seed",
+				Entry{postedAccount("card-1"), tt.posted}, Entry{holdsAccount("card-1"), tt.held},
+				Entry{openToBuyAccount("card-1"), -tt.posted - tt.held}); err != nil {
+				t.Fatal(err)
+			}
+			env.RegisterActivity(&Activities{Ledger: l, Config: StaticConfig{Statuses: map[string]string{"card-1": tt.status}}})
+
+			env.ExecuteWorkflow(StatementWorkflow, StatementTerms{CardID: "card-1"}, Statement{})
+
+			if !env.IsWorkflowCompleted() {
+				t.Fatal("workflow did not finish its cycle")
+			}
+			var can *workflow.ContinueAsNewError
+			ended := env.GetWorkflowError() == nil
+			if !ended && !errors.As(env.GetWorkflowError(), &can) {
+				t.Fatalf("workflow error: %v", env.GetWorkflowError())
+			}
+			if ended != tt.wantEnd {
+				t.Errorf("ended = %v, want %v", ended, tt.wantEnd)
+			}
+		})
+	}
+}
+
 // flakyBalances fails its first balance reads, as if the ledger were down.
 type flakyBalances struct {
 	Ledger
