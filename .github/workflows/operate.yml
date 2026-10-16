@@ -1,0 +1,32 @@
+# Operate: probe the deployed worker's /healthz and turn sustained SLO breaches
+# into `incident`-labelled issues, which learn.yml reads for change-failure rate
+# and MTTR. Incidents close themselves when the target recovers.
+#
+# Manual-only until docs/slo.yml's url names a real deployment (ADR 0006):
+# probing an address nothing serves files incidents that never close, which
+# corrupts the DORA numbers. Then restore a schedule, e.g. cron "*/10 * * * *".
+name: operate
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+concurrency:
+  group: operate # never two probers racing to file the same incident
+  cancel-in-progress: false
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      # The template's canonical prober, by module path: this repo carries no copy.
+      - run: go run github.com/jamesponwith/flywheel-template/tools/watch@latest -repo "$GITHUB_REPOSITORY" -slo docs/slo.yml
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

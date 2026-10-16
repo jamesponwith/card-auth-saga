@@ -15,8 +15,7 @@ address that isn't deployed files incidents that never close, and those inflate 
 The worker serves the template's contract (`healthz.go`, byte-identical) on `CAS_HTTP_ADDR`. Health is
 "ok" only if Temporal and MySQL both answer; otherwise it reports `degraded: <dependency>`. The Temporal
 SDK's metrics go to `/debug/vars` through a stdlib `expvar` handler, so there's no metrics dependency.
-The template's `operate.yml` prober comes over manual-only (bead cas-0a1) until `docs/slo.yml` names a
-real deployment.
+`operate.yml` comes over manual-only until `docs/slo.yml` names a real deployment.
 
 ## Consequences
 
