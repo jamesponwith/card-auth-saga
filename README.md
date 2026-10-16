@@ -126,6 +126,8 @@ Pushing a `v*` tag releases and deploys (ADR 0007). `release.yml` runs gorelease
 - **The worker**, whose `/healthz` is public.
 
 The deploy fails unless `https://<prefix>-worker.fly.dev/healthz` reports `ok` at the tag's version.
+If it doesn't, the script redeploys the image that was running (by digest) and still fails, reporting
+"rolled back to <version>" (ADR 0007).
 
 One-time setup: a Fly.io account with a payment method, then two repo secrets:
 

@@ -22,4 +22,6 @@ volume; and the worker, which serves `/healthz` publicly and `/debug/vars` only 
 One machine each, about the cost of a coffee a month, and the deploy is a script anyone can read. A
 SQLite-backed server has no replication: losing the Temporal volume loses workflow history, though not
 the ledger. Move to the multi-service Temporal on MySQL when uptime or throughput needs it; the worker
-only needs `TEMPORAL_ADDRESS` to change.
+only needs `TEMPORAL_ADDRESS` to change. A worker that fails the smoke test is rolled back to the image digest that was
+running, and the job still fails. A release that migrated the schema can't be rolled back that way,
+because the old worker refuses a newer schema (ADR 0005). The script says so; fix forward.
