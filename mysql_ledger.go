@@ -115,14 +115,36 @@ func (l *MySQLLedger) PostWithin(ctx context.Context, key string, capped []strin
 }
 
 func (l *MySQLLedger) RecordAttempt(ctx context.Context, card, id string, at time.Time, window time.Duration) (int, error) {
-	if _, err := l.db.ExecContext(ctx, `INSERT IGNORE INTO attempts (card, auth_id, at_us) VALUES (?, ?, ?)`, card, id, at.UnixMicro()); err != nil {
+	// The lock row is created outside the transaction, for the same reason
+	// PostWithin creates accounts first: INSERT IGNORE on an existing row
+	// takes a shared lock that FOR UPDATE would then deadlock upgrading.
+	if _, err := l.db.ExecContext(ctx, `INSERT IGNORE INTO attempt_locks (card) VALUES (?)`, card); err != nil {
+		return 0, err
+	}
+	tx, err := l.db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, err
+	}
+	defer func() { _ = tx.Rollback() }() // no-op after Commit
+	if _, err := tx.ExecContext(ctx, `SELECT card FROM attempt_locks WHERE card = ? FOR UPDATE`, card); err != nil {
+		return 0, err
+	}
+	// A new attempt lands just after the card's last one, at the earliest; a
+	// retry hits IGNORE and keeps its first time.
+	if _, err := tx.ExecContext(ctx, `INSERT IGNORE INTO attempts (card, auth_id, at_us)
+		SELECT ?, ?, GREATEST(?, COALESCE(MAX(at_us), 0) + 1) FROM attempts WHERE card = ?`, card, id, at.UnixMicro(), card); err != nil {
+		return 0, err
+	}
+	var atUs int64
+	if err := tx.QueryRowContext(ctx, `SELECT at_us FROM attempts WHERE card = ? AND auth_id = ?`, card, id).Scan(&atUs); err != nil {
 		return 0, err
 	}
 	var n int
-	err := l.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM attempts a JOIN attempts me ON a.card = me.card
-		WHERE me.card = ? AND me.auth_id = ? AND a.at_us <= me.at_us AND a.at_us > me.at_us - ?`,
-		card, id, window.Microseconds()).Scan(&n)
-	return n, err
+	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM attempts WHERE card = ? AND at_us <= ? AND at_us > ?`,
+		card, atUs, atUs-window.Microseconds()).Scan(&n); err != nil {
+		return 0, err
+	}
+	return n, tx.Commit()
 }
 
 func (l *MySQLLedger) Accounts(ctx context.Context) (map[string]int64, error) {

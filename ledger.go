@@ -31,9 +31,11 @@ type Ledger interface {
 	// Accounts is every account with its balance, for the audit.
 	// ponytail: loads them all at once; page by ID when the ledger outgrows memory.
 	Accounts(ctx context.Context) (map[string]int64, error)
-	// RecordAttempt notes auth attempt id on card at `at`, once per id, and
-	// counts the card's attempts in the window ending at this attempt's first
-	// recorded time, this one included. A retry gets the same count.
+	// RecordAttempt notes auth attempt id on card, once per id, and counts the
+	// card's attempts in the window ending at this attempt, this one included.
+	// A card's attempts are recorded one at a time, each at the later of `at`
+	// and just after the card's previous attempt, so arrival order is time
+	// order and a burst is counted exactly. A retry gets the same count.
 	RecordAttempt(ctx context.Context, card, id string, at time.Time, window time.Duration) (int, error)
 }
 
@@ -92,6 +94,11 @@ func (l *MemLedger) RecordAttempt(_ context.Context, card, id string, at time.Ti
 	if first, ok := l.attempts[card][id]; ok {
 		at = first
 	} else {
+		for _, t := range l.attempts[card] {
+			if !t.Before(at) {
+				at = t.Add(time.Microsecond)
+			}
+		}
 		l.attempts[card][id] = at
 	}
 	n := 0

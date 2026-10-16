@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -186,7 +187,10 @@ func TestRecordAttempt(t *testing.T) {
 			{"b", 10 * time.Second, 2},
 			{"a", 20 * time.Second, 1}, // retry of a
 			{"c", 30 * time.Second, 3},
-			{"d", 70 * time.Second, 2}, // a and b have aged out
+			// e's clock read 5s but it arrived after c: it counts every attempt
+			// before it (and takes a time just after c's), not just those before 5s.
+			{"e", 5 * time.Second, 4},
+			{"d", 70 * time.Second, 3}, // a and b have aged out; c and e haven't
 			{"b", 90 * time.Second, 2}, // retry of b
 		}
 		for _, tt := range tests {
@@ -216,6 +220,33 @@ func TestLedgerAccounts(t *testing.T) {
 		}
 		if all[n("a")] != 300 || all[n("b")] != -300 {
 			t.Errorf("Accounts = %v, want a = 300 and b = -300", all)
+		}
+	})
+}
+
+// Attempts racing on one card are counted in a strict order: twenty at the
+// same instant get exactly the counts 1 through 20, never a repeat that would
+// let a burst slip past the cap.
+func TestRecordAttemptConcurrent(t *testing.T) {
+	forEachLedger(t, func(t *testing.T, l Ledger, n func(string) string) {
+		at := time.Unix(2_000_000, 0)
+		counts := make([]int, 20)
+		var wg sync.WaitGroup
+		for i := range counts {
+			wg.Go(func() {
+				c, err := l.RecordAttempt(context.Background(), n("burst-card"), fmt.Sprint("auth-", i), at, time.Minute)
+				if err != nil {
+					t.Error(err)
+				}
+				counts[i] = c
+			})
+		}
+		wg.Wait()
+		slices.Sort(counts)
+		for i, c := range counts {
+			if c != i+1 {
+				t.Fatalf("sorted counts = %v, want 1 through 20", counts)
+			}
 		}
 	})
 }

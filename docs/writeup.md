@@ -157,6 +157,7 @@ Each safeguard was removed on purpose to confirm a test notices:
 | Every auth tags itself with its card | *auth tags CardID*; audit drill: an orphan reported for a card whose auth is running |
 | Orphaned holds are found, but not while untagged auths run | audit drill: a stray hold missed, or reported despite an untagged auth |
 | A closed card's statements wait for its last running auth | audit drill: statements end with an auth still open |
+| A card's velocity attempts are serialized, with strictly increasing times | *record attempt concurrent* on MySQL: repeated counts; *record attempt*: a late attempt undercounted |
 | An increment claims the hold | *capture during increment rejected*: otherwise a final capture strands the increment |
 
 Two experiments removed code instead. Cancelling the hold timer after capture survived mutation,
@@ -196,8 +197,9 @@ Apple M5 Pro:
 
 The counts are the point. The velocity check admits exactly 5 of 400 simultaneous attempts on one card,
 the ledger's row locks admit exactly the 3 that each limit covers, and the auditor finds nothing
-afterwards. The burst case does have a theoretical gap: an attempt that reads the clock first but
-records later can be missed by a racing count. It's noted in `PlaceHold` with its fix, a per-card lock.
+afterwards. The velocity count used to be exact only by luck: 20 attempts racing on one card got counts
+like 10, 12, 20, 20. Now each card's attempts are recorded one at a time under a lock row, with strictly
+increasing times, so arrival order is time order and racing attempts get counts of exactly 1 through 20.
 
 Two changes took decisions from ~150–180ms to these numbers:
 

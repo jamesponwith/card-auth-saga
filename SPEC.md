@@ -114,6 +114,9 @@ Declined attempts count too.
 
 - Attempts are keyed by auth ID, and each is counted in the window ending at its *first* recorded
   time. A retried `PlaceHold` therefore gets the same answer, even if more attempts arrived since.
+- A card's attempts are recorded one at a time, under a lock row (`attempt_locks`, migration 6). Each
+  is recorded at the later of its clock and just after the card's previous attempt, so arrival order is
+  time order: racing attempts are counted exactly, and a burst can never slip past the cap.
 - No workflow code changes. The check happens inside an existing activity, so old histories replay
   untouched.
 - Every decline carries a reason, in both the authorize `Decision` and `AuthResult.Reason`:
