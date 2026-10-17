@@ -15,7 +15,9 @@ jobs) is a lot to operate for one worker.
 Three Fly apps on Fly's private network: MySQL 8.4 on a volume; Temporal as the CLI's single-process
 server (the same 1.9.1 the drills and load test run, pinned and checksummed), persisted to SQLite on a
 volume; and the worker, which serves `/healthz` publicly and `/debug/vars` only on the private network. `release.yml` deploys on `v*` tags through
-`deploy/fly/deploy.sh`, then smoke-tests that `/healthz` reports ok and the tag's version.
+`deploy/fly/deploy.sh`, then smoke-tests that `/healthz` reports ok and the tag's version. It deploys
+with Fly deploy tokens for the three apps, joined, which can't create apps or reach any other; only
+the restore drill, which creates scratch apps, holds an org token.
 
 ## Consequences
 

@@ -1,4 +1,5 @@
-# Validate: no green, no merge. lint + unit (runs the ledger contract against a MySQL service too).
+# Validate: no green, no merge. lint + unit (runs the ledger contract against a MySQL service too)
+# + security (secrets in history, reachable known vulnerabilities).
 # AI review runs locally in the pre-push hook (see lefthook.yml + docs/adr/0002), not here.
 name: pr
 
@@ -35,3 +36,25 @@ jobs:
         with:
           go-version-file: go.mod
       - run: go test -race ./...
+
+  security:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0 # gitleaks scans history, not just the tip
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod # its toolchain line: the Go production builds with
+      - name: secrets
+        # Blocking: a committed secret is already leaked; failing loudly is the
+        # only useful response.
+        uses: gitleaks/gitleaks-action@v3
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: vulnerabilities
+        # Blocking here, unlike the template's advisory step: this repo runs a
+        # production ledger, and govulncheck reports only vulnerabilities the
+        # code can reach. Pinned for reproducibility; it fetches the current
+        # vulnerability database every run. security.yml rescans main weekly.
+        run: go run golang.org/x/vuln/cmd/govulncheck@v1.9.0 ./...

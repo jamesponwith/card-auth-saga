@@ -26,7 +26,7 @@ func TestDeployScript(t *testing.T) {
 echo "flyctl $*" >> "$STUB/calls"
 case "$1 $2" in
   "status -a") [ -e "$STUB/app-$3" ] || exit 1 ;;
-  "apps create") touch "$STUB/app-$3" ;;
+  "apps create") [ -n "$DENY_CREATE" ] && { echo "Error: unauthorized" >&2; exit 1; }; touch "$STUB/app-$3" ;;
   "volumes list") # a JSON array, as flyctl prints it
     echo "["; sep=""; for f in "$STUB"/vol-"$4"-*; do [ -e "$f" ] && { n=${f##*-$4-}; echo "$sep{\"name\": \"$n\", \"id\": \"vol_$n\"}"; sep=","; }; done; echo "]" ;;
   "volumes create") touch "$STUB/vol-$5-$3" ;;
@@ -124,6 +124,13 @@ echo "{\"status\":\"$status\",\"uptime_s\":3,\"version\":\"$v\"}"
 
 	if _, _, _, err := deploy("v1", nil, "FLY_API_TOKEN=x"); err == nil {
 		t.Error("deployed without CAS_MYSQL_PASSWORD")
+	}
+
+	// An app-scoped deploy token can't create a missing app: say how to fix it.
+	_ = os.Remove(filepath.Join(stub, "app-cas-jamesponwith-temporal"))
+	_, out, _, err = deploy("v0.6.0", nil, append(secrets, "DENY_CREATE=1")...)
+	if err == nil || !strings.Contains(out, "fly apps create cas-jamesponwith-temporal --org personal") {
+		t.Errorf("missing app with a deploy token: err %v, want instructions to create it:\n%s", err, out)
 	}
 }
 
