@@ -74,7 +74,11 @@ func run(ctx context.Context, args []string, env func(string) string) error {
 		}
 		defer func() { _ = l.Close() }()
 		if cmd != nil {
-			return cmd(ctx, l, temporalOptions)
+			if err := cmd(ctx, l, temporalOptions); err != nil {
+				return err
+			}
+			fmt.Println("ok:", strings.Join(args, " ")) // a silent success reads as nothing happened
+			return nil
 		}
 		acts = &Activities{Ledger: l, Config: l}
 		ping = l.Ping
