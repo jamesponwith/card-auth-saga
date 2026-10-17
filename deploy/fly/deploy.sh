@@ -7,6 +7,8 @@
 #   FLY_API_TOKEN, CAS_MYSQL_PASSWORD   from GitHub Actions secrets
 #   VERSION                             the release tag (v0.2.0) or version (0.2.0)
 #   FLY_APP_PREFIX, FLY_REGION          optional; see the defaults below
+#   FLY_VM_SIZE                         optional; every machine at this size, for a drill
+#                                       comparing sizes (production's are in the .toml files)
 set -euo pipefail
 : "${FLY_API_TOKEN:?}" "${CAS_MYSQL_PASSWORD:?}" "${VERSION:?}"
 VERSION=${VERSION#v} # a tag (v0.2.0) or a version (0.2.0): goreleaser stamps without the v
@@ -29,14 +31,29 @@ ensure_volume() { # app, volume, size in GB
   # Daily snapshots kept two weeks; restore-drill.sh proves they restore.
   local id
   id=$(flyctl volumes list -a "$1" --json | jq -r --arg n "$2" 'first(.[] | select(.name == $n)) | .id')
-  flyctl volumes update "$id" -a "$1" --scheduled-snapshots=true --snapshot-retention 14 >/dev/null
+  # A volume made a moment ago can 404 here until Fly's API catches up.
+  for _ in 1 2 3 4 5; do
+    flyctl volumes update "$id" -a "$1" --scheduled-snapshots=true --snapshot-retention 14 >/dev/null && return
+    sleep 5
+  done
+  return 1
 }
 deploy() { # app, config, extra flags...
-  local app=$1 config=$2
+  local app=$1 name=$2 config=$root/deploy/fly/$2
   shift 2
+  # The config's [[vm]] (always its last section) wins over deploy --vm-size,
+  # so a drill sizing machines swaps it. Resizing after the deploy instead
+  # restarts MySQL mid first-boot and leaves its new datadir unbootable.
+  if [ -n "${FLY_VM_SIZE:-}" ]; then
+    local sized
+    sized=$(mktemp -d)/$name # flyctl reads the format from the extension
+    sed '/^\[\[vm\]\]/,$d' "$config" > "$sized"
+    printf '[[vm]]\n  size = "%s"\n' "$FLY_VM_SIZE" >> "$sized"
+    config=$sized
+  fi
   # One machine per app: MySQL and Temporal are bound to their volume, and two
   # workers would be fine but buy nothing here.
-  flyctl deploy "$@" -a "$app" -c "$root/deploy/fly/$config" --primary-region "$region" --ha=false --yes
+  flyctl deploy "$@" -a "$app" -c "$config" --primary-region "$region" --ha=false --yes
 }
 
 mysql=$prefix-mysql temporal=$prefix-temporal worker=$prefix-worker
@@ -57,9 +74,14 @@ flyctl secrets set -a "$worker" --stage >/dev/null \
 url="https://$worker.fly.dev/healthz"
 # smoke: does the public /healthz report ok at version $1? It means the worker
 # reached Temporal and MySQL, and the latest audit (if any) was clean.
+# Through the app's own public IP: a new app's hostname can be cached as
+# missing for minutes (fly.dev's negative TTL is 300s), which a drill's fresh
+# stack hits every time. Same edge, TLS and /healthz; just no DNS.
 smoke() {
+  local ip
   for _ in $(seq 1 "${SMOKE_TRIES:-30}"); do
-    body=$(curl -fsS --max-time 10 "$url" || true)
+    ip=$(flyctl ips list -a "$worker" --json 2>/dev/null | jq -r 'first(.[] | select(.Type == "shared_v4" or .Type == "v4")) | .Address' 2>/dev/null || true)
+    body=$(curl -fsS --max-time 10 ${ip:+--resolve "$worker.fly.dev:443:$ip"} "$url" || true)
     if echo "$body" | grep -q '"status":"ok"' && echo "$body" | grep -q "\"version\":\"$1\""; then
       return 0
     fi

@@ -1,35 +1,31 @@
 package main
 
 import (
+	"net"
 	"os"
 	osexec "os/exec" // "exec" is a MySQL test helper in this package
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"testing"
 )
 
-// deploy/fly/deploy.sh against a stand-in flyctl and curl that model a worker
-// serving a version: flyctl remembers apps and volumes, a deploy changes the
-// running version (built at VERSION, or an earlier image by digest), and curl
-// serves /healthz for whatever runs, degraded if that version is in $STUB/bad.
-func TestDeployScript(t *testing.T) {
-	for _, tool := range []string{"bash", "jq"} {
-		if _, err := osexec.LookPath(tool); err != nil {
-			t.Skip("needs " + tool)
-		}
-	}
-	stub := t.TempDir()
-	bin := filepath.Join(stub, "bin")
-	for name, body := range map[string]string{
-		"flyctl": `#!/usr/bin/env bash
+// deployStubs stand in for flyctl and curl, modelling a worker serving a
+// version: flyctl remembers apps and volumes, a deploy changes the running
+// version (built at VERSION, or an earlier image by digest), and curl serves
+// /healthz for whatever runs, degraded if that version is in $STUB/bad.
+var deployStubs = map[string]string{
+	"flyctl": `#!/usr/bin/env bash
 echo "flyctl $*" >> "$STUB/calls"
 case "$1 $2" in
   "status -a") [ -e "$STUB/app-$3" ] || exit 1 ;;
+  "apps destroy") rm -f "$STUB/app-$3" ;;
   "apps create") [ -n "$DENY_CREATE" ] && { echo "Error: unauthorized" >&2; exit 1; }; touch "$STUB/app-$3" ;;
   "volumes list") # a JSON array, as flyctl prints it
     echo "["; sep=""; for f in "$STUB"/vol-"$4"-*; do [ -e "$f" ] && { n=${f##*-$4-}; echo "$sep{\"name\": \"$n\", \"id\": \"vol_$n\"}"; sep=","; }; done; echo "]" ;;
   "volumes create") touch "$STUB/vol-$5-$3" ;;
+  "ips list") echo "[{\"Type\":\"v6\",\"Address\":\"2a09::1\"},{\"Type\":\"shared_v4\",\"Address\":\"66.0.0.7\"}]" ;;
   "image show")
     [ -s "$STUB/current" ] && echo "[{\"Registry\":\"registry.fly.io\",\"Repository\":\"$4\",\"Digest\":\"sha256:$(cat "$STUB/current")\"}]" || echo "[]" ;;
   "deploy "*)
@@ -37,26 +33,48 @@ case "$1 $2" in
       case "$a" in
         VERSION=*) echo "${a#VERSION=}" > "$STUB/current" ;;
         *@sha256:*) echo "${a##*@sha256:}" > "$STUB/current" ;;
+        *.toml*) grep -h "size = " "$a" >> "$STUB/calls" ;; # a drill's machine size
       esac
     done ;;
 esac
 exit 0
 `,
-		"curl": `#!/usr/bin/env bash
+	"curl": `#!/usr/bin/env bash
+echo "curl $*" >> "$STUB/calls"
 [ -s "$STUB/current" ] || exit 22 # nothing serving yet
 v=$(cat "$STUB/current")
 status=ok
 grep -qx "$v" "$STUB/bad" 2>/dev/null && status="degraded: mysql: refused"
 echo "{\"status\":\"$status\",\"uptime_s\":3,\"version\":\"$v\"}"
 `,
-	} {
-		if err := os.MkdirAll(bin, 0o755); err != nil {
-			t.Fatal(err)
-		}
-		if err := os.WriteFile(filepath.Join(bin, name), []byte(body), 0o755); err != nil {
-			t.Fatal(err)
+}
+
+// writeStubs writes stand-in commands into a temporary bin directory, returning
+// the directory their state lives in ($STUB) and the bin directory to put first on PATH.
+func writeStubs(t *testing.T, stubs ...map[string]string) (stub, bin string) {
+	stub = t.TempDir()
+	bin = filepath.Join(stub, "bin")
+	if err := os.MkdirAll(bin, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for _, m := range stubs {
+		for name, body := range m {
+			if err := os.WriteFile(filepath.Join(bin, name), []byte(body), 0o755); err != nil {
+				t.Fatal(err)
+			}
 		}
 	}
+	return stub, bin
+}
+
+// deploy/fly/deploy.sh against deployStubs.
+func TestDeployScript(t *testing.T) {
+	for _, tool := range []string{"bash", "jq"} {
+		if _, err := osexec.LookPath(tool); err != nil {
+			t.Skip("needs " + tool)
+		}
+	}
+	stub, bin := writeStubs(t, deployStubs)
 	// deploy runs deploy.sh at version, with these versions unhealthy, and
 	// returns the flyctl calls, the output, and the version left running.
 	deploy := func(version string, bad []string, env ...string) (calls, out, running string, err error) {
@@ -98,6 +116,9 @@ echo "{\"status\":\"$status\",\"uptime_s\":3,\"version\":\"$v\"}"
 			t.Errorf("deploy order wrong: want MySQL, then Temporal, then the worker:\n%s", calls)
 		}
 		last = i
+	}
+	if !strings.Contains(calls, "--resolve cas-jamesponwith-worker.fly.dev:443:66.0.0.7 https://cas-jamesponwith-worker.fly.dev/healthz") {
+		t.Errorf("smoke test didn't reach the worker's shared IPv4 by name, past DNS:\n%s", calls)
 	}
 	if !strings.Contains(calls, "--build-arg VERSION=0.2.0") {
 		t.Errorf("worker not built at version 0.2.0 (tag v0.2.0):\n%s", calls)
@@ -142,12 +163,12 @@ func TestDeployScriptFlyctlFlags(t *testing.T) {
 	if _, err := osexec.LookPath("flyctl"); err != nil {
 		t.Skip("flyctl not installed")
 	}
-	cmd := regexp.MustCompile(`flyctl ((?:volumes snapshots|apps|volumes|secrets|image|ssh) \w+|deploy|status)\b([^|;&\n]*)`)
+	cmd := regexp.MustCompile(`flyctl ((?:volumes snapshots|apps|volumes|secrets|image|ssh) \w+|deploy|status|proxy)\b([^|;&\n]*)`)
 	flag := regexp.MustCompile(`--[a-z][a-z-]*`)
 	// deploy.sh's own deploy helper passes its extra arguments to flyctl deploy.
 	helper := regexp.MustCompile(`(?m)^deploy "\$\w+" \S+()(.*)$`)
 	checked := 0
-	for _, script := range []string{"deploy/fly/deploy.sh", "deploy/fly/restore-drill.sh"} {
+	for _, script := range []string{"deploy/fly/deploy.sh", "deploy/fly/restore-drill.sh", "deploy/fly/load-drill.sh"} {
 		src, err := os.ReadFile(script)
 		if err != nil {
 			t.Fatal(err)
@@ -183,8 +204,6 @@ func TestRestoreDrillScript(t *testing.T) {
 			t.Skip("needs " + tool)
 		}
 	}
-	stub := t.TempDir()
-	bin := filepath.Join(stub, "bin")
 	flyctl := `#!/usr/bin/env bash
 echo "flyctl $*" >> "$STUB/calls"
 case "$1 $2" in
@@ -212,12 +231,7 @@ case "$1 $2" in
 esac
 exit 0
 `
-	if err := os.MkdirAll(bin, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(bin, "flyctl"), []byte(flyctl), 0o755); err != nil {
-		t.Fatal(err)
-	}
+	stub, bin := writeStubs(t, map[string]string{"flyctl": flyctl})
 	drill := func(env ...string) (calls, out string, err error) {
 		_ = os.Remove(filepath.Join(stub, "calls"))
 		cmd := osexec.Command("bash", "deploy/fly/restore-drill.sh")
@@ -265,5 +279,100 @@ exit 0
 	}
 	if n := len(destroyed(calls)); n != 2 {
 		t.Errorf("after a failed drill, destroyed %d apps, want the 2 drill apps", n)
+	}
+}
+
+// load-drill.sh against deployStubs, a stand-in go that records what TestLoad
+// would get, and real listeners for flyctl proxy's ports: it loads a fresh
+// drill stack with a password of its own, and destroys that stack and only
+// that, whether the load passes, fails, or never starts.
+func TestLoadDrillScript(t *testing.T) {
+	for _, tool := range []string{"bash", "jq", "openssl"} {
+		if _, err := osexec.LookPath(tool); err != nil {
+			t.Skip("needs " + tool)
+		}
+	}
+	stub, bin := writeStubs(t, deployStubs, map[string]string{"go": `#!/usr/bin/env bash
+echo "go $* TEMPORAL=$CAS_LOAD_TEMPORAL DSN=$CAS_MYSQL_DSN" >> "$STUB/go"
+exit "${GO_EXIT:-0}"
+`})
+	port := func() string { // a listening port, standing in for a flyctl proxy that came up
+		ln, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = ln.Close() })
+		return strconv.Itoa(ln.Addr().(*net.TCPAddr).Port)
+	}
+	tport, mport := port(), port()
+	drill := func(env ...string) (calls, gocall, out string, err error) {
+		for _, f := range []string{"calls", "go", "current"} {
+			_ = os.Remove(filepath.Join(stub, f))
+		}
+		cmd := osexec.Command("bash", "deploy/fly/load-drill.sh")
+		cmd.Env = append([]string{"PATH=" + bin + ":" + os.Getenv("PATH"), "STUB=" + stub,
+			"FLY_API_TOKEN=x", "CAS_MYSQL_PASSWORD=production-pw", "VERSION=v0.9.0", "SMOKE_TRIES=1", "SMOKE_WAIT=0",
+			"LOAD_TEMPORAL_PORT=" + tport, "LOAD_MYSQL_PORT=" + mport, "PROXY_TRIES=2"}, env...)
+		o, err := cmd.CombinedOutput()
+		c, _ := os.ReadFile(filepath.Join(stub, "calls"))
+		g, _ := os.ReadFile(filepath.Join(stub, "go"))
+		return string(c), string(g), string(o), err
+	}
+	// left lists the apps still standing, and fails on any outside the drill.
+	left := func(calls string) []string {
+		for _, line := range strings.Split(calls, "\n") {
+			if strings.Contains(line, " -a ") && !strings.Contains(line, "-drill-load-") {
+				t.Errorf("touched an app outside the drill: %s", line)
+			}
+		}
+		apps, _ := filepath.Glob(filepath.Join(stub, "app-*"))
+		return apps
+	}
+
+	calls, gocall, out, err := drill()
+	if err != nil {
+		t.Fatalf("good drill: %v:\n%s", err, out)
+	}
+	if !strings.Contains(gocall, "go test -run ^TestLoad$ ") || !strings.Contains(gocall, "TEMPORAL=127.0.0.1:"+tport) ||
+		!strings.Contains(gocall, "@tcp(127.0.0.1:"+mport+")/cas") {
+		t.Errorf("TestLoad not pointed at the proxied drill stack: %s", gocall)
+	}
+	if strings.Contains(gocall+calls, "production-pw") {
+		t.Errorf("the drill used production's MySQL password")
+	}
+	if n := strings.Count(calls, "apps destroy"); n != 3 {
+		t.Errorf("destroyed %d apps, want the 3 drill apps:\n%s", n, calls)
+	}
+	if apps := left(calls); len(apps) != 0 {
+		t.Errorf("drill apps left standing: %v", apps)
+	}
+
+	if calls, _, out, err := drill("FLY_VM_SIZE=performance-1x"); err != nil || strings.Count(calls, `size = "performance-1x"`) != 3 {
+		t.Errorf("FLY_VM_SIZE: err %v, want all 3 machines resized:\n%s\n%s", err, out, calls)
+	}
+
+	for _, tt := range []struct {
+		name, env, want string
+		loaded          bool
+	}{
+		{"load fails", "GO_EXIT=1", "", true},
+		{"deploy fails", "", "never reported ok", false},
+		{"proxy never comes up", "LOAD_MYSQL_PORT=1", "proxy on port 1 never came up", false},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			if tt.name == "deploy fails" { // the worker never reports ok
+				if err := os.WriteFile(filepath.Join(stub, "bad"), []byte("0.9.0\n"), 0o644); err != nil {
+					t.Fatal(err)
+				}
+				defer func() { _ = os.Remove(filepath.Join(stub, "bad")) }()
+			}
+			calls, gocall, out, err := drill(tt.env)
+			if err == nil || !strings.Contains(out, tt.want) || (gocall != "") != tt.loaded {
+				t.Errorf("err %v, loaded %v; want a failure saying %q, loaded %v:\n%s", err, gocall != "", tt.want, tt.loaded, out)
+			}
+			if apps := left(calls); len(apps) != 0 {
+				t.Errorf("drill apps left standing after a failure: %v", apps)
+			}
+		})
 	}
 }

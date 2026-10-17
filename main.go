@@ -111,7 +111,11 @@ func run(ctx context.Context, args []string, env func(string) string) error {
 		go func() { _ = debug.Serve(dln) }()
 		defer func() { _ = debug.Close() }()
 	}
-	w := worker.New(c, TaskQueue, worker.Options{})
+	// The SDK's 2 workflow-task pollers each wait a network round trip per task.
+	// Over Fly's private network that capped the worker near 14 tasks/s, about 2
+	// auths/s, with decisions queued for seconds (docs/writeup.md, "On Fly").
+	// ponytail: fixed counts; NewPollerBehaviorAutoscaling if one worker size stops fitting all loads.
+	w := worker.New(c, TaskQueue, worker.Options{MaxConcurrentWorkflowTaskPollers: 16, MaxConcurrentActivityTaskPollers: 8})
 	w.RegisterWorkflow(AuthorizeWorkflow)
 	w.RegisterWorkflow(StatementWorkflow)
 	w.RegisterWorkflow(AuditWorkflow)

@@ -10,5 +10,8 @@ RUN wget -q -O /tmp/cli.tgz "https://github.com/temporalio/cli/releases/download
 EXPOSE 7233
 # --ip :: listens on Fly's private IPv6 network; binding one IPv6 address
 # breaks the server's internal services, which dial 127.0.0.1.
+# WAL, still synced on every commit: as durable as SQLite's default rollback
+# journal, with fewer syncs per commit (docs/writeup.md, "On Fly").
 ENTRYPOINT ["temporal", "server", "start-dev", "--ip", "::", "--db-filename", "/data/temporal.db", \
+  "--sqlite-pragma", "journal_mode=wal", "--sqlite-pragma", "synchronous=full", \
   "--headless", "--namespace", "default", "--search-attribute", "CardID=Keyword", "--log-level", "warn"]
