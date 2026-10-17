@@ -16,7 +16,12 @@ cd "$(dirname "$0")/../.."
 root=$PWD # every path below is absolute: build contexts, Dockerfiles, configs
 
 ensure_app() {
-  flyctl status -a "$1" >/dev/null 2>&1 || flyctl apps create "$1" --org personal
+  flyctl status -a "$1" >/dev/null 2>&1 && return
+  # The release job's tokens are scoped to existing apps and can't create one.
+  flyctl apps create "$1" --org personal || {
+    echo "app $1 doesn't exist and this token can't create it: run 'fly apps create $1 --org personal' once, then add a deploy token for it to FLY_DEPLOY_TOKEN" >&2
+    return 1
+  }
 }
 ensure_volume() { # app, volume, size in GB
   flyctl volumes list -a "$1" --json | grep -q "\"name\": *\"$2\"" ||

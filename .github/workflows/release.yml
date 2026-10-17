@@ -54,7 +54,9 @@ jobs:
       # public /healthz reports ok at it.
       - run: deploy/fly/deploy.sh
         env:
-          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+          # Deploy tokens for the three apps, joined: they can deploy those apps
+          # and nothing else, and can't create apps (ADR 0007).
+          FLY_API_TOKEN: ${{ secrets.FLY_DEPLOY_TOKEN }}
           CAS_MYSQL_PASSWORD: ${{ secrets.CAS_MYSQL_PASSWORD }}
           VERSION: ${{ github.ref_name }}
           FLY_APP_PREFIX: ${{ vars.FLY_APP_PREFIX }}

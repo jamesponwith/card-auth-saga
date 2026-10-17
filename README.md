@@ -129,10 +129,16 @@ The deploy fails unless `https://<prefix>-worker.fly.dev/healthz` reports `ok` a
 If it doesn't, the script redeploys the image that was running (by digest) and still fails, reporting
 "rolled back to <version>" (ADR 0007).
 
-One-time setup: a Fly.io account with a payment method, then two repo secrets:
+One-time setup: a Fly.io account with a payment method, the three apps, then three repo secrets. The
+release job deploys with tokens scoped to those three apps, which can't create apps or touch any other.
+The monthly restore drill keeps an org token, because it creates and destroys scratch apps.
 
 ```sh
-fly tokens create org | gh secret set FLY_API_TOKEN
+for a in mysql temporal worker; do fly apps create cas-jamesponwith-$a --org personal; done
+tok=$(for a in mysql temporal worker; do fly tokens create deploy -a cas-jamesponwith-$a -x 8760h; done |
+  paste -sd, - | sed 's/,FlyV1 /,/g')       # deploy tokens joined: each app, nothing else
+printf %s "$tok" | gh secret set FLY_DEPLOY_TOKEN; unset tok
+fly tokens create org -x 8760h | gh secret set FLY_API_TOKEN      # restore drill only
 openssl rand -base64 24 | gh secret set CAS_MYSQL_PASSWORD
 git tag v0.2.0 && git push origin v0.2.0      # release and deploy
 ```
@@ -178,6 +184,13 @@ workflow's result, and `/healthz` reports `degraded: audit: …` while the lates
 go run . audit                     # run it now: prints "audit: clean", or the findings and exits 1
 temporal schedule describe --schedule-id ledger-audit
 ```
+
+## Security
+
+Every PR runs `gitleaks` over the whole history and `govulncheck` over the code. Both block the merge,
+and `govulncheck` only reports vulnerabilities the code can reach. `security.yml` rescans `main` weekly,
+since new CVEs arrive without any code changing. `go.mod`'s `toolchain` line and the Dockerfile pin
+the same patched Go, so CI scans exactly what production runs.
 
 ## Load test
 
