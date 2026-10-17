@@ -7,13 +7,13 @@
 #   FLY_API_TOKEN              an org token: the drill creates apps
 #   VERSION                    optional; the worker version to build (default: git describe)
 #   FLY_APP_PREFIX, FLY_REGION, FLY_VM_SIZE   optional; as in deploy.sh
-#   LOAD_TEMPORAL_PORT, LOAD_MYSQL_PORT, PROXY_TRIES   local proxy ports, and how long to wait for them
+#   LOAD_TEMPORAL_PORT, LOAD_MYSQL_PORT, LOAD_DEBUG_PORT, PROXY_TRIES   local proxy ports, and how long to wait for them
 set -euo pipefail
 : "${FLY_API_TOKEN:?}"
 prefix=${FLY_APP_PREFIX:-cas-jamesponwith}
 cd "$(dirname "$0")/../.."
 drill=$prefix-drill-load-$(date -u +%m%d%H%M)
-tport=${LOAD_TEMPORAL_PORT:-17233} mport=${LOAD_MYSQL_PORT:-13306}
+tport=${LOAD_TEMPORAL_PORT:-17233} mport=${LOAD_MYSQL_PORT:-13306} dport=${LOAD_DEBUG_PORT:-19091}
 # Its own password: production's never leaves production.
 password=$(openssl rand -hex 16)
 
@@ -36,6 +36,7 @@ FLY_APP_PREFIX=$drill CAS_MYSQL_PASSWORD=$password VERSION=${VERSION:-$(git desc
 
 flyctl proxy "$tport:7233" -a "$drill-temporal" >/dev/null 2>&1 & pids+=($!)
 flyctl proxy "$mport:3306" -a "$drill-mysql" >/dev/null 2>&1 & pids+=($!)
+flyctl proxy "$dport:9091" -a "$drill-worker" >/dev/null 2>&1 & pids+=($!)
 for port in "$tport" "$mport"; do
   for try in $(seq 1 "${PROXY_TRIES:-30}"); do
     (: <"/dev/tcp/127.0.0.1/$port") 2>/dev/null && break
@@ -44,5 +45,18 @@ for port in "$tport" "$mport"; do
   done
 done
 
+for app in mysql temporal worker; do
+  echo "$app machine: $(flyctl machine list -a "$drill-$app" --json | jq -c '.[0].config.guest')"
+done
+
+status=0
 CAS_LOAD=1 CAS_LOAD_TEMPORAL=127.0.0.1:$tport CAS_MYSQL_DSN="root:$password@tcp(127.0.0.1:$mport)/cas" \
-  go test -run '^TestLoad$' -v -count=1 -timeout 30m .
+  go test -run '^TestLoad$' -v -count=1 -timeout 30m . || status=$?
+
+# Where the time went: the worker's Temporal SDK timers (/debug/vars), slowest mean first.
+echo "worker timers, mean over the run:"
+curl -fsS --max-time 10 "http://127.0.0.1:$dport/debug/vars" | jq -r '.temporal as $t | $t | keys[] |
+  select(endswith("_seconds") or contains("_seconds{")) as $k | ($k | sub("_seconds"; "_count")) as $c |
+  select($t[$c] > 0) | "\($t[$k] / $t[$c] * 1000 | floor)ms\tx\($t[$c])\t\($k | sub("_seconds"; ""))"' |
+  sort -rn | head -25 || echo "(no metrics)"
+exit "$status"

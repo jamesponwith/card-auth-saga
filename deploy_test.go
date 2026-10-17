@@ -33,6 +33,7 @@ case "$1 $2" in
       case "$a" in
         VERSION=*) echo "${a#VERSION=}" > "$STUB/current" ;;
         *@sha256:*) echo "${a##*@sha256:}" > "$STUB/current" ;;
+        *.toml*) grep -h "size = " "$a" >> "$STUB/calls" ;; # a drill's machine size
       esac
     done ;;
 esac
@@ -351,6 +352,10 @@ exit "${GO_EXIT:-0}"
 	}
 	if apps := left(calls); len(apps) != 0 {
 		t.Errorf("drill apps left standing: %v", apps)
+	}
+
+	if calls, _, out, err := drill("FLY_VM_SIZE=performance-1x"); err != nil || strings.Count(calls, `size = "performance-1x"`) != 3 {
+		t.Errorf("FLY_VM_SIZE: err %v, want all 3 machines resized:\n%s\n%s", err, out, calls)
 	}
 
 	for _, tt := range []struct {

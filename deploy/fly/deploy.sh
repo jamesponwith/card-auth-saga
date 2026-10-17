@@ -31,15 +31,29 @@ ensure_volume() { # app, volume, size in GB
   # Daily snapshots kept two weeks; restore-drill.sh proves they restore.
   local id
   id=$(flyctl volumes list -a "$1" --json | jq -r --arg n "$2" 'first(.[] | select(.name == $n)) | .id')
-  flyctl volumes update "$id" -a "$1" --scheduled-snapshots=true --snapshot-retention 14 >/dev/null
+  # A volume made a moment ago can 404 here until Fly's API catches up.
+  for try in 1 2 3 4 5; do
+    flyctl volumes update "$id" -a "$1" --scheduled-snapshots=true --snapshot-retention 14 >/dev/null && return
+    [ "$try" = 5 ] && return 1
+    sleep "${RETRY_WAIT:-5}"
+  done
 }
 deploy() { # app, config, extra flags...
-  local app=$1 config=$2
+  local app=$1 name=$2 config=$root/deploy/fly/$2
   shift 2
+  # The config's [[vm]] (always its last section) wins over deploy --vm-size,
+  # so a drill sizing machines swaps it. Resizing after the deploy instead
+  # restarts MySQL mid first-boot and leaves its new datadir unbootable.
+  if [ -n "${FLY_VM_SIZE:-}" ]; then
+    local sized
+    sized=$(mktemp -d)/$name # flyctl reads the format from the extension
+    sed '/^\[\[vm\]\]/,$d' "$config" > "$sized"
+    printf '[[vm]]\n  size = "%s"\n' "$FLY_VM_SIZE" >> "$sized"
+    config=$sized
+  fi
   # One machine per app: MySQL and Temporal are bound to their volume, and two
   # workers would be fine but buy nothing here.
-  flyctl deploy "$@" -a "$app" -c "$root/deploy/fly/$config" --primary-region "$region" --ha=false --yes \
-    ${FLY_VM_SIZE:+--vm-size "$FLY_VM_SIZE"}
+  flyctl deploy "$@" -a "$app" -c "$config" --primary-region "$region" --ha=false --yes
 }
 
 mysql=$prefix-mysql temporal=$prefix-temporal worker=$prefix-worker

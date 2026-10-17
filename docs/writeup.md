@@ -214,6 +214,38 @@ Two changes took decisions from ~150–180ms to these numbers:
 The rest of the decision time is mostly the dev server's SQLite persistence. A production Temporal
 cluster is the next lever.
 
+## On Fly
+
+The laptop numbers above don't carry over. `deploy/fly/load-drill.sh` (ADR 0008) ran the same test
+against a throwaway copy of the Fly stack: same recipes, sizes and region, with a ~20ms round trip
+from the load generator. Every row kept the counts exact and the audit clean. Only the speed changed:
+
+| Fly stack | Spread (400) | Hot card (400) | Contention (100) |
+|---|---|---|---|
+| As first deployed: shared CPUs, SDK default pollers, SQLite rollback journal | 3/s, p50 9.6s | 2/s, p50 7.7s | 3/s, p50 12.1s |
+| + Temporal's SQLite in WAL mode | 6/s, p50 6.3s | 5/s, p50 5.6s | 7/s, p50 6.0s |
+| + 16 workflow / 8 activity pollers | 6/s, p50 3.2s | 5/s, p50 4.4s | 8/s, p50 3.1s |
+| + dedicated CPUs (`FLY_VM_SIZE=performance-1x`) | 18/s, p50 0.8s | 31/s, p50 1.2s | 27/s, p50 0.7s |
+
+The worker's own timers (which the drill prints) found each limit in turn:
+
+- **Pollers.** MySQL work stayed fast throughout: ~30ms to place a hold, ~25ms to settle. Each
+  workflow task, though, waited 2.4s in Temporal's queue. The SDK's 2 pollers each spend a network
+  round trip per task, about 14 tasks/s, and each auth takes ~7 tasks. On a laptop that round trip is
+  under a millisecond, so 2 pollers never showed up as a limit. The worker now runs 16 and 8.
+- **SQLite's journal.** The CLI's server uses SQLite's rollback journal, which costs several syncs
+  per commit on a Fly volume. WAL with `synchronous=full` is just as durable and doubled throughput.
+- **Shared CPUs.** With those fixed, polls themselves took ~1.1s: the server was throttled. On
+  dedicated CPUs the same stack ran 3–6x faster, and decisions landed under a second at the median.
+
+Production runs on shared CPUs, so it gets the first two rows' fixes but not the third. Dedicated
+CPUs cost about $90/month for the three machines, against about $10/month now. At a few auths per
+second, a decision on shared CPUs takes seconds, longer than a card network waits. Move to dedicated
+CPUs before taking real traffic. Two drill-only traps came up along the way. `deploy --vm-size`
+loses to the config's `[[vm]]`. And resizing a machine just after it's created restarts MySQL in the
+middle of its first boot, which leaves its new datadir unbootable. `deploy.sh` therefore writes the
+size into the config.
+
 ## In production
 
 A `v*` tag deploys to Fly.io (ADR 0007): MySQL, a single-process Temporal persisted to SQLite on a
