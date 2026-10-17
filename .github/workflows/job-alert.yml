@@ -1,10 +1,5 @@
-# Scheduled jobs page someone: a failed run of a scheduled workflow on main
-# opens a `job-failure` issue (GitHub notifies the repo's watchers), a repeat
-# failure comments on it, and the next green run closes it. A red run in the
-# Actions tab alone reaches no one. Not `incident`: those are SLO breaches,
-# filed by tools/watch, and feed the DORA numbers.
-#
-# workflow_dispatch drives the same logic by hand, to test it.
+# A scheduled workflow that fails on main opens a job-failure issue; the next
+# green run closes it (README "Operate"). Not `incident`: that's tools/watch.
 name: job-alert
 
 on:
@@ -36,7 +31,7 @@ jobs:
           esac
           title="scheduled job failing: $JOB"
           open=$(gh issue list --state open --label job-failure --json number,title \
-            --jq "map(select(.title == \"$title\")) | first | .number // empty" 2>/dev/null || true)
+            --jq "map(select(.title == \"$title\")) | first | .number // empty")
           if [ "$failed" = 1 ] && [ -n "$open" ]; then
             gh issue comment "$open" --body "Failed again ($CONCLUSION): $RUN_URL"
           elif [ "$failed" = 1 ]; then
