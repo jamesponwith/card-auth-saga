@@ -187,6 +187,11 @@ Set `CAS_DEBUG_ADDR` to give `/debug/vars` a port of its own. The Fly deployment
 `gh workflow run operate`. If the deployment goes away, take the schedule off first: probing an
 address nothing serves files incidents that never close.
 
+The scheduled jobs (`security`, `restore-drill`, `learn` and the `operate` prober itself) report their
+own failures. `job-alert.yml` opens a `job-failure` issue when one fails on `main`, comments on repeat
+failures, and closes the issue on the next green run. Test it with
+`gh workflow run job-alert -f job=security -f conclusion=failure`, then `-f conclusion=success`.
+
 ## Audit
 
 Every 24 hours a Temporal Schedule (`ledger-audit`, created by the worker on boot) runs `AuditWorkflow`
