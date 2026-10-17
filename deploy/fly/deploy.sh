@@ -32,11 +32,11 @@ ensure_volume() { # app, volume, size in GB
   local id
   id=$(flyctl volumes list -a "$1" --json | jq -r --arg n "$2" 'first(.[] | select(.name == $n)) | .id')
   # A volume made a moment ago can 404 here until Fly's API catches up.
-  for try in 1 2 3 4 5; do
+  for _ in 1 2 3 4 5; do
     flyctl volumes update "$id" -a "$1" --scheduled-snapshots=true --snapshot-retention 14 >/dev/null && return
-    [ "$try" = 5 ] && return 1
-    sleep "${RETRY_WAIT:-5}"
+    sleep 5
   done
+  return 1
 }
 deploy() { # app, config, extra flags...
   local app=$1 name=$2 config=$root/deploy/fly/$2

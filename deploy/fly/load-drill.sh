@@ -7,13 +7,13 @@
 #   FLY_API_TOKEN              an org token: the drill creates apps
 #   VERSION                    optional; the worker version to build (default: git describe)
 #   FLY_APP_PREFIX, FLY_REGION, FLY_VM_SIZE   optional; as in deploy.sh
-#   LOAD_TEMPORAL_PORT, LOAD_MYSQL_PORT, LOAD_DEBUG_PORT, PROXY_TRIES   local proxy ports, and how long to wait for them
+#   LOAD_TEMPORAL_PORT, LOAD_MYSQL_PORT, PROXY_TRIES   local proxy ports, and how long to wait for them
 set -euo pipefail
 : "${FLY_API_TOKEN:?}"
 prefix=${FLY_APP_PREFIX:-cas-jamesponwith}
 cd "$(dirname "$0")/../.."
 drill=$prefix-drill-load-$(date -u +%m%d%H%M)
-tport=${LOAD_TEMPORAL_PORT:-17233} mport=${LOAD_MYSQL_PORT:-13306} dport=${LOAD_DEBUG_PORT:-19091}
+tport=${LOAD_TEMPORAL_PORT:-17233} mport=${LOAD_MYSQL_PORT:-13306} dport=19091
 # Its own password: production's never leaves production.
 password=$(openssl rand -hex 16)
 

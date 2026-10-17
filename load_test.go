@@ -30,16 +30,11 @@ func TestLoad(t *testing.T) {
 	ctx := context.Background()
 	c, l := loadTarget(t)
 	// Every latency below includes this round trip from here to Temporal.
-	rtts := make([]time.Duration, 5)
-	for i := range rtts {
-		began := time.Now()
-		if _, err := c.CheckHealth(ctx, &client.CheckHealthRequest{}); err != nil {
-			t.Fatal(err)
-		}
-		rtts[i] = time.Since(began)
+	began := time.Now()
+	if _, err := c.CheckHealth(ctx, &client.CheckHealthRequest{}); err != nil {
+		t.Fatal(err)
 	}
-	slices.Sort(rtts)
-	t.Logf("round trip to Temporal: %v (median of 5)", rtts[2].Round(100*time.Microsecond))
+	t.Logf("round trip to Temporal: %v", time.Since(began).Round(100*time.Microsecond))
 
 	const amount = 1_000 // $10 per auth
 	scenarios := []struct {

@@ -204,8 +204,6 @@ func TestRestoreDrillScript(t *testing.T) {
 			t.Skip("needs " + tool)
 		}
 	}
-	stub := t.TempDir()
-	bin := filepath.Join(stub, "bin")
 	flyctl := `#!/usr/bin/env bash
 echo "flyctl $*" >> "$STUB/calls"
 case "$1 $2" in
@@ -233,12 +231,7 @@ case "$1 $2" in
 esac
 exit 0
 `
-	if err := os.MkdirAll(bin, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(bin, "flyctl"), []byte(flyctl), 0o755); err != nil {
-		t.Fatal(err)
-	}
+	stub, bin := writeStubs(t, map[string]string{"flyctl": flyctl})
 	drill := func(env ...string) (calls, out string, err error) {
 		_ = os.Remove(filepath.Join(stub, "calls"))
 		cmd := osexec.Command("bash", "deploy/fly/restore-drill.sh")
