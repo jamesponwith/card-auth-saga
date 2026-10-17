@@ -46,15 +46,11 @@ jobs:
       - uses: actions/setup-go@v7
         with:
           go-version-file: go.mod # its toolchain line: the Go production builds with
-      - name: secrets
-        # Blocking: a committed secret is already leaked; failing loudly is the
-        # only useful response.
+      - name: secrets # blocking: a committed secret is already leaked
         uses: gitleaks/gitleaks-action@v3
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       - name: vulnerabilities
-        # Blocking here, unlike the template's advisory step: this repo runs a
-        # production ledger, and govulncheck reports only vulnerabilities the
-        # code can reach. Pinned for reproducibility; it fetches the current
-        # vulnerability database every run. security.yml rescans main weekly.
+        # Blocking (the template's is advisory): a production ledger, and only reachable
+        # vulns are reported. See README "Security"; security.yml rescans main weekly.
         run: go run golang.org/x/vuln/cmd/govulncheck@v1.9.0 ./...

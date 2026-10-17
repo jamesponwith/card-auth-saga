@@ -4,8 +4,7 @@
 # redeploy the image that was running and fail anyway. Idempotent: apps,
 # volumes and secrets are created only if missing. Run by release.yml on a tag.
 #
-#   FLY_API_TOKEN, CAS_MYSQL_PASSWORD   from GitHub Actions secrets (the release
-#                                       job passes app-scoped deploy tokens)
+#   FLY_API_TOKEN, CAS_MYSQL_PASSWORD   from GitHub Actions secrets
 #   VERSION                             the release tag (v0.2.0) or version (0.2.0)
 #   FLY_APP_PREFIX, FLY_REGION          optional; see the defaults below
 set -euo pipefail
