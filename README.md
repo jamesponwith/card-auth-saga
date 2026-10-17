@@ -222,6 +222,16 @@ CAS_LOAD=1 go test -run TestLoad -v .   # needs CAS_MYSQL_DSN; numbers and invar
 It measures auths per second and decision latency, spread across cards and concentrated on one, and
 checks that exactly the right number are approved and that the audit is clean afterwards.
 
+To measure the Fly stack instead of a laptop, without putting load cards in production's ledger
+(ADR 0008):
+
+```sh
+FLY_API_TOKEN=$(fly auth token) deploy/fly/load-drill.sh   # ~10 min; a few cents
+```
+
+It deploys a throwaway `-drill-load-` copy of the stack, runs the same test against it through
+`flyctl proxy`, and destroys the copy, pass or fail.
+
 ## Failure drills
 
 ```sh

@@ -3,7 +3,9 @@ package main
 // Load test: auths per second and authorize-decision latency against a real
 // Temporal dev server and MySQL, with the ledger's invariants checked after.
 // Opt-in: CAS_LOAD=1 and CAS_MYSQL_DSN. Not part of CI, which runs on shared
-// runners whose timing would make the numbers noise.
+// runners whose timing would make the numbers noise. With CAS_LOAD_TEMPORAL it
+// loads a deployed stack instead (deploy/fly/load-drill.sh): that address's
+// workers serve the task queue, and the DSN is their ledger.
 
 import (
 	"context"
@@ -26,21 +28,18 @@ func TestLoad(t *testing.T) {
 		t.Skip("set CAS_LOAD=1 and CAS_MYSQL_DSN to run the load test")
 	}
 	ctx := context.Background()
-	srv, err := testsuite.StartDevServer(ctx, testsuite.DevServerOptions{LogLevel: "error", ExtraArgs: []string{"--search-attribute", "CardID=Keyword"}})
-	if err != nil {
-		t.Fatal(err)
+	c, l := loadTarget(t)
+	// Every latency below includes this round trip from here to Temporal.
+	rtts := make([]time.Duration, 5)
+	for i := range rtts {
+		began := time.Now()
+		if _, err := c.CheckHealth(ctx, &client.CheckHealthRequest{}); err != nil {
+			t.Fatal(err)
+		}
+		rtts[i] = time.Since(began)
 	}
-	t.Cleanup(func() { _ = srv.Stop() })
-	c := srv.Client()
-	l := open(t, freshDB(t)) // its own database, so the audit sees only this load
-
-	w := worker.New(c, TaskQueue, worker.Options{})
-	w.RegisterWorkflow(AuthorizeWorkflow)
-	w.RegisterActivity(&Activities{Ledger: l, Config: l})
-	if err := w.Start(); err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(w.Stop)
+	slices.Sort(rtts)
+	t.Logf("round trip to Temporal: %v (median of 5)", rtts[2].Round(100*time.Microsecond))
 
 	const amount = 1_000 // $10 per auth
 	scenarios := []struct {
@@ -134,6 +133,35 @@ func TestLoad(t *testing.T) {
 			}
 		})
 	}
+}
+
+// loadTarget is what TestLoad loads: a deployed stack at CAS_LOAD_TEMPORAL, or
+// else a dev server and a worker of its own on a fresh database, so the audit
+// sees only this load. A deployed stack's ledger is the drill's own.
+func loadTarget(t *testing.T) (client.Client, *MySQLLedger) {
+	if addr := os.Getenv("CAS_LOAD_TEMPORAL"); addr != "" {
+		c, err := client.Dial(client.Options{HostPort: addr})
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(c.Close)
+		return c, open(t, os.Getenv("CAS_MYSQL_DSN"))
+	}
+	srv, err := testsuite.StartDevServer(context.Background(), testsuite.DevServerOptions{LogLevel: "error", ExtraArgs: []string{"--search-attribute", "CardID=Keyword"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = srv.Stop() })
+	c := srv.Client()
+	l := open(t, freshDB(t))
+	w := worker.New(c, TaskQueue, worker.Options{})
+	w.RegisterWorkflow(AuthorizeWorkflow)
+	w.RegisterActivity(&Activities{Ledger: l, Config: l})
+	if err := w.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(w.Stop)
+	return c, l
 }
 
 // authorizeAndSettle asks for a decision and, if approved, captures in full.
