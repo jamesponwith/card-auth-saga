@@ -1,0 +1,49 @@
+# A scheduled workflow that fails on main opens a job-failure issue; the next
+# green run closes it (README "Operate"). Not `incident`: that's tools/watch.
+name: job-alert
+
+on:
+  workflow_run:
+    workflows: [security, restore-drill, learn, operate]
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      job: { description: "workflow name", required: true }
+      conclusion: { description: "failure or success", required: true }
+
+permissions:
+  issues: write
+
+concurrency:
+  group: job-alert-${{ github.event.workflow_run.name || inputs.job }} # one issue per job, never two
+  cancel-in-progress: false
+
+jobs:
+  alert:
+    runs-on: ubuntu-latest
+    steps:
+      - run: |
+          case "$CONCLUSION" in
+            failure|timed_out|startup_failure) failed=1 ;;
+            success) failed=0 ;;
+            *) echo "ignoring conclusion $CONCLUSION"; exit 0 ;; # cancelled, skipped
+          esac
+          title="scheduled job failing: $JOB"
+          open=$(gh issue list --state open --label job-failure --json number,title \
+            --jq "map(select(.title == \"$title\")) | first | .number // empty")
+          if [ "$failed" = 1 ] && [ -n "$open" ]; then
+            gh issue comment "$open" --body "Failed again ($CONCLUSION): $RUN_URL"
+          elif [ "$failed" = 1 ]; then
+            gh label create job-failure --color B60205 --description "a scheduled workflow is failing" --force
+            gh issue create --title "$title" --label job-failure \
+              --body "The scheduled \`$JOB\` workflow failed ($CONCLUSION): $RUN_URL. This closes itself on its next green run."
+          elif [ -n "$open" ]; then
+            gh issue close "$open" --comment "Recovered: $RUN_URL"
+          fi
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          JOB: ${{ github.event.workflow_run.name || inputs.job }}
+          CONCLUSION: ${{ github.event.workflow_run.conclusion || inputs.conclusion }}
+          RUN_URL: ${{ github.event.workflow_run.html_url || format('{0}/{1}/actions/runs/{2}', github.server_url, github.repository, github.run_id) }}

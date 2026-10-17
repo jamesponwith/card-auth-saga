@@ -1,6 +1,6 @@
 # Weekly vulnerability scan of main. New CVEs land without any code changing,
 # so a PR gate alone would miss them until the next PR. A finding turns this
-# run red, which GitHub emails to the repo's owner: fix it with a bead.
+# run red, and job-alert.yml opens a job-failure issue for it: fix it with a bead.
 name: security
 
 on:
