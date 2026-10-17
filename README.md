@@ -29,9 +29,23 @@ MySQL ledger (ADR 0004) — integration tests and a durable worker:
 
 ```sh
 docker run -d --name cas-mysql -e MYSQL_ROOT_PASSWORD=cas -e MYSQL_DATABASE=cas -p 3307:3306 mysql:8.4
-#   no Docker? brew install mysql@8.4, then run mysqld from any datadir on port 3307
 export CAS_MYSQL_DSN='root:cas@tcp(127.0.0.1:3307)/cas'
 go test ./...                  # adds the ledger contract, migrations and config against MySQL
+```
+
+`go test ./...` takes about a minute: with MySQL it also runs the drills (below), which download and
+start a Temporal dev server of their own.
+
+No Docker? Run MySQL 8.4 from Homebrew in a directory of its own:
+
+```sh
+brew install mysql@8.4
+mysqld=$(brew --prefix mysql@8.4)/bin/mysqld
+mkdir -p ~/cas-mysql && cd ~/cas-mysql
+$mysqld --initialize-insecure --datadir=./data
+$mysqld --datadir=./data --port=3307 --bind-address=127.0.0.1 --socket=m.sock --mysqlx=OFF &
+$(brew --prefix mysql@8.4)/bin/mysql -h127.0.0.1 -P3307 -uroot \
+  -e "ALTER USER root@localhost IDENTIFIED BY 'cas'; CREATE DATABASE cas"
 ```
 
 With MySQL, card limits and partner reward rates live in the `cards` and `partners` tables (SPEC.md,
@@ -40,6 +54,7 @@ M11). The schema migrates itself on boot (ADR 0005). Before the first auth, set 
 ```sh
 go run . set-limit card-1 100000   # $1,000.00
 go run . set-rate shell 3          # 3 points per $1 at shell
+# each prints ok: <the command> once saved
 ```
 
 Without MySQL, the worker uses a fixed demo config: `card-1` has a $1,000 limit, `shell` earns 3
@@ -51,7 +66,7 @@ Drive a hold by hand (worker in one terminal, CLI in another):
 go run .                       # worker on task queue card-auth
 temporal workflow execute-update-with-start --update-name authorize \
   --task-queue card-auth --type AuthorizeWorkflow --id-conflict-policy UseExisting \
-  --workflow-id auth-1 --input '{"CardID":"card-1","Amount":40000,"Merchant":"shop"}'
+  --workflow-id auth-1 --input '{"CardID":"card-1","Amount":40000,"Merchant":"shell"}'
 temporal workflow update execute --workflow-id auth-1 --name increment --input '{"ID":"i1","Amount":10000}'
 temporal workflow update execute --workflow-id auth-1 --name capture --input '{"Amount":20000,"Partial":true}'
 temporal workflow update execute --workflow-id auth-1 --name capture --input '{"Amount":25000}'
@@ -74,7 +89,8 @@ $250 for $450 captured in total, releases what's left. A reversal or expiry afte
 releases the rest and still settles what was captured (M8).
 
 After a capture the workflow accepts refunds (deduplicated by `ID`, capped at the captured
-amount) for 30 days, then returns e.g. `{"Status":"captured","Captured":25000,"Refunded":5000,"Points":200}`.
+amount) for 30 days, then returns the totals. After this walkthrough and the dispute below:
+`{"Status":"captured","Captured":45000,"Refunded":5000,"ChargedBack":5000,"Points":1050,"Reason":""}`.
 Points accrue on the captured total at the merchant's partner rate at settlement and are clawed back on refund (SPEC.md).
 Before capture, `--name reverse` voids the hold; with no signal it expires after 7 days
 (`"HoldFor"`/`"RefundWindow"` in nanoseconds shorten either).
@@ -114,7 +130,7 @@ temporal workflow query --workflow-id statement:card-1 --name statement
 Each cycle samples the card's balance at the end of every day. It charges a $25 late fee if the
 minimum isn't paid by the due date, and at close charges interest on the average daily balance
 unless the last statement was paid in full. The workflow then continues as new, so its history covers
-one cycle. `temporal workflow show` lists each run.
+one cycle. `temporal workflow list --query 'WorkflowId="statement:card-1"'` lists each run.
 
 ## Deploy
 
