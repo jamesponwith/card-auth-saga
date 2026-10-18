@@ -23,29 +23,32 @@ func TestSubscriptionCycle(t *testing.T) {
 	const cycle = 30 * day
 	tests := []struct {
 		name      string
-		last      Subscription // carried from the previous cycle
-		decisions []Decision   // ChargeCard's answers, in order
+		cycle     time.Duration // zero: 30 days
+		last      Subscription  // carried from the previous cycle
+		decisions []Decision    // ChargeCard's answers, in order
 		cancelAt  time.Duration
 		wantAt    []time.Duration // when each charge was attempted
 		want      Subscription
 		continued bool          // continued as new into the next cycle
 		endAt     time.Duration // when the run finished
 	}{
-		{"charged: next cycle at the cycle's end", Subscription{}, []Decision{approve()}, 0,
+		{"charged: next cycle at the cycle's end", 0, Subscription{}, []Decision{approve()}, 0,
 			[]time.Duration{0}, Subscription{Cycle: 1, Status: SubActive, Charged: 1_000}, true, cycle},
-		{"cycle numbers carry on", Subscription{Cycle: 4, Status: SubActive, Charged: 4_000}, []Decision{approve()}, 0,
+		{"cycle numbers carry on", 0, Subscription{Cycle: 4, Status: SubActive, Charged: 4_000}, []Decision{approve()}, 0,
 			[]time.Duration{0}, Subscription{Cycle: 5, Status: SubActive, Charged: 5_000}, true, cycle},
-		{"declined, then charged on the second retry", Subscription{}, []Decision{decline(DeclineOverLimit), decline(DeclineFrozen), approve()}, 0,
+		{"declined, then charged on the second retry", 0, Subscription{}, []Decision{decline(DeclineOverLimit), decline(DeclineFrozen), approve()}, 0,
 			[]time.Duration{0, day, 3 * day}, Subscription{Cycle: 1, Status: SubActive, Charged: 1_000}, true, cycle},
-		{"lapses when the last retry fails", Subscription{}, []Decision{decline(DeclineOverLimit), decline(DeclineOverLimit), decline(DeclineVelocity), decline(DeclineOverLimit)}, 0,
+		{"lapses when the last retry fails", 0, Subscription{}, []Decision{decline(DeclineOverLimit), decline(DeclineOverLimit), decline(DeclineVelocity), decline(DeclineOverLimit)}, 0,
 			[]time.Duration{0, day, 3 * day, 7 * day}, Subscription{Cycle: 1, Status: SubLapsed, Failures: 4, LastReason: DeclineOverLimit}, false, 7 * day},
-		{"a closed card ends it", Subscription{}, []Decision{decline(DeclineClosed)}, 0,
+		{"a closed card ends it", 0, Subscription{}, []Decision{decline(DeclineClosed)}, 0,
 			[]time.Duration{0}, Subscription{Cycle: 1, Status: SubEnded, Failures: 1, LastReason: DeclineClosed}, false, 0},
-		{"an unknown card ends it", Subscription{}, []Decision{decline(DeclineUnknownCard)}, 0,
+		{"an unknown card ends it", 0, Subscription{}, []Decision{decline(DeclineUnknownCard)}, 0,
 			[]time.Duration{0}, Subscription{Cycle: 1, Status: SubEnded, Failures: 1, LastReason: DeclineUnknownCard}, false, 0},
-		{"cancelled between charges", Subscription{}, []Decision{approve()}, 5 * day,
+		{"cancelled between charges", 0, Subscription{}, []Decision{approve()}, 5 * day,
 			[]time.Duration{0}, Subscription{Cycle: 1, Status: SubCancelled, Charged: 1_000}, false, 5 * day},
-		{"cancelled while past due: no more retries", Subscription{}, []Decision{decline(DeclineOverLimit)}, 12 * time.Hour,
+		{"retries outlast a short cycle: the next one starts right after the charge", 2 * day, Subscription{}, []Decision{decline(DeclineOverLimit), decline(DeclineOverLimit), approve()}, 0,
+			[]time.Duration{0, day, 3 * day}, Subscription{Cycle: 1, Status: SubActive, Charged: 1_000}, true, 3 * day},
+		{"cancelled while past due: no more retries", 0, Subscription{}, []Decision{decline(DeclineOverLimit)}, 12 * time.Hour,
 			[]time.Duration{0}, Subscription{Cycle: 1, Status: SubCancelled, Failures: 1, LastReason: DeclineOverLimit}, false, 12 * time.Hour},
 	}
 	for _, tt := range tests {
@@ -56,10 +59,10 @@ func TestSubscriptionCycle(t *testing.T) {
 			start := env.Now()
 			var at []time.Duration
 			var ids []string
-			env.OnActivity("ChargeCard", mock.Anything, mock.Anything).Return(func(_ context.Context, c Charge) (Decision, error) {
-				at, ids = append(at, env.Now().Sub(start)), append(ids, c.AuthID)
-				if c.Number != "card-1" || c.Amount != 1_000 || c.Merchant != "streamer" {
-					return Decision{}, fmt.Errorf("charge %+v, want card-1's 1000 at streamer", c)
+			env.OnActivity("ChargeCard", mock.Anything, mock.Anything, mock.Anything).Return(func(_ context.Context, id string, req AuthRequest) (Decision, error) {
+				at, ids = append(at, env.Now().Sub(start)), append(ids, id)
+				if req != (AuthRequest{CardID: "card-1", Amount: 1_000, Merchant: "streamer"}) {
+					return Decision{}, fmt.Errorf("charge %+v, want card-1's 1000 at streamer", req)
 				}
 				return tt.decisions[len(at)-1], nil
 			})
@@ -69,7 +72,7 @@ func TestSubscriptionCycle(t *testing.T) {
 			}
 			sent := sendSteps(env, steps)
 
-			env.ExecuteWorkflow(SubscriptionWorkflow, SubscriptionTerms{ID: "s1", CardID: "card-1", Merchant: "streamer", Amount: 1_000}, tt.last)
+			env.ExecuteWorkflow(SubscriptionWorkflow, SubscriptionTerms{ID: "s1", CardID: "card-1", Merchant: "streamer", Amount: 1_000, Cycle: tt.cycle}, tt.last)
 
 			checkSteps(t, steps, sent)
 			if fmt.Sprint(at) != fmt.Sprint(tt.wantAt) {
@@ -103,57 +106,6 @@ func TestSubscriptionCycle(t *testing.T) {
 				t.Errorf("run ended at %v, want %v", end, tt.endAt)
 			}
 		})
-	}
-}
-
-// The billing date doesn't drift: retries that outlast a short cycle start
-// the next one as soon as the charge lands.
-func TestSubscriptionRetriesOutlastCycle(t *testing.T) {
-	var s testsuite.WorkflowTestSuite
-	env := s.NewTestWorkflowEnvironment()
-	env.RegisterActivity(&Activities{Ledger: NewMemLedger(), Config: card1()})
-	start, n := env.Now(), 0
-	env.OnActivity("ChargeCard", mock.Anything, mock.Anything).Return(func(context.Context, Charge) (Decision, error) {
-		n++
-		if n < 3 {
-			return decline(DeclineOverLimit), nil
-		}
-		return approve(), nil
-	})
-
-	env.ExecuteWorkflow(SubscriptionWorkflow, SubscriptionTerms{ID: "s1", CardID: "card-1", Merchant: "streamer", Amount: 1_000, Cycle: 2 * day}, Subscription{})
-
-	var can *workflow.ContinueAsNewError
-	if !errors.As(env.GetWorkflowError(), &can) {
-		t.Fatalf("want continue-as-new, got %v", env.GetWorkflowError())
-	}
-	if end := env.Now().Sub(start); end != 3*day {
-		t.Errorf("next cycle at %v, want 3 days: right after the charge that landed past the 2-day cycle", end)
-	}
-}
-
-// The query shows where a subscription stands mid-cycle.
-func TestSubscriptionQuery(t *testing.T) {
-	var s testsuite.WorkflowTestSuite
-	env := s.NewTestWorkflowEnvironment()
-	env.RegisterActivity(&Activities{Ledger: NewMemLedger(), Config: card1()})
-	env.OnActivity("ChargeCard", mock.Anything, mock.Anything).Return(decline(DeclineFrozen), nil)
-	env.RegisterDelayedCallback(func() {
-		v, err := env.QueryWorkflow(SubscriptionQuery)
-		var got Subscription
-		if err == nil {
-			err = v.Get(&got)
-		}
-		if want := (Subscription{Cycle: 1, Status: SubPastDue, Failures: 1, LastReason: DeclineFrozen}); err != nil || got != want {
-			t.Errorf("query = %+v, %v; want %+v", got, err, want)
-		}
-	}, 12*time.Hour)
-
-	env.ExecuteWorkflow(SubscriptionWorkflow, SubscriptionTerms{ID: "s1", CardID: "card-1", Merchant: "streamer", Amount: 1_000}, Subscription{})
-
-	var got Subscription
-	if err := env.GetWorkflowResult(&got); err != nil || got.Status != SubLapsed {
-		t.Errorf("result = %+v, %v; want lapsed", got, err)
 	}
 }
 

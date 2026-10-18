@@ -633,15 +633,15 @@ func TestDrills(t *testing.T) {
 			{"declined", func() { admin("freeze", d.card+"-retry") }, Decision{Reason: DeclineFrozen}},
 		} {
 			tt.before()
-			ch := Charge{AuthID: d.card + "-retry-" + tt.name, Number: d.card + "-retry", Merchant: d.merchant, Amount: 1_000}
+			id := d.card + "-retry-" + tt.name
 			for range 2 {
-				if got, err := d.acts.ChargeCard(ctx, ch); err != nil || got != tt.want {
+				if got, err := d.acts.ChargeCard(ctx, id, AuthRequest{CardID: d.card + "-retry", Merchant: d.merchant, Amount: 1_000}); err != nil || got != tt.want {
 					t.Errorf("%s: ChargeCard = %+v, %v; want %+v", tt.name, got, err, tt.want)
 				}
 			}
-			runs, err := c.ListWorkflow(ctx, &workflowservice.ListWorkflowExecutionsRequest{Query: fmt.Sprintf("WorkflowId = %q", ch.AuthID)})
+			runs, err := c.ListWorkflow(ctx, &workflowservice.ListWorkflowExecutionsRequest{Query: fmt.Sprintf("WorkflowId = %q", id)})
 			if err != nil || len(runs.GetExecutions()) != 1 {
-				t.Errorf("%s: %d runs of %s (%v), want 1", tt.name, len(runs.GetExecutions()), ch.AuthID, err)
+				t.Errorf("%s: %d runs of %s (%v), want 1", tt.name, len(runs.GetExecutions()), id, err)
 			}
 		}
 		if p := balance(t, d.l, postedAccount(d.card+"-retry")); p != 1_000 {

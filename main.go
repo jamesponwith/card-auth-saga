@@ -272,10 +272,11 @@ func audit(ctx context.Context, opts client.Options) error {
 // subscriptionCmd starts a subscription, which charges at once and then every
 // cycle, or cancels one. A subscription ID is used once, ever.
 func subscriptionCmd(ctx context.Context, args []string, opts client.Options) error {
-	subscribe := args[0] == "subscribe" && len(args) == 5
-	if !subscribe && !(args[0] == "unsubscribe" && len(args) == 2) || slices.Contains(args[1:], "") {
+	n := map[string]int{"subscribe": 5, "unsubscribe": 2}[args[0]]
+	if len(args) != n || slices.Contains(args[1:], "") {
 		return errUsage
 	}
+	subscribe := n == 5
 	var terms SubscriptionTerms
 	if subscribe {
 		terms = SubscriptionTerms{ID: args[1], CardID: args[2], Merchant: args[3]}

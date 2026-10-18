@@ -57,14 +57,6 @@ type Subscription struct {
 	LastReason string
 }
 
-// Charge is one attempt at a cycle's charge.
-type Charge struct {
-	AuthID   string
-	Number   string
-	Merchant string
-	Amount   int64
-}
-
 // SubscriptionWorkflow runs one cycle per run: it charges at the start,
 // retries a declined charge, and continues as new a full cycle after it
 // began, however long the retries took, so the billing date never drifts.
@@ -82,14 +74,13 @@ func SubscriptionWorkflow(ctx workflow.Context, terms SubscriptionTerms, sub Sub
 	// A charge attempt always has an answer, and a retry finds the same auth,
 	// so the activity retries until it gets one.
 	actx := workflow.WithActivityOptions(ctx, workflow.ActivityOptions{StartToCloseTimeout: time.Minute, RetryPolicy: &temporal.RetryPolicy{}})
-	retries := terms.Retries
-	if retries == nil {
-		retries = DefaultRetries
+	if terms.Retries == nil {
+		terms.Retries = DefaultRetries
 	}
 	for attempt := 0; ; attempt++ {
-		c := Charge{fmt.Sprintf("%s:c%d:a%d", SubscriptionWorkflowID(terms.ID), sub.Cycle, attempt), terms.CardID, terms.Merchant, terms.Amount}
+		id := fmt.Sprintf("%s:c%d:a%d", SubscriptionWorkflowID(terms.ID), sub.Cycle, attempt)
 		var dec Decision
-		if err := workflow.ExecuteActivity(actx, a.ChargeCard, c).Get(ctx, &dec); err != nil {
+		if err := workflow.ExecuteActivity(actx, a.ChargeCard, id, AuthRequest{CardID: terms.CardID, Amount: terms.Amount, Merchant: terms.Merchant}).Get(ctx, &dec); err != nil {
 			return sub, err
 		}
 		if dec.Approved {
@@ -101,12 +92,12 @@ func SubscriptionWorkflow(ctx workflow.Context, terms SubscriptionTerms, sub Sub
 		case slices.Contains([]string{DeclineClosed, DeclineUnknownCard}, dec.Reason):
 			sub.Status = SubEnded
 			return sub, nil
-		case attempt == len(retries):
+		case attempt == len(terms.Retries):
 			sub.Status = SubLapsed
 			return sub, nil
 		}
 		sub.Status = SubPastDue
-		if stopped, err := workflow.AwaitWithTimeout(ctx, retries[attempt], func() bool { return cancelled }); err != nil || stopped {
+		if stopped, err := workflow.AwaitWithTimeout(ctx, terms.Retries[attempt], func() bool { return cancelled }); err != nil || stopped {
 			sub.Status = SubCancelled
 			return sub, err
 		}
@@ -124,19 +115,19 @@ func SubscriptionWorkflow(ctx workflow.Context, terms SubscriptionTerms, sub Sub
 // ChargeCard makes one attempt at a charge as a network would: an authorize
 // on the card's current number (the account updater, SPEC M19), then a full
 // capture. A retry attaches to the same auth and capture (ADR 0010).
-func (a *Activities) ChargeCard(ctx context.Context, c Charge) (Decision, error) {
-	if a.Temporal == nil {
+func (a *Activities) ChargeCard(ctx context.Context, authID string, req AuthRequest) (Decision, error) {
+	if a.Temporal == nil { // fail the subscription where the audit sees it, not panic and retry forever
 		return Decision{}, temporal.NewNonRetryableApplicationError("charges need a Temporal client", "NoClient", nil)
 	}
-	number, err := a.Config.CurrentNumber(ctx, c.Number)
-	if err != nil {
+	var err error
+	if req.CardID, err = a.Config.CurrentNumber(ctx, req.CardID); err != nil {
 		return Decision{}, err
 	}
-	dec, _, err := authorizeAndCapture(ctx, a.Temporal, c.AuthID, AuthRequest{CardID: number, Amount: c.Amount, Merchant: c.Merchant})
+	dec, _, err := authorizeAndCapture(ctx, a.Temporal, authID, req)
 	var started *serviceerror.WorkflowExecutionAlreadyStarted
 	if errors.As(err, &started) { // a retry after the declined auth finished: its answer stands
 		var res AuthResult
-		if err := a.Temporal.GetWorkflow(ctx, c.AuthID, "").Get(ctx, &res); err != nil {
+		if err := a.Temporal.GetWorkflow(ctx, authID, "").Get(ctx, &res); err != nil {
 			return Decision{}, err
 		}
 		return Decision{Approved: res.Status != StatusDeclined, Reason: res.Reason}, nil
