@@ -234,6 +234,35 @@ on demand with `go run . audit`. It reports findings rather than fixing anything
   started before this replay unchanged: an old `PlaceHold` result is only `true`/`false`, and statement
   runs gate the new close step with `GetVersion("end-when-closed")`.
 
+## Card replacement (M18)
+
+A lost or stolen card gets a new number on the same account (ADR 0009):
+`go run . replace <card> <new-number>`.
+
+- **One account, many numbers.** The ID a card was created with is its account ID: its ledger
+  accounts, `cards` row, `statement:<id>` and `CardID` attribute keep using it. `card_numbers`
+  (migration 7, backfilled with each card's own ID) maps each number to its account. Replacing marks
+  the old number `replaced_at` and adds the new one. Its primary key means a number can belong to
+  only one account, ever.
+- **Auths.** `ResolveCard` is a local activity that runs before `PlaceHold`. It maps the number to its
+  account. A replaced number declines with `Reason: Replaced` and no attempt recorded, so a thief
+  trying the old number can't trip the new card's velocity check. Otherwise the auth puts the account
+  in `AuthRequest.CardID` and tags itself with it, so holds, captures, refunds, disputes, rewards,
+  velocity and the audit all see one card. A number with no row is its own account, so an unknown
+  number still declines `UnknownCard`.
+- **Auths already running** on the old number carry on: captures, refunds and disputes settle on the
+  account as usual.
+- **Admin commands** (`set-limit`, `set-apr`, `freeze`, `unfreeze`, `close`, `replace`) accept any of the
+  card's numbers and act on its account. `set-limit` with a new ID creates the card and its number,
+  and refuses an ID that is already another card's number.
+- **Refused:** replacing a number that was already replaced, a closed card, an unknown card, or
+  replacing with a number already in use. The new number follows card-ID rules (no `:`, quotes or `\`).
+  The card's status is unchanged, so a card frozen when it was reported lost stays frozen until `unfreeze`.
+- **Accepted race:** an auth that resolved its number just before the replacement committed can still
+  be approved on the old number. That's the same window a network has, and the auth still settles on
+  the account.
+- Runs started earlier replay unchanged: they never resolve, and their `CardID` is their account.
+
 ## Non-goals
 
 - Real card networks (ISO 8583), PCI scope, or real money.
@@ -260,6 +289,7 @@ on demand with `go run . audit`. It reports findings rather than fixing anything
 - **M15**: Nightly ledger auditor on a Temporal Schedule.
 - **M16**: Freezing and closing cards.
 - **M17**: Deploy to Fly.io on release tags (ADR 0007).
+- **M18**: Card replacement: a new number on the same account (ADR 0009).
 
 ## Success criteria
 

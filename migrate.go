@@ -63,6 +63,16 @@ var migrations = [][]string{
 	{ // 6: one lock row per card, serializing its velocity attempts
 		`CREATE TABLE IF NOT EXISTS attempt_locks (card VARCHAR(191) PRIMARY KEY)`,
 	},
+	{ // 7: card numbers, so a replacement number authorizes on its account (ADR 0009)
+		`CREATE TABLE IF NOT EXISTS card_numbers (
+			number      VARCHAR(191) PRIMARY KEY, -- one account per number, ever
+			account     VARCHAR(191) NOT NULL,
+			replaced_at DATETIME(6) NULL,         -- set once a newer number takes over
+			INDEX (account),
+			FOREIGN KEY (account) REFERENCES cards (id)
+		)`,
+		`INSERT IGNORE INTO card_numbers (number, account) SELECT id, id FROM cards`,
+	},
 }
 
 // mysqlDupColumn is ADD COLUMN on a column that exists: MySQL has no

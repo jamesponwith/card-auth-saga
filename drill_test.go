@@ -8,6 +8,7 @@ package main
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"encoding/json"
 	"errors"
@@ -25,6 +26,7 @@ import (
 	enumspb "go.temporal.io/api/enums/v1"
 	historypb "go.temporal.io/api/history/v1"
 	"go.temporal.io/api/temporalproto"
+	"go.temporal.io/api/workflowservice/v1"
 	"go.temporal.io/sdk/client"
 	"go.temporal.io/sdk/testsuite"
 	"go.temporal.io/sdk/worker"
@@ -98,7 +100,7 @@ func TestDrills(t *testing.T) {
 		d.startWorker()
 		req := AuthRequest{Amount: 40_000, RefundWindow: time.Second}
 		for range 2 { // the network retries: same auth ID, same answer, one hold
-			if !d.authorize(req) {
+			if !d.authorize(d.card, req).Approved {
 				t.Fatal("want approved")
 			}
 		}
@@ -116,7 +118,7 @@ func TestDrills(t *testing.T) {
 		slow := &slowFirstLedger{delay: 1500 * time.Millisecond, seen: map[string]bool{}}
 		d := newDrill(t, c, "updates", slow)
 		d.startWorker()
-		if !d.authorize(AuthRequest{Amount: 40_000, RefundWindow: time.Second}) {
+		if !d.authorize(d.card, AuthRequest{Amount: 40_000, RefundWindow: time.Second}).Approved {
 			t.Fatal("want approved")
 		}
 		if err := d.update(CaptureSignal, "c1", Capture{Amount: 40_000}); err != nil {
@@ -142,7 +144,7 @@ func TestDrills(t *testing.T) {
 	t.Run("increments and split capture", func(t *testing.T) {
 		d := newDrill(t, c, "split", nil)
 		d.startWorker()
-		if !d.authorize(AuthRequest{Amount: 40_000, RefundWindow: time.Second}) {
+		if !d.authorize(d.card, AuthRequest{Amount: 40_000, RefundWindow: time.Second}).Approved {
 			t.Fatal("want approved")
 		}
 		for _, inc := range []struct {
@@ -248,7 +250,7 @@ func TestDrills(t *testing.T) {
 		d.startWorker()
 		// Seconds-long deadlines; refunds and disputes open for 6s after settlement.
 		req := AuthRequest{Amount: 40_000, RefundWindow: 6 * time.Second, MerchantResponse: 2 * time.Second, DisputeReview: 2 * time.Second}
-		if !d.authorize(req) {
+		if !d.authorize(d.card, req).Approved {
 			t.Fatal("want approved")
 		}
 		steps := []struct {
@@ -488,10 +490,69 @@ func TestDrills(t *testing.T) {
 		}
 	})
 
+	t.Run("card replacement", func(t *testing.T) {
+		dsn := os.Getenv("CAS_MYSQL_DSN")
+		if dsn == "" {
+			t.Skip("card numbers live in MySQL; set CAS_MYSQL_DSN")
+		}
+		d := newDrill(t, c, "replace", nil)
+		d.startWorker()
+		ctx := context.Background()
+		env := envOf(map[string]string{"CAS_MYSQL_DSN": dsn, "TEMPORAL_ADDRESS": srv.FrontendHostPort()})
+		old, replacement := d.card, d.card+"-new"
+		ask := func(id, number string, amount int64) Decision { // what the network sends: the number on the card
+			return d.authorize(id, AuthRequest{CardID: number, Amount: amount, RefundWindow: time.Second})
+		}
+		capture := func(id string, amount int64) {
+			t.Helper()
+			if err := d.updateOn(id, CaptureSignal, "", Capture{Amount: amount}, nil); err != nil {
+				t.Fatal(err)
+			}
+		}
+
+		// Held on the old number when the card is reported lost.
+		if !ask(old+"-a1", old, 30_000).Approved {
+			t.Fatal("auth on the card before replacement: want approved")
+		}
+		if err := run(ctx, []string{"replace", old, replacement}, env); err != nil {
+			t.Fatal(err)
+		}
+		if dec := ask(old+"-a2", old, 1_000); dec.Approved || dec.Reason != DeclineReplaced {
+			t.Errorf("old number after replacement = %+v, want declined %s", dec, DeclineReplaced)
+		}
+		if !ask(old+"-a3", replacement, 40_000).Approved { // 30,000 still held: the limit is shared
+			t.Fatal("new number: want approved")
+		}
+		if dec := ask(old+"-a4", replacement, 40_000); dec.Approved || dec.Reason != DeclineOverLimit {
+			t.Errorf("new number past the shared limit = %+v, want declined %s", dec, DeclineOverLimit)
+		}
+		capture(old+"-a1", 30_000)
+		capture(old+"-a3", 40_000)
+		d.expect(c.GetWorkflow(ctx, old+"-a1", ""), AuthResult{Status: StatusCaptured, Captured: 30_000, Points: 300})
+		d.expect(c.GetWorkflow(ctx, old+"-a2", ""), AuthResult{Status: StatusDeclined, Reason: DeclineReplaced})
+		d.expect(c.GetWorkflow(ctx, old+"-a3", ""), AuthResult{Status: StatusCaptured, Captured: 40_000, Points: 400})
+		d.expectBalances(0, 70_000, 700) // one account: both numbers' spend and points
+		if b := balance(t, d.l, postedAccount(replacement)); b != 0 {
+			t.Errorf("the new number has ledger accounts of its own: posted %d", b)
+		}
+		// Every auth is tagged with the account, so the audit and the statement's
+		// end-of-life check see them all on one card.
+		var tagged int64
+		for deadline := time.Now().Add(10 * time.Second); time.Now().Before(deadline) && tagged != 4; time.Sleep(200 * time.Millisecond) {
+			n, err := c.CountWorkflow(ctx, &workflowservice.CountWorkflowExecutionsRequest{Query: fmt.Sprintf("CardID = %q", old)})
+			if err == nil {
+				tagged = n.GetCount()
+			}
+		}
+		if tagged != 4 {
+			t.Errorf("auths tagged %s: %d, want all 4", old, tagged)
+		}
+	})
+
 	t.Run("update with start declined", func(t *testing.T) {
 		d := newDrill(t, c, "uws-decline", nil)
 		d.startWorker()
-		if d.authorize(AuthRequest{Amount: 100_001}) {
+		if d.authorize(d.card, AuthRequest{Amount: 100_001}).Approved {
 			t.Fatal("want declined")
 		}
 		d.expect(d.c.GetWorkflow(context.Background(), d.card, ""), AuthResult{Status: StatusDeclined, Reason: DeclineOverLimit})
@@ -558,13 +619,14 @@ func (d *drill) start(req AuthRequest) client.WorkflowRun {
 	return run
 }
 
-// authorize starts the auth (or attaches to the running one) and waits for the decision.
-func (d *drill) authorize(req AuthRequest) bool {
+// authorize starts auth id (or attaches to the running one) and waits for the
+// decision. The auth is on the drill's card unless req names another number.
+func (d *drill) authorize(id string, req AuthRequest) Decision {
 	d.t.Helper()
-	req.CardID, req.Merchant = d.card, d.merchant
+	req.CardID, req.Merchant = cmp.Or(req.CardID, d.card), d.merchant
 	ctx := context.Background()
 	start := d.c.NewWithStartWorkflowOperation(client.StartWorkflowOptions{
-		ID: d.card, TaskQueue: TaskQueue, WorkflowIDConflictPolicy: enumspb.WORKFLOW_ID_CONFLICT_POLICY_USE_EXISTING,
+		ID: id, TaskQueue: TaskQueue, WorkflowIDConflictPolicy: enumspb.WORKFLOW_ID_CONFLICT_POLICY_USE_EXISTING,
 	}, AuthorizeWorkflow, req)
 	h, err := d.c.UpdateWithStartWorkflow(ctx, client.UpdateWithStartWorkflowOptions{
 		StartWorkflowOperation: start,
@@ -577,7 +639,7 @@ func (d *drill) authorize(req AuthRequest) bool {
 	if err := h.Get(ctx, &dec); err != nil {
 		d.t.Fatal(err)
 	}
-	return dec.Approved
+	return dec
 }
 
 // update sends an update to the drill's workflow and waits for it to finish.
@@ -585,8 +647,13 @@ func (d *drill) update(name, id string, arg any) error { return d.updateResult(n
 
 // updateResult is update, decoding the update's result into result.
 func (d *drill) updateResult(name, id string, arg, result any) error {
+	return d.updateOn(d.card, name, id, arg, result)
+}
+
+// updateOn is updateResult on another of the drill's workflows.
+func (d *drill) updateOn(workflowID, name, id string, arg, result any) error {
 	h, err := d.c.UpdateWorkflow(context.Background(), client.UpdateWorkflowOptions{
-		WorkflowID: d.card, UpdateID: id, UpdateName: name, Args: []any{arg},
+		WorkflowID: workflowID, UpdateID: id, UpdateName: name, Args: []any{arg},
 		WaitForStage: client.WorkflowUpdateStageCompleted,
 	})
 	if err != nil {

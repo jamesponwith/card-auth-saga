@@ -204,9 +204,81 @@ func (l *MySQLLedger) SetCreditLimit(ctx context.Context, card string, limit int
 	} else if ok && status == CardClosed {
 		return fmt.Errorf("card %q is closed", card)
 	}
-	_, err := l.db.ExecContext(ctx, `INSERT INTO cards (id, credit_limit) VALUES (?, ?) AS new
-		ON DUPLICATE KEY UPDATE credit_limit = IF(cards.status = 'closed', cards.credit_limit, new.credit_limit)`, card, limit)
-	return err
+	return l.tx(ctx, func(tx *sql.Tx) error {
+		// Locks the number, or the gap where it would go, so a replacement
+		// taking it waits for this card and then finds it in use.
+		var account string
+		switch err := tx.QueryRowContext(ctx, `SELECT account FROM card_numbers WHERE number = ? FOR UPDATE`, card).Scan(&account); {
+		case err == nil && account != card:
+			return fmt.Errorf("%q is a number of card %q, not a card of its own", card, account)
+		case err != nil && !errors.Is(err, sql.ErrNoRows):
+			return err
+		}
+		if _, err := tx.ExecContext(ctx, `INSERT INTO cards (id, credit_limit) VALUES (?, ?) AS new
+			ON DUPLICATE KEY UPDATE credit_limit = IF(cards.status = 'closed', cards.credit_limit, new.credit_limit)`, card, limit); err != nil {
+			return err
+		}
+		_, err := tx.ExecContext(ctx, `INSERT IGNORE INTO card_numbers (number, account) VALUES (?, ?)`, card, card)
+		return err
+	})
+}
+
+// tx runs f in a transaction, and commits if f succeeds.
+func (l *MySQLLedger) tx(ctx context.Context, f func(*sql.Tx) error) error {
+	tx, err := l.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }() // no-op after Commit
+	if err := f(tx); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func (l *MySQLLedger) CardAccount(ctx context.Context, number string) (string, bool, error) {
+	var account string
+	var replaced bool
+	err := l.db.QueryRowContext(ctx, `SELECT account, replaced_at IS NOT NULL FROM card_numbers WHERE number = ?`, number).Scan(&account, &replaced)
+	if errors.Is(err, sql.ErrNoRows) {
+		return number, false, nil
+	}
+	return account, replaced, err
+}
+
+// ReplaceCard retires number and gives its account the replacement number.
+// Only a card's current number can be replaced, and not on a closed card;
+// a number already in use anywhere is refused by card_numbers' primary key.
+func (l *MySQLLedger) ReplaceCard(ctx context.Context, number, replacement string) error {
+	return l.tx(ctx, func(tx *sql.Tx) error {
+		var account string
+		var replaced bool
+		err := tx.QueryRowContext(ctx, `SELECT account, replaced_at IS NOT NULL FROM card_numbers WHERE number = ? FOR UPDATE`, number).Scan(&account, &replaced)
+		switch {
+		case errors.Is(err, sql.ErrNoRows):
+			return fmt.Errorf("no card %q", number)
+		case err != nil:
+			return err
+		case replaced:
+			return fmt.Errorf("card %q was already replaced", number)
+		}
+		var status string
+		if err := tx.QueryRowContext(ctx, `SELECT status FROM cards WHERE id = ? FOR UPDATE`, account).Scan(&status); err != nil {
+			return err
+		}
+		if status == CardClosed {
+			return fmt.Errorf("card %q is closed", account)
+		}
+		if _, err := tx.ExecContext(ctx, `UPDATE card_numbers SET replaced_at = NOW(6) WHERE number = ?`, number); err != nil {
+			return err
+		}
+		_, err = tx.ExecContext(ctx, `INSERT INTO card_numbers (number, account) VALUES (?, ?)`, replacement, account)
+		var me *mysql.MySQLError
+		if errors.As(err, &me) && me.Number == mysqlDupKey {
+			return fmt.Errorf("number %q is in use", replacement)
+		}
+		return err
+	})
 }
 
 func (l *MySQLLedger) CardStatus(ctx context.Context, card string) (string, bool, error) {

@@ -10,6 +10,7 @@
 //	card-auth-saga set-apr <card> <basis-points>  set a card's APR, from its next statement (MySQL)
 //	card-auth-saga set-rate <merchant> <points>   set a partner's points per $1 (MySQL)
 //	card-auth-saga freeze|unfreeze|close <card>   decline new auths; closing is final (MySQL)
+//	card-auth-saga replace <card> <new-number>    a new number on the same account; the old one declines (MySQL)
 //	card-auth-saga audit                          run the ledger audit now; exits non-zero on findings
 package main
 
@@ -132,29 +133,44 @@ func run(ctx context.Context, args []string, env func(string) string) error {
 	return w.Run(stopped) // until ctx is cancelled: SIGINT or SIGTERM in main
 }
 
-var errUsage = errors.New("usage: card-auth-saga [set-limit <card> <cents> | set-apr <card> <basis-points> | set-rate <merchant> <points-per-dollar> | freeze|unfreeze|close <card> | audit]")
+var errUsage = errors.New("usage: card-auth-saga [set-limit <card> <cents> | set-apr <card> <basis-points> | set-rate <merchant> <points-per-dollar> | freeze|unfreeze|close <card> | replace <card> <new-number> | audit]")
 
 // adminCmd applies a parsed admin command. Temporal options reach set-limit,
 // which also starts the card's statements.
 type adminCmd func(context.Context, *MySQLLedger, client.Options) error
 
 // admin parses an admin command. Bad values such as a negative limit are left
-// to the tables' CHECK constraints.
+// to the tables' CHECK constraints. A card may be named by any of its numbers:
+// the command acts on its account (SPEC M18).
 func admin(args []string) (adminCmd, error) {
 	statuses := map[string]string{"freeze": CardFrozen, "unfreeze": CardActive, "close": CardClosed}
 	if status, ok := statuses[args[0]]; ok && len(args) == 2 && args[1] != "" {
 		id := args[1]
-		return func(ctx context.Context, l *MySQLLedger, _ client.Options) error {
-			return l.SetCardStatus(ctx, id, status)
-		}, nil
+		return onAccount(id, func(ctx context.Context, l *MySQLLedger, _ client.Options, account string) error {
+			return l.SetCardStatus(ctx, account, status)
+		}), nil
 	}
-	if len(args) != 3 || args[1] == "" || !slices.Contains([]string{"set-limit", "set-apr", "set-rate"}, args[0]) {
+	if len(args) != 3 || args[1] == "" || args[2] == "" || !slices.Contains([]string{"set-limit", "set-apr", "set-rate", "replace"}, args[0]) {
 		return nil, errUsage
 	}
 	id := args[1]
 	// Account IDs are card:<id>:<kind>, and the audit quotes card IDs in visibility queries.
-	if args[0] != "set-rate" && strings.ContainsAny(id, `:'"\`) {
-		return nil, fmt.Errorf("%s: card ID %q can't contain : ' \" or \\", args[0], id)
+	cardIDs := args[1:2]
+	switch args[0] {
+	case "set-rate": // merchants aren't card IDs
+		cardIDs = nil
+	case "replace":
+		cardIDs = args[1:]
+	}
+	for _, c := range cardIDs {
+		if strings.ContainsAny(c, `:'"\`) {
+			return nil, fmt.Errorf("%s: card ID %q can't contain : ' \" or \\", args[0], c)
+		}
+	}
+	if args[0] == "replace" {
+		return func(ctx context.Context, l *MySQLLedger, _ client.Options) error {
+			return l.ReplaceCard(ctx, id, args[2])
+		}, nil
 	}
 	n, err := strconv.ParseInt(args[2], 10, 64)
 	if err != nil {
@@ -162,18 +178,32 @@ func admin(args []string) (adminCmd, error) {
 	}
 	switch args[0] {
 	case "set-limit":
-		return func(ctx context.Context, l *MySQLLedger, opts client.Options) error {
-			if err := l.SetCreditLimit(ctx, id, n); err != nil {
+		return onAccount(id, func(ctx context.Context, l *MySQLLedger, opts client.Options, account string) error {
+			if err := l.SetCreditLimit(ctx, account, n); err != nil {
 				return err
 			}
-			return startStatement(ctx, opts, id)
-		}, nil
+			return startStatement(ctx, opts, account)
+		}), nil
 	case "set-apr":
-		return func(ctx context.Context, l *MySQLLedger, _ client.Options) error { return l.SetAPR(ctx, id, n) }, nil
+		return onAccount(id, func(ctx context.Context, l *MySQLLedger, _ client.Options, account string) error {
+			return l.SetAPR(ctx, account, n)
+		}), nil
 	case "set-rate":
 		return func(ctx context.Context, l *MySQLLedger, _ client.Options) error { return l.SetRewardRate(ctx, id, n) }, nil
 	}
 	return nil, errUsage
+}
+
+// onAccount runs f on the account a card number belongs to. A new ID is its
+// own account, so set-limit can create it.
+func onAccount(number string, f func(context.Context, *MySQLLedger, client.Options, string) error) adminCmd {
+	return func(ctx context.Context, l *MySQLLedger, opts client.Options) error {
+		account, _, err := l.CardAccount(ctx, number)
+		if err != nil {
+			return err
+		}
+		return f(ctx, l, opts, account)
+	}
 }
 
 // startStatement starts the card's statement cycle, or leaves the running one
