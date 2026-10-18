@@ -78,6 +78,16 @@ The first command answers `{"Approved":true}` as soon as the hold is decided, or
 with `OverLimit`, `Velocity` or `UnknownCard` (or `Frozen`, `Closed` or `Replaced`, below). The workflow keeps running. Running it again on the same `--workflow-id`, as a network retry would, returns
 the same answer without placing a second hold (SPEC.md, M6).
 
+A real network waits about 2 seconds, then gives up and sends a timeout reversal (SPEC.md, M20).
+`go run . authorize` plays that network:
+
+```sh
+go run . authorize auth-9 card-1 shell 1000   # approved, declined (Reason), or Timeout and reversed
+```
+
+A reversal is safe whenever it lands. Before the hold, none is placed. While the hold is being placed,
+it's released once it lands. After a decline, there's nothing to undo.
+
 `capture`, `reverse` and `refund` are updates: each returns once the ledger posts. A bad request is
 rejected with the reason: a capture outside the hold, a second capture, a refund over what's left, or
 a used refund ID. A retry with the same `--update-id` gets the first result back. The same names also

@@ -571,6 +571,39 @@ func TestCardReplacement(t *testing.T) {
 	}
 }
 
+// A network that gives up on a slow decision sends a timeout reversal, which
+// can arrive while the auth is still deciding. It's accepted, and the hold
+// it would have stood behind is never placed (SPEC M20).
+func TestReversalBeforeTheHold(t *testing.T) {
+	var s testsuite.WorkflowTestSuite
+	env := s.NewTestWorkflowEnvironment()
+	l := NewMemLedger()
+	env.RegisterActivity(&Activities{Ledger: l, Config: card1()})
+	steps := []step{upd(reverse(0), "ok")} // delivered with the start, before the hold
+	got := sendSteps(env, steps)
+
+	env.ExecuteWorkflow(AuthorizeWorkflow, auth("card-1", 40_000))
+
+	checkSteps(t, steps, got)
+	var res AuthResult
+	if err := env.GetWorkflowResult(&res); err != nil {
+		t.Fatal(err)
+	}
+	if res != (AuthResult{Status: StatusReversed}) {
+		t.Errorf("result = %+v, want reversed", res)
+	}
+	accounts, err := l.Accounts(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(accounts) != 0 {
+		t.Errorf("ledger touched: %v; a reversal before the hold places none", accounts)
+	}
+	if n, err := l.RecordAttempt(context.Background(), "card-1", "probe", time.Now(), VelocityWindow); err != nil || n != 1 {
+		t.Errorf("attempts = %d (%v), want only the probe: no hold was tried", n, err)
+	}
+}
+
 // Each auth tags itself with its card, so card-scoped visibility finds it.
 func TestAuthTagsCardID(t *testing.T) {
 	var s testsuite.WorkflowTestSuite

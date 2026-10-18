@@ -53,6 +53,8 @@ const (
 	DeclineFrozen      = "Frozen"
 	DeclineClosed      = "Closed"
 	DeclineReplaced    = "Replaced" // a number its card has been given a replacement for (M18)
+	DeclineTimeout     = "Timeout"  // the network's: no decision in time, so it reversed (M20)
+	DeclineReversed    = "Reversed" // a timeout reversal beat the decision; no hold stands
 )
 
 // Decision is the authorize update's answer.
@@ -159,6 +161,13 @@ func AuthorizeWorkflow(ctx workflow.Context, req AuthRequest) (AuthResult, error
 		s.phase, s.reason = StatusDeclined, DeclineReplaced
 		return AuthResult{Status: StatusDeclined, Reason: s.reason}, nil
 	}
+	// A timeout reversal that beat the hold: place none (M20). Only a reverse
+	// update accepted while deciding sets this, and runs from before M20
+	// rejected those, so their histories never reach it.
+	if s.reversing {
+		s.phase = StatusReversed
+		return AuthResult{Status: StatusReversed}, nil
+	}
 
 	// Waiting authorize updates run in the same workflow task that ends
 	// deciding, so they answer before a decline or error closes the workflow.
@@ -183,6 +192,12 @@ func AuthorizeWorkflow(ctx workflow.Context, req AuthRequest) (AuthResult, error
 		return AuthResult{Status: StatusDeclined, Reason: s.reason}, nil
 	}
 	s.phase = phaseHolding
+	if s.reversing { // the reversal arrived while the hold was being placed
+		if err := s.release(ctx, StatusReversed); err != nil {
+			return AuthResult{}, err
+		}
+		return AuthResult{Status: StatusReversed}, nil
+	}
 
 	expiry := workflow.NewTimer(ctx, cmp.Or(req.HoldFor, DefaultHoldFor))
 	workflow.Go(ctx, func(ctx workflow.Context) { _ = expiry.Get(ctx, nil); _ = s.release(ctx, StatusExpired) })
@@ -265,14 +280,15 @@ const (
 // in parallel, so a check and the state change after it can't interleave:
 // each step claims its share (phase, seen, reserved) before its first activity.
 type authState struct {
-	a       *Activities
-	req     AuthRequest
-	root    workflow.Context // the workflow's own context, for work that outlives an update handler
-	v       workflow.Version // DefaultVersion: single capture, no increments
-	phase   string
-	holdErr error  // PlaceHold's error, for the authorize update
-	reason  string // a Decline* reason once declined
-	err     error  // a capture, release or refund that could not post
+	a         *Activities
+	req       AuthRequest
+	root      workflow.Context // the workflow's own context, for work that outlives an update handler
+	v         workflow.Version // DefaultVersion: single capture, no increments
+	phase     string
+	reversing bool   // a reverse update arrived while deciding: the hold must not stand
+	holdErr   error  // PlaceHold's error, for the authorize update
+	reason    string // a Decline* reason once declined
+	err       error  // a capture, release or refund that could not post
 
 	held       int64           // open hold: the auth plus increments, less partial captures
 	increments map[string]bool // increment IDs claimed
@@ -296,17 +312,39 @@ func (s *authState) registerUpdates(ctx workflow.Context) error {
 	return errors.Join(
 		workflow.SetUpdateHandler(ctx, AuthorizeUpdate, func(ctx workflow.Context) (Decision, error) {
 			err := workflow.Await(ctx, func() bool { return s.phase != phaseDeciding })
+			if s.reversing && s.phase != StatusDeclined {
+				return Decision{Reason: DeclineReversed}, cmp.Or(err, s.holdErr)
+			}
 			return Decision{Approved: s.phase != StatusDeclined, Reason: s.reason}, cmp.Or(err, s.holdErr)
 		}),
 		workflow.SetUpdateHandlerWithOptions(ctx, CaptureSignal, s.capture,
 			workflow.UpdateHandlerOptions{Validator: func(_ workflow.Context, c Capture) error { return s.checkCapture(c) }}),
 		workflow.SetUpdateHandlerWithOptions(ctx, IncrementUpdate, s.increment,
 			workflow.UpdateHandlerOptions{Validator: func(_ workflow.Context, i Increment) error { return s.checkIncrement(i) }}),
-		workflow.SetUpdateHandlerWithOptions(ctx, ReverseSignal, func(ctx workflow.Context) error { return s.release(ctx, StatusReversed) },
-			workflow.UpdateHandlerOptions{Validator: func(workflow.Context) error { return s.checkHeld() }}),
+		workflow.SetUpdateHandlerWithOptions(ctx, ReverseSignal, s.reverse,
+			workflow.UpdateHandlerOptions{Validator: func(workflow.Context) error {
+				if s.phase == phaseDeciding { // a timeout reversal can beat the decision
+					return nil
+				}
+				return s.checkHeld()
+			}}),
 		workflow.SetUpdateHandlerWithOptions(ctx, RefundSignal, s.refund,
 			workflow.UpdateHandlerOptions{Validator: func(_ workflow.Context, r Refund) error { return s.checkRefund(r) }}),
 	)
+}
+
+// reverse voids the hold. One that arrives while the auth is still deciding
+// is a timeout reversal: the decision path places no hold, or releases the one
+// it just placed, and this returns once nothing is held.
+func (s *authState) reverse(ctx workflow.Context) error {
+	if s.phase != phaseDeciding {
+		return s.release(ctx, StatusReversed)
+	}
+	s.reversing = true
+	if err := workflow.Await(ctx, func() bool { return !slices.Contains([]string{phaseDeciding, phaseHolding, phaseBusy}, s.phase) }); err != nil {
+		return err
+	}
+	return cmp.Or(s.holdErr, s.err)
 }
 
 func (s *authState) checkHeld() error {

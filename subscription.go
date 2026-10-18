@@ -8,9 +8,7 @@ import (
 	"slices"
 	"time"
 
-	enumspb "go.temporal.io/api/enums/v1"
 	"go.temporal.io/api/serviceerror"
-	"go.temporal.io/sdk/client"
 	"go.temporal.io/sdk/temporal"
 	"go.temporal.io/sdk/workflow"
 )
@@ -133,36 +131,4 @@ func (a *Activities) ChargeCard(ctx context.Context, authID string, req AuthRequ
 		return Decision{Approved: res.Status != StatusDeclined, Reason: res.Reason}, nil
 	}
 	return dec, err
-}
-
-// authorizeAndCapture asks for a decision and, if approved, captures in full.
-// decided is how long the decision took, the latency a network waits on. An
-// auth ID is used once: a retry attaches to the running auth, and one that
-// finished (a decline) is refused rather than tried again.
-func authorizeAndCapture(ctx context.Context, c client.Client, id string, req AuthRequest) (dec Decision, decided time.Duration, err error) {
-	began := time.Now()
-	h, err := c.UpdateWithStartWorkflow(ctx, client.UpdateWithStartWorkflowOptions{
-		StartWorkflowOperation: c.NewWithStartWorkflowOperation(client.StartWorkflowOptions{
-			ID: id, TaskQueue: TaskQueue,
-			WorkflowIDConflictPolicy: enumspb.WORKFLOW_ID_CONFLICT_POLICY_USE_EXISTING,
-			WorkflowIDReusePolicy:    enumspb.WORKFLOW_ID_REUSE_POLICY_REJECT_DUPLICATE,
-		}, AuthorizeWorkflow, req),
-		UpdateOptions: client.UpdateWorkflowOptions{UpdateName: AuthorizeUpdate, WaitForStage: client.WorkflowUpdateStageCompleted},
-	})
-	if err != nil {
-		return dec, 0, err
-	}
-	err = h.Get(ctx, &dec)
-	decided = time.Since(began)
-	if err != nil || !dec.Approved {
-		return dec, decided, err
-	}
-	ch, err := c.UpdateWorkflow(ctx, client.UpdateWorkflowOptions{
-		WorkflowID: id, UpdateID: "capture", UpdateName: CaptureSignal, Args: []any{Capture{Amount: req.Amount}},
-		WaitForStage: client.WorkflowUpdateStageCompleted,
-	})
-	if err != nil {
-		return dec, decided, err
-	}
-	return dec, decided, ch.Get(ctx, nil)
 }

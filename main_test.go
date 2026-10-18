@@ -121,6 +121,9 @@ func TestSubscriptionArgs(t *testing.T) {
 		{[]string{"subscribe", "s1", "card-1", "streamer", "-5"}, "not a positive"},
 		{[]string{"subscribe", "s1", "card-1", "streamer", "9.99"}, "not a positive"},
 		{[]string{"subscribe", "s1", "card:1", "streamer", "999"}, "can't contain"},
+		{[]string{"authorize", "a1", "card-1", "shop", "999"}, "dial temporal"},
+		{[]string{"authorize", "a1", "card-1", "shop"}, "usage"},
+		{[]string{"authorize", "a1", "card-1", "shop", "0"}, "not a positive"},
 	}
 	for _, tt := range tests {
 		t.Run(strings.Join(tt.args, " "), func(t *testing.T) {
