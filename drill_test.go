@@ -649,6 +649,130 @@ func TestDrills(t *testing.T) {
 		}
 	})
 
+	t.Run("decision deadline", func(t *testing.T) {
+		// Every hold posts, then stalls 1.5s before PlaceHold returns: the hold
+		// lands after a 300ms network has given up on it.
+		slow := &slowFirstLedger{delay: 1500 * time.Millisecond, seen: map[string]bool{}}
+		d := newDrill(t, c, "deadline", slow)
+		d.startWorker()
+		ctx := context.Background()
+		req := func(amount int64) AuthRequest {
+			return AuthRequest{CardID: d.card, Merchant: d.merchant, Amount: amount, RefundWindow: time.Second}
+		}
+		result := func(id string) AuthResult {
+			t.Helper()
+			wctx, cancel := context.WithTimeout(ctx, 30*time.Second) // a hold left standing would wait 7 days
+			defer cancel()
+			var res AuthResult
+			if err := c.GetWorkflow(ctx, id, "").Get(wctx, &res); err != nil {
+				t.Fatal(err)
+			}
+			d.replay(c.GetWorkflow(ctx, id, ""))
+			return res
+		}
+		runs := func(id string) int {
+			r, err := c.ListWorkflow(ctx, &workflowservice.ListWorkflowExecutionsRequest{Query: fmt.Sprintf("WorkflowId = %q", id)})
+			if err != nil {
+				t.Fatal(err)
+			}
+			return len(r.GetExecutions())
+		}
+
+		// a: the reversal reaches the auth while PlaceHold is still running, and
+		// the hold is released as it lands. An update can reach a workflow
+		// mid-local-activity only when the SDK heartbeats the workflow task, at
+		// 80% of its timeout: a 1s timeout heartbeats inside the 1.5s stall.
+		a := d.card + "-a"
+		answer := make(chan Decision, 1)
+		go func() {
+			var dec Decision
+			start := c.NewWithStartWorkflowOperation(client.StartWorkflowOptions{ID: a, TaskQueue: TaskQueue, WorkflowTaskTimeout: time.Second,
+				WorkflowIDConflictPolicy: enumspb.WORKFLOW_ID_CONFLICT_POLICY_USE_EXISTING}, AuthorizeWorkflow, req(40_000))
+			h, err := c.UpdateWithStartWorkflow(ctx, client.UpdateWithStartWorkflowOptions{StartWorkflowOperation: start,
+				UpdateOptions: client.UpdateWorkflowOptions{UpdateName: AuthorizeUpdate, WaitForStage: client.WorkflowUpdateStageCompleted}})
+			if err == nil {
+				err = h.Get(ctx, &dec)
+			}
+			if err != nil {
+				t.Error(err)
+			}
+			answer <- dec
+		}()
+		d.waitBalance(holdsAccount(d.card), 40_000) // posted; PlaceHold hasn't returned
+		h, err := c.UpdateWorkflow(ctx, client.UpdateWorkflowOptions{WorkflowID: a, UpdateName: ReverseSignal, WaitForStage: client.WorkflowUpdateStageCompleted})
+		if err == nil {
+			err = h.Get(ctx, nil)
+		}
+		if err != nil {
+			t.Fatalf("reversal while deciding: %v", err)
+		}
+		if got := balance(t, d.l, holdsAccount(d.card)); got != 0 {
+			t.Errorf("holds = %d once the reversal returned, want 0", got)
+		}
+		if dec := <-answer; dec != (Decision{Reason: DeclineReversed}) {
+			t.Errorf("decision = %+v, want declined %s: the hold doesn't stand", dec, DeclineReversed)
+		}
+		if res := result(a); res != (AuthResult{Status: StatusReversed}) {
+			t.Errorf("a: %+v, want reversed", res)
+		}
+
+		// b: the network times out and reverses; the late hold is released.
+		b := d.card + "-b"
+		if dec, err := authorizeWithin(ctx, c, b, req(40_000), 300*time.Millisecond); err != nil || dec != (Decision{Reason: DeclineTimeout}) {
+			t.Errorf("b: %+v, %v; want declined %s", dec, err, DeclineTimeout)
+		}
+		if res := result(b); res != (AuthResult{Status: StatusReversed}) {
+			t.Errorf("b: %+v, want reversed", res)
+		}
+
+		// c: a slow decline times out too; its reversal has nothing to undo.
+		cc := d.card + "-c"
+		if dec, err := authorizeWithin(ctx, c, cc, req(100_001), 300*time.Millisecond); err != nil || dec != (Decision{Reason: DeclineTimeout}) {
+			t.Errorf("c: %+v, %v; want declined %s", dec, err, DeclineTimeout)
+		}
+		if res := result(cc); res != (AuthResult{Status: StatusDeclined, Reason: DeclineOverLimit}) {
+			t.Errorf("c: %+v, want declined OverLimit", res)
+		}
+
+		// d: the reversal gets there first; the network's own request, arriving
+		// late, finds the auth finished and places nothing.
+		dd := d.card + "-d"
+		if err := reverseAuth(ctx, c, dd, req(40_000)); err != nil {
+			t.Fatal(err)
+		}
+		if res := result(dd); res != (AuthResult{Status: StatusReversed}) {
+			t.Errorf("d: %+v, want reversed", res)
+		}
+		if dec, err := authorizeWithin(ctx, c, dd, req(40_000), time.Minute); err != nil || dec.Approved {
+			t.Errorf("d: the late request = %+v, %v; want no approval (and, below, no second run)", dec, err)
+		}
+		if err := reverseAuth(ctx, c, dd, req(40_000)); err != nil { // a resent reversal
+			t.Errorf("d: resent reversal: %v", err)
+		}
+		for _, id := range []string{a, b, cc, dd} {
+			if n := runs(id); n != 1 {
+				t.Errorf("%s ran %d times, want once", id, n)
+			}
+		}
+		d.expectBalances(0, 0, 0)
+
+	})
+
+	t.Run("decision in time", func(t *testing.T) { // nothing changes: the hold stands
+		ctx := context.Background()
+		fast := newDrill(t, c, "deadline-fast", nil)
+		fast.startWorker()
+		id := fast.card + "-ok"
+		if dec, err := authorizeWithin(ctx, c, id, AuthRequest{CardID: fast.card, Merchant: fast.merchant, Amount: 40_000}, DecisionDeadline); err != nil || !dec.Approved {
+			t.Fatalf("in time: %+v, %v; want approved", dec, err)
+		}
+		fast.expectBalances(40_000, 0, 0)
+		if err := reverseAuth(ctx, c, id, AuthRequest{}); err != nil { // a reversal of a standing hold releases it
+			t.Fatal(err)
+		}
+		fast.expectBalances(0, 0, 0)
+	})
+
 	t.Run("update with start declined", func(t *testing.T) {
 		d := newDrill(t, c, "uws-decline", nil)
 		d.startWorker()

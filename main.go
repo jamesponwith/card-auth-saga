@@ -12,6 +12,7 @@
 //	card-auth-saga freeze|unfreeze|close <card>   decline new auths; closing is final (MySQL)
 //	card-auth-saga replace <card> <new-number>    a new number on the same account; the old one declines (MySQL)
 //	card-auth-saga audit                          run the ledger audit now; exits non-zero on findings
+//	card-auth-saga authorize <auth-id> <card> <merchant> <cents>   play the network: decide in 2s, or reverse
 //	card-auth-saga subscribe <id> <card> <merchant> <cents>   charge the card every 30 days, from now
 //	card-auth-saga unsubscribe <id>               stop a subscription's future charges
 package main
@@ -55,6 +56,9 @@ func run(ctx context.Context, args []string, env func(string) string) error {
 	}
 	if len(args) > 0 && (args[0] == "subscribe" || args[0] == "unsubscribe") {
 		return subscriptionCmd(ctx, args, temporalOptions)
+	}
+	if len(args) > 0 && args[0] == "authorize" {
+		return authorizeCmd(ctx, args, temporalOptions)
 	}
 	var cmd adminCmd
 	if len(args) > 0 {
@@ -139,7 +143,7 @@ func run(ctx context.Context, args []string, env func(string) string) error {
 	return w.Run(stopped) // until ctx is cancelled: SIGINT or SIGTERM in main
 }
 
-var errUsage = errors.New("usage: card-auth-saga [set-limit <card> <cents> | set-apr <card> <basis-points> | set-rate <merchant> <points-per-dollar> | freeze|unfreeze|close <card> | replace <card> <new-number> | subscribe <id> <card> <merchant> <cents> | unsubscribe <id> | audit]")
+var errUsage = errors.New("usage: card-auth-saga [set-limit <card> <cents> | set-apr <card> <basis-points> | set-rate <merchant> <points-per-dollar> | freeze|unfreeze|close <card> | replace <card> <new-number> | authorize <auth-id> <card> <merchant> <cents> | subscribe <id> <card> <merchant> <cents> | unsubscribe <id> | audit]")
 
 // adminCmd applies a parsed admin command. Temporal options reach set-limit,
 // which also starts the card's statements.
@@ -267,6 +271,34 @@ func audit(ctx context.Context, opts client.Options) error {
 		lines[i] = fmt.Sprintf("  %s %s: %s", f.Check, f.Subject, f.Detail)
 	}
 	return fmt.Errorf("audit: %d findings\n%s", len(report.Findings), strings.Join(lines, "\n"))
+}
+
+// authorizeCmd sends one auth as a network would, with its deadline: the
+// decision, or Timeout and a reversal if none comes in DecisionDeadline.
+func authorizeCmd(ctx context.Context, args []string, opts client.Options) error {
+	if len(args) != 5 || slices.Contains(args[1:], "") {
+		return errUsage
+	}
+	req := AuthRequest{CardID: args[2], Merchant: args[3]}
+	var err error
+	if req.Amount, err = strconv.ParseInt(args[4], 10, 64); err != nil || req.Amount <= 0 {
+		return fmt.Errorf("authorize: %q is not a positive number of cents", args[4])
+	}
+	c, err := client.Dial(opts)
+	if err != nil {
+		return fmt.Errorf("dial temporal: %w", err)
+	}
+	defer c.Close()
+	dec, err := authorizeWithin(ctx, c, args[1], req, DecisionDeadline)
+	switch {
+	case err != nil:
+		return fmt.Errorf("authorize %s: %w", args[1], err)
+	case dec.Approved:
+		fmt.Println("approved:", args[1])
+	default:
+		fmt.Printf("declined: %s (%s)\n", args[1], dec.Reason)
+	}
+	return nil
 }
 
 // subscriptionCmd starts a subscription, which charges at once and then every

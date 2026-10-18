@@ -288,6 +288,32 @@ A subscription charges a card a fixed amount every cycle without the cardholder 
 - The `subscription` query returns the cycle, status, total charged, failures in a row and the last
   decline reason.
 
+## Decision deadline and timeout reversals (M20)
+
+A network waits about 2 seconds for a decision. Without one, it declines the auth itself and sends a
+timeout reversal. The workflow can't impose that deadline. The time is lost before its code runs (a
+workflow task queued behind a busy worker) or inside a local activity, which a timer can't interrupt.
+So the deadline belongs to the caller, as it does in real networks, and the issuer's job is to make
+the reversal safe whenever it lands:
+
+- **Before the hold** (it arrived with the start, or started the auth itself): `reverse` is accepted
+  while deciding, and no hold is placed and no velocity attempt recorded. The auth ends `reversed`.
+- **While the hold is being placed:** the reversal releases the hold as soon as it lands, and the
+  `reverse` update returns once nothing is held. An update reaches a running local activity only when
+  the SDK heartbeats the workflow task, so mostly this is a plain reversal just after the decision.
+- **After a decline, or on an auth that has finished:** there's nothing to reverse, and it succeeds.
+- `authorize` answers `Reversed` when a reversal beat the decision.
+
+`authorizeWithin` (network.go) plays the network. It sends Update-with-Start `authorize` and waits up
+to `DecisionDeadline` (2s). Without an answer, whatever the reason, it sends the reversal and reports
+`Timeout`. The reversal is itself an Update-with-Start, so a start still in flight finds the auth already
+reversed. It uses a fixed update ID, so a resend is a no-op. An auth ID runs once: the network's own
+request, arriving late, starts nothing. `go run . authorize <auth-id> <card> <merchant> <cents>`
+does the same from the command line.
+
+No `GetVersion` is needed. The new paths start only from a `reverse` update accepted while deciding,
+which runs from before M20 rejected. Rejected updates never reach history.
+
 ## Non-goals
 
 - Real card networks (ISO 8583), PCI scope, or real money.
@@ -316,6 +342,7 @@ A subscription charges a card a fixed amount every cycle without the cardholder 
 - **M17**: Deploy to Fly.io on release tags (ADR 0007).
 - **M18**: Card replacement: a new number on the same account (ADR 0009).
 - **M19**: Recurring charges: subscriptions with retries, lapse, cancel and account updater (ADR 0010).
+- **M20**: Decision deadline: timeout reversals that leave no hold, whenever they land.
 
 ## Success criteria
 
