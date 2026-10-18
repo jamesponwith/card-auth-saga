@@ -146,30 +146,30 @@ func admin(args []string) (adminCmd, error) {
 	statuses := map[string]string{"freeze": CardFrozen, "unfreeze": CardActive, "close": CardClosed}
 	if status, ok := statuses[args[0]]; ok && len(args) == 2 && args[1] != "" {
 		id := args[1]
-		return func(ctx context.Context, l *MySQLLedger, _ client.Options) error {
-			account, _, err := l.CardAccount(ctx, id)
-			if err != nil {
-				return err
-			}
+		return onAccount(id, func(ctx context.Context, l *MySQLLedger, _ client.Options, account string) error {
 			return l.SetCardStatus(ctx, account, status)
-		}, nil
+		}), nil
 	}
 	if len(args) != 3 || args[1] == "" || args[2] == "" || !slices.Contains([]string{"set-limit", "set-apr", "set-rate", "replace"}, args[0]) {
 		return nil, errUsage
 	}
 	id := args[1]
-	if args[0] != "set-rate" {
-		if err := checkCardID(args[0], id); err != nil {
-			return nil, err
+	// Account IDs are card:<id>:<kind>, and the audit quotes card IDs in visibility queries.
+	cardIDs := args[1:2]
+	switch args[0] {
+	case "set-rate": // merchants aren't card IDs
+		cardIDs = nil
+	case "replace":
+		cardIDs = args[1:]
+	}
+	for _, c := range cardIDs {
+		if strings.ContainsAny(c, `:'"\`) {
+			return nil, fmt.Errorf("%s: card ID %q can't contain : ' \" or \\", args[0], c)
 		}
 	}
 	if args[0] == "replace" {
-		replacement := args[2]
-		if err := checkCardID(args[0], replacement); err != nil {
-			return nil, err
-		}
 		return func(ctx context.Context, l *MySQLLedger, _ client.Options) error {
-			return l.ReplaceCard(ctx, id, replacement)
+			return l.ReplaceCard(ctx, id, args[2])
 		}, nil
 	}
 	n, err := strconv.ParseInt(args[2], 10, 64)
@@ -178,37 +178,32 @@ func admin(args []string) (adminCmd, error) {
 	}
 	switch args[0] {
 	case "set-limit":
-		return func(ctx context.Context, l *MySQLLedger, opts client.Options) error {
-			account, _, err := l.CardAccount(ctx, id) // a new ID is its own account
-			if err != nil {
-				return err
-			}
+		return onAccount(id, func(ctx context.Context, l *MySQLLedger, opts client.Options, account string) error {
 			if err := l.SetCreditLimit(ctx, account, n); err != nil {
 				return err
 			}
 			return startStatement(ctx, opts, account)
-		}, nil
+		}), nil
 	case "set-apr":
-		return func(ctx context.Context, l *MySQLLedger, _ client.Options) error {
-			account, _, err := l.CardAccount(ctx, id)
-			if err != nil {
-				return err
-			}
+		return onAccount(id, func(ctx context.Context, l *MySQLLedger, _ client.Options, account string) error {
 			return l.SetAPR(ctx, account, n)
-		}, nil
+		}), nil
 	case "set-rate":
 		return func(ctx context.Context, l *MySQLLedger, _ client.Options) error { return l.SetRewardRate(ctx, id, n) }, nil
 	}
 	return nil, errUsage
 }
 
-// checkCardID rejects what card IDs can't hold: account IDs are
-// card:<id>:<kind>, and the audit quotes card IDs in visibility queries.
-func checkCardID(cmd, id string) error {
-	if strings.ContainsAny(id, `:'"\`) {
-		return fmt.Errorf("%s: card ID %q can't contain : ' \" or \\", cmd, id)
+// onAccount runs f on the account a card number belongs to. A new ID is its
+// own account, so set-limit can create it.
+func onAccount(number string, f func(context.Context, *MySQLLedger, client.Options, string) error) adminCmd {
+	return func(ctx context.Context, l *MySQLLedger, opts client.Options) error {
+		account, _, err := l.CardAccount(ctx, number)
+		if err != nil {
+			return err
+		}
+		return f(ctx, l, opts, account)
 	}
-	return nil
 }
 
 // startStatement starts the card's statement cycle, or leaves the running one

@@ -8,6 +8,7 @@ package main
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"encoding/json"
 	"errors"
@@ -99,7 +100,7 @@ func TestDrills(t *testing.T) {
 		d.startWorker()
 		req := AuthRequest{Amount: 40_000, RefundWindow: time.Second}
 		for range 2 { // the network retries: same auth ID, same answer, one hold
-			if !d.authorize(req) {
+			if !d.authorize(d.card, req).Approved {
 				t.Fatal("want approved")
 			}
 		}
@@ -117,7 +118,7 @@ func TestDrills(t *testing.T) {
 		slow := &slowFirstLedger{delay: 1500 * time.Millisecond, seen: map[string]bool{}}
 		d := newDrill(t, c, "updates", slow)
 		d.startWorker()
-		if !d.authorize(AuthRequest{Amount: 40_000, RefundWindow: time.Second}) {
+		if !d.authorize(d.card, AuthRequest{Amount: 40_000, RefundWindow: time.Second}).Approved {
 			t.Fatal("want approved")
 		}
 		if err := d.update(CaptureSignal, "c1", Capture{Amount: 40_000}); err != nil {
@@ -143,7 +144,7 @@ func TestDrills(t *testing.T) {
 	t.Run("increments and split capture", func(t *testing.T) {
 		d := newDrill(t, c, "split", nil)
 		d.startWorker()
-		if !d.authorize(AuthRequest{Amount: 40_000, RefundWindow: time.Second}) {
+		if !d.authorize(d.card, AuthRequest{Amount: 40_000, RefundWindow: time.Second}).Approved {
 			t.Fatal("want approved")
 		}
 		for _, inc := range []struct {
@@ -249,7 +250,7 @@ func TestDrills(t *testing.T) {
 		d.startWorker()
 		// Seconds-long deadlines; refunds and disputes open for 6s after settlement.
 		req := AuthRequest{Amount: 40_000, RefundWindow: 6 * time.Second, MerchantResponse: 2 * time.Second, DisputeReview: 2 * time.Second}
-		if !d.authorize(req) {
+		if !d.authorize(d.card, req).Approved {
 			t.Fatal("want approved")
 		}
 		steps := []struct {
@@ -500,29 +501,11 @@ func TestDrills(t *testing.T) {
 		env := envOf(map[string]string{"CAS_MYSQL_DSN": dsn, "TEMPORAL_ADDRESS": srv.FrontendHostPort()})
 		old, replacement := d.card, d.card+"-new"
 		ask := func(id, number string, amount int64) Decision { // what the network sends: the number on the card
-			t.Helper()
-			start := c.NewWithStartWorkflowOperation(client.StartWorkflowOptions{ID: id, TaskQueue: TaskQueue,
-				WorkflowIDConflictPolicy: enumspb.WORKFLOW_ID_CONFLICT_POLICY_USE_EXISTING},
-				AuthorizeWorkflow, AuthRequest{CardID: number, Amount: amount, Merchant: d.merchant, RefundWindow: time.Second})
-			h, err := c.UpdateWithStartWorkflow(ctx, client.UpdateWithStartWorkflowOptions{StartWorkflowOperation: start,
-				UpdateOptions: client.UpdateWorkflowOptions{UpdateName: AuthorizeUpdate, WaitForStage: client.WorkflowUpdateStageCompleted}})
-			var dec Decision
-			if err == nil {
-				err = h.Get(ctx, &dec)
-			}
-			if err != nil {
-				t.Fatal(err)
-			}
-			return dec
+			return d.authorize(id, AuthRequest{CardID: number, Amount: amount, RefundWindow: time.Second})
 		}
 		capture := func(id string, amount int64) {
 			t.Helper()
-			h, err := c.UpdateWorkflow(ctx, client.UpdateWorkflowOptions{WorkflowID: id, UpdateName: CaptureSignal,
-				Args: []any{Capture{Amount: amount}}, WaitForStage: client.WorkflowUpdateStageCompleted})
-			if err == nil {
-				err = h.Get(ctx, nil)
-			}
-			if err != nil {
+			if err := d.updateOn(id, CaptureSignal, "", Capture{Amount: amount}, nil); err != nil {
 				t.Fatal(err)
 			}
 		}
@@ -554,23 +537,22 @@ func TestDrills(t *testing.T) {
 		}
 		// Every auth is tagged with the account, so the audit and the statement's
 		// end-of-life check see them all on one card.
-		deadline := time.Now().Add(10 * time.Second)
-		for {
+		var tagged int64
+		for deadline := time.Now().Add(10 * time.Second); time.Now().Before(deadline) && tagged != 4; time.Sleep(200 * time.Millisecond) {
 			n, err := c.CountWorkflow(ctx, &workflowservice.CountWorkflowExecutionsRequest{Query: fmt.Sprintf("CardID = %q", old)})
-			if err == nil && n.GetCount() == 4 {
-				break
+			if err == nil {
+				tagged = n.GetCount()
 			}
-			if time.Now().After(deadline) {
-				t.Fatalf("auths tagged %s: %d (%v), want all 4", old, n.GetCount(), err)
-			}
-			time.Sleep(200 * time.Millisecond)
+		}
+		if tagged != 4 {
+			t.Errorf("auths tagged %s: %d, want all 4", old, tagged)
 		}
 	})
 
 	t.Run("update with start declined", func(t *testing.T) {
 		d := newDrill(t, c, "uws-decline", nil)
 		d.startWorker()
-		if d.authorize(AuthRequest{Amount: 100_001}) {
+		if d.authorize(d.card, AuthRequest{Amount: 100_001}).Approved {
 			t.Fatal("want declined")
 		}
 		d.expect(d.c.GetWorkflow(context.Background(), d.card, ""), AuthResult{Status: StatusDeclined, Reason: DeclineOverLimit})
@@ -637,13 +619,14 @@ func (d *drill) start(req AuthRequest) client.WorkflowRun {
 	return run
 }
 
-// authorize starts the auth (or attaches to the running one) and waits for the decision.
-func (d *drill) authorize(req AuthRequest) bool {
+// authorize starts auth id (or attaches to the running one) and waits for the
+// decision. The auth is on the drill's card unless req names another number.
+func (d *drill) authorize(id string, req AuthRequest) Decision {
 	d.t.Helper()
-	req.CardID, req.Merchant = d.card, d.merchant
+	req.CardID, req.Merchant = cmp.Or(req.CardID, d.card), d.merchant
 	ctx := context.Background()
 	start := d.c.NewWithStartWorkflowOperation(client.StartWorkflowOptions{
-		ID: d.card, TaskQueue: TaskQueue, WorkflowIDConflictPolicy: enumspb.WORKFLOW_ID_CONFLICT_POLICY_USE_EXISTING,
+		ID: id, TaskQueue: TaskQueue, WorkflowIDConflictPolicy: enumspb.WORKFLOW_ID_CONFLICT_POLICY_USE_EXISTING,
 	}, AuthorizeWorkflow, req)
 	h, err := d.c.UpdateWithStartWorkflow(ctx, client.UpdateWithStartWorkflowOptions{
 		StartWorkflowOperation: start,
@@ -656,7 +639,7 @@ func (d *drill) authorize(req AuthRequest) bool {
 	if err := h.Get(ctx, &dec); err != nil {
 		d.t.Fatal(err)
 	}
-	return dec.Approved
+	return dec
 }
 
 // update sends an update to the drill's workflow and waits for it to finish.
@@ -664,8 +647,13 @@ func (d *drill) update(name, id string, arg any) error { return d.updateResult(n
 
 // updateResult is update, decoding the update's result into result.
 func (d *drill) updateResult(name, id string, arg, result any) error {
+	return d.updateOn(d.card, name, id, arg, result)
+}
+
+// updateOn is updateResult on another of the drill's workflows.
+func (d *drill) updateOn(workflowID, name, id string, arg, result any) error {
 	h, err := d.c.UpdateWorkflow(context.Background(), client.UpdateWorkflowOptions{
-		WorkflowID: d.card, UpdateID: id, UpdateName: name, Args: []any{arg},
+		WorkflowID: workflowID, UpdateID: id, UpdateName: name, Args: []any{arg},
 		WaitForStage: client.WorkflowUpdateStageCompleted,
 	})
 	if err != nil {

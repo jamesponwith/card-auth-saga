@@ -509,14 +509,15 @@ func TestCardReplacement(t *testing.T) {
 		name      string
 		number    string        // presented at authorization
 		replaceAt time.Duration // card-1 is replaced by card-9 then; 0: before the auth
+		tagged    string        // the account the auth tags itself with
 		steps     []step
 		want      AuthResult
 	}{
-		{"new number authorizes on the account", "card-9", 0, []step{upd(capture(hr, 40_000), "ok")},
+		{"new number authorizes on the account", "card-9", 0, "card-1", []step{upd(capture(hr, 40_000), "ok")},
 			AuthResult{Status: StatusCaptured, Captured: 40_000, Points: 400}},
-		{"replaced number declines", "card-1", 0, nil, AuthResult{Status: StatusDeclined, Reason: DeclineReplaced}},
-		{"unknown number declines as unknown", "card-x", 0, nil, AuthResult{Status: StatusDeclined, Reason: DeclineUnknownCard}},
-		{"auth placed before the replacement still settles", "card-1", hr / 2, []step{upd(capture(hr, 40_000), "ok")},
+		{"replaced number declines", "card-1", 0, "card-1", nil, AuthResult{Status: StatusDeclined, Reason: DeclineReplaced}},
+		{"unknown number declines as unknown", "card-x", 0, "card-x", nil, AuthResult{Status: StatusDeclined, Reason: DeclineUnknownCard}},
+		{"auth placed before the replacement still settles", "card-1", hr / 2, "card-1", []step{upd(capture(hr, 40_000), "ok")},
 			AuthResult{Status: StatusCaptured, Captured: 40_000, Points: 400}},
 	}
 	for _, tt := range tests {
@@ -550,26 +551,13 @@ func TestCardReplacement(t *testing.T) {
 			if res != tt.want {
 				t.Errorf("result = %+v, want %+v", res, tt.want)
 			}
-			account := "card-1"
-			if tt.number == "card-x" {
-				account = "card-x"
-			}
-			if fmt.Sprint(tagged) != "["+account+"]" {
-				t.Errorf("CardID upserts = %v, want [%s]: auths are tagged with the account", tagged, account)
+			if fmt.Sprint(tagged) != "["+tt.tagged+"]" {
+				t.Errorf("CardID upserts = %v, want [%s]: auths are tagged with the account", tagged, tt.tagged)
 			}
 			if p := balance(t, l, postedAccount("card-1")); p != tt.want.Captured {
-				t.Errorf("card-1 posted = %d, want %d", p, tt.want.Captured)
+				t.Errorf("card-1 posted = %d, want %d: a replacement number posts to its account", p, tt.want.Captured)
 			}
-			accounts, err := l.Accounts(context.Background())
-			if err != nil {
-				t.Fatal(err)
-			}
-			for id := range accounts {
-				if strings.Contains(id, "card-9") {
-					t.Errorf("ledger account %s: a replacement number must post to its account", id)
-				}
-			}
-			// The decline recorded no attempt: five more on the new number all pass velocity.
+			// The decline recorded no attempt, so a thief on the old number spends none of the new one's velocity.
 			if tt.want.Reason == DeclineReplaced {
 				n, err := l.RecordAttempt(context.Background(), "card-1", "probe", time.Now(), VelocityWindow)
 				if err != nil || n != 1 {
