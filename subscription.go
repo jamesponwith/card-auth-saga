@@ -1,0 +1,168 @@
+package main
+
+import (
+	"cmp"
+	"context"
+	"errors"
+	"fmt"
+	"slices"
+	"time"
+
+	enumspb "go.temporal.io/api/enums/v1"
+	"go.temporal.io/api/serviceerror"
+	"go.temporal.io/sdk/client"
+	"go.temporal.io/sdk/temporal"
+	"go.temporal.io/sdk/workflow"
+)
+
+const (
+	CancelUpdate      = "cancel"       // stops a subscription's future charges
+	SubscriptionQuery = "subscription" // the current Subscription
+
+	DefaultSubscriptionCycle = 30 * 24 * time.Hour
+)
+
+// DefaultRetries are the waits between a declined charge's attempts: retries
+// on days 1, 3 and 7, then the subscription lapses.
+var DefaultRetries = []time.Duration{24 * time.Hour, 48 * time.Hour, 96 * time.Hour}
+
+// Subscription statuses (SPEC M19). Lapsed, cancelled and ended are final.
+const (
+	SubActive    = "active"
+	SubPastDue   = "past-due"  // the cycle's charge declined; retrying
+	SubLapsed    = "lapsed"    // every retry declined
+	SubCancelled = "cancelled" // the cancel update
+	SubEnded     = "ended"     // the card is closed or unknown
+)
+
+// SubscriptionWorkflowID is the ID of a subscription's workflow.
+func SubscriptionWorkflowID(id string) string { return "subscription:" + id }
+
+// SubscriptionTerms are what the cardholder signed up for. Zero values take the defaults.
+type SubscriptionTerms struct {
+	ID       string
+	CardID   string // the number given at signup; charges go to its card's current number
+	Merchant string
+	Amount   int64 // cents per cycle
+	Cycle    time.Duration
+	Retries  []time.Duration // waits between a declined charge's attempts
+}
+
+// Subscription is where a subscription stands, carried from cycle to cycle.
+type Subscription struct {
+	Cycle      int // the current cycle, from 1
+	Status     string
+	Charged    int64 // cents charged over every cycle
+	Failures   int   // declines in a row
+	LastReason string
+}
+
+// SubscriptionWorkflow runs one cycle per run: it charges at the start,
+// retries a declined charge, and continues as new a full cycle after it
+// began, however long the retries took, so the billing date never drifts.
+func SubscriptionWorkflow(ctx workflow.Context, terms SubscriptionTerms, sub Subscription) (Subscription, error) {
+	var a *Activities
+	sub.Cycle++
+	cancelled := false
+	if err := workflow.SetQueryHandler(ctx, SubscriptionQuery, func() (Subscription, error) { return sub, nil }); err != nil {
+		return sub, err
+	}
+	if err := workflow.SetUpdateHandler(ctx, CancelUpdate, func(workflow.Context) error { cancelled = true; return nil }); err != nil {
+		return sub, err
+	}
+	nextCycle := workflow.NewTimer(ctx, cmp.Or(terms.Cycle, DefaultSubscriptionCycle))
+	// A charge attempt always has an answer, and a retry finds the same auth,
+	// so the activity retries until it gets one.
+	actx := workflow.WithActivityOptions(ctx, workflow.ActivityOptions{StartToCloseTimeout: time.Minute, RetryPolicy: &temporal.RetryPolicy{}})
+	if terms.Retries == nil {
+		terms.Retries = DefaultRetries
+	}
+	for attempt := 0; ; attempt++ {
+		id := fmt.Sprintf("%s:c%d:a%d", SubscriptionWorkflowID(terms.ID), sub.Cycle, attempt)
+		var dec Decision
+		if err := workflow.ExecuteActivity(actx, a.ChargeCard, id, AuthRequest{CardID: terms.CardID, Amount: terms.Amount, Merchant: terms.Merchant}).Get(ctx, &dec); err != nil {
+			return sub, err
+		}
+		if dec.Approved {
+			sub.Status, sub.Charged, sub.Failures, sub.LastReason = SubActive, sub.Charged+terms.Amount, 0, ""
+			break
+		}
+		sub.Failures, sub.LastReason = sub.Failures+1, dec.Reason
+		switch {
+		case slices.Contains([]string{DeclineClosed, DeclineUnknownCard}, dec.Reason):
+			sub.Status = SubEnded
+			return sub, nil
+		case attempt == len(terms.Retries):
+			sub.Status = SubLapsed
+			return sub, nil
+		}
+		sub.Status = SubPastDue
+		if stopped, err := workflow.AwaitWithTimeout(ctx, terms.Retries[attempt], func() bool { return cancelled }); err != nil || stopped {
+			sub.Status = SubCancelled
+			return sub, err
+		}
+	}
+	if err := workflow.Await(ctx, func() bool { return cancelled || nextCycle.IsReady() }); err != nil {
+		return sub, err
+	}
+	if cancelled {
+		sub.Status = SubCancelled
+		return sub, nil
+	}
+	return sub, workflow.NewContinueAsNewError(ctx, SubscriptionWorkflow, terms, sub)
+}
+
+// ChargeCard makes one attempt at a charge as a network would: an authorize
+// on the card's current number (the account updater, SPEC M19), then a full
+// capture. A retry attaches to the same auth and capture (ADR 0010).
+func (a *Activities) ChargeCard(ctx context.Context, authID string, req AuthRequest) (Decision, error) {
+	if a.Temporal == nil { // fail the subscription where the audit sees it, not panic and retry forever
+		return Decision{}, temporal.NewNonRetryableApplicationError("charges need a Temporal client", "NoClient", nil)
+	}
+	var err error
+	if req.CardID, err = a.Config.CurrentNumber(ctx, req.CardID); err != nil {
+		return Decision{}, err
+	}
+	dec, _, err := authorizeAndCapture(ctx, a.Temporal, authID, req)
+	var started *serviceerror.WorkflowExecutionAlreadyStarted
+	if errors.As(err, &started) { // a retry after the declined auth finished: its answer stands
+		var res AuthResult
+		if err := a.Temporal.GetWorkflow(ctx, authID, "").Get(ctx, &res); err != nil {
+			return Decision{}, err
+		}
+		return Decision{Approved: res.Status != StatusDeclined, Reason: res.Reason}, nil
+	}
+	return dec, err
+}
+
+// authorizeAndCapture asks for a decision and, if approved, captures in full.
+// decided is how long the decision took, the latency a network waits on. An
+// auth ID is used once: a retry attaches to the running auth, and one that
+// finished (a decline) is refused rather than tried again.
+func authorizeAndCapture(ctx context.Context, c client.Client, id string, req AuthRequest) (dec Decision, decided time.Duration, err error) {
+	began := time.Now()
+	h, err := c.UpdateWithStartWorkflow(ctx, client.UpdateWithStartWorkflowOptions{
+		StartWorkflowOperation: c.NewWithStartWorkflowOperation(client.StartWorkflowOptions{
+			ID: id, TaskQueue: TaskQueue,
+			WorkflowIDConflictPolicy: enumspb.WORKFLOW_ID_CONFLICT_POLICY_USE_EXISTING,
+			WorkflowIDReusePolicy:    enumspb.WORKFLOW_ID_REUSE_POLICY_REJECT_DUPLICATE,
+		}, AuthorizeWorkflow, req),
+		UpdateOptions: client.UpdateWorkflowOptions{UpdateName: AuthorizeUpdate, WaitForStage: client.WorkflowUpdateStageCompleted},
+	})
+	if err != nil {
+		return dec, 0, err
+	}
+	err = h.Get(ctx, &dec)
+	decided = time.Since(began)
+	if err != nil || !dec.Approved {
+		return dec, decided, err
+	}
+	ch, err := c.UpdateWorkflow(ctx, client.UpdateWorkflowOptions{
+		WorkflowID: id, UpdateID: "capture", UpdateName: CaptureSignal, Args: []any{Capture{Amount: req.Amount}},
+		WaitForStage: client.WorkflowUpdateStageCompleted,
+	})
+	if err != nil {
+		return dec, decided, err
+	}
+	return dec, decided, ch.Get(ctx, nil)
+}

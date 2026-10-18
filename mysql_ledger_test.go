@@ -426,6 +426,11 @@ func TestReplaceCard(t *testing.T) {
 			t.Errorf("CardAccount(%s) = %q, %v, %v; want %q, %v", tt.number, account, replaced, err, tt.account, tt.replaced)
 		}
 	}
+	for number, want := range map[string]string{"card-1": "card-3", "card-2": "card-3", "card-3": "card-3", "card-5": "card-5", "unknown": "unknown"} {
+		if got, err := l.CurrentNumber(ctx, number); err != nil || got != want {
+			t.Errorf("CurrentNumber(%s) = %q, %v; want %q", number, got, err, want)
+		}
+	}
 	// A number that belongs to an account can't become an account of its own.
 	if err := l.SetCreditLimit(ctx, "card-3", 1); err == nil || !strings.Contains(err.Error(), "card-1") {
 		t.Errorf("SetCreditLimit on card-1's number card-3: %v, want a refusal naming card-1", err)

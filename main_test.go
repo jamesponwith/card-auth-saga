@@ -103,3 +103,30 @@ func TestAdminCommands(t *testing.T) {
 		t.Errorf("RewardRate = %d, %v, %v; want 4", rate, ok, err)
 	}
 }
+
+// Subscription commands are checked before anything dials Temporal.
+func TestSubscriptionArgs(t *testing.T) {
+	unreachable := envOf(map[string]string{"TEMPORAL_ADDRESS": "127.0.0.1:1"})
+	tests := []struct {
+		args    []string
+		wantErr string // a valid command gets as far as dialing
+	}{
+		{[]string{"subscribe", "s1", "card-1", "streamer", "999"}, "dial temporal"},
+		{[]string{"unsubscribe", "s1"}, "dial temporal"},
+		{[]string{"subscribe", "s1", "card-1", "streamer"}, "usage"},
+		{[]string{"subscribe", "", "card-1", "streamer", "999"}, "usage"},
+		{[]string{"unsubscribe"}, "usage"},
+		{[]string{"unsubscribe", "s1", "now"}, "usage"},
+		{[]string{"subscribe", "s1", "card-1", "streamer", "0"}, "not a positive"},
+		{[]string{"subscribe", "s1", "card-1", "streamer", "-5"}, "not a positive"},
+		{[]string{"subscribe", "s1", "card-1", "streamer", "9.99"}, "not a positive"},
+		{[]string{"subscribe", "s1", "card:1", "streamer", "999"}, "can't contain"},
+	}
+	for _, tt := range tests {
+		t.Run(strings.Join(tt.args, " "), func(t *testing.T) {
+			if err := run(context.Background(), tt.args, unreachable); err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+				t.Errorf("run(%q) = %v, want an error containing %q", tt.args, err, tt.wantErr)
+			}
+		})
+	}
+}

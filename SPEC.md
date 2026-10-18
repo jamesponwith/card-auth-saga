@@ -263,6 +263,31 @@ A lost or stolen card gets a new number on the same account (ADR 0009):
   the account.
 - Runs started earlier replay unchanged: they never resolve, and their `CardID` is their account.
 
+## Recurring charges (M19)
+
+A subscription charges a card a fixed amount every cycle without the cardholder present (ADR 0010):
+`go run . subscribe <id> <card> <merchant> <cents>` and `go run . unsubscribe <id>`.
+
+- **One workflow per subscription**, `subscription:<id>`. Each run is one cycle. It charges at the start
+  of the cycle (the first charge is at signup), then continues as new when the cycle ends. Billing
+  stays anchored to the cycle start, even when retries took days. The default cycle is 30 days.
+- **A charge is an ordinary auth.** `ChargeCard` sends an Update-with-Start `authorize`, then captures
+  in full, like a network. So limits, velocity, status, the ledger, rewards, refunds, disputes and the
+  audit all apply unchanged. Auth IDs are `<subscription>:c<cycle>:a<attempt>`, and the capture has a fixed
+  update ID, so a retried charge never charges twice.
+- **Account updater.** Each charge first looks up the card's current number (`CurrentNumber`), so a
+  replaced card's subscriptions carry on with no re-signup (M18). Replaced numbers still decline for
+  everyone else: nothing in the request can bypass that.
+- **Declines.**
+  - `OverLimit`, `Frozen` or `Velocity` puts the subscription **past-due** and retries after 1, 2 and 4 days
+    (days 1, 3 and 7). A charge that succeeds clears it. One that fails after the last retry **lapses** it:
+    no more charges.
+  - `Closed` or `UnknownCard` **ends** it at once.
+- **Cancel:** the `cancel` update stops future charges. A charge already made stands, and a refund goes
+  through its auth as usual. Cancelling a subscription that has already finished fails: nothing is left to stop.
+- The `subscription` query returns the cycle, status, total charged, failures in a row and the last
+  decline reason.
+
 ## Non-goals
 
 - Real card networks (ISO 8583), PCI scope, or real money.
@@ -290,6 +315,7 @@ A lost or stolen card gets a new number on the same account (ADR 0009):
 - **M16**: Freezing and closing cards.
 - **M17**: Deploy to Fly.io on release tags (ADR 0007).
 - **M18**: Card replacement: a new number on the same account (ADR 0009).
+- **M19**: Recurring charges: subscriptions with retries, lapse, cancel and account updater (ADR 0010).
 
 ## Success criteria
 

@@ -246,6 +246,17 @@ func (l *MySQLLedger) CardAccount(ctx context.Context, number string) (string, b
 	return account, replaced, err
 }
 
+func (l *MySQLLedger) CurrentNumber(ctx context.Context, number string) (string, error) {
+	var current string
+	err := l.db.QueryRowContext(ctx, `SELECT cur.number FROM card_numbers given
+		JOIN card_numbers cur ON cur.account = given.account AND cur.replaced_at IS NULL
+		WHERE given.number = ?`, number).Scan(&current)
+	if errors.Is(err, sql.ErrNoRows) {
+		return number, nil
+	}
+	return current, err
+}
+
 // ReplaceCard retires number and gives its account the replacement number.
 // Only a card's current number can be replaced, and not on a closed card;
 // a number already in use anywhere is refused by card_numbers' primary key.
