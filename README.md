@@ -75,7 +75,7 @@ temporal workflow update execute --workflow-id auth-1 --name refund --update-id 
 ```
 
 The first command answers `{"Approved":true}` as soon as the hold is decided, or `{"Approved":false,"Reason":…}`
-with `OverLimit`, `Velocity` or `UnknownCard`. The workflow keeps running. Running it again on the same `--workflow-id`, as a network retry would, returns
+with `OverLimit`, `Velocity` or `UnknownCard` (or `Frozen`, `Closed` or `Replaced`, below). The workflow keeps running. Running it again on the same `--workflow-id`, as a network retry would, returns
 the same answer without placing a second hold (SPEC.md, M6).
 
 `capture`, `reverse` and `refund` are updates: each returns once the ledger posts. A bad request is
@@ -131,6 +131,20 @@ Each cycle samples the card's balance at the end of every day. It charges a $25 
 minimum isn't paid by the due date, and at close charges interest on the average daily balance
 unless the last statement was paid in full. The workflow then continues as new, so its history covers
 one cycle. `temporal workflow list --query 'WorkflowId="statement:card-1"'` lists each run.
+
+A lost or stolen card gets a new number on the same account (SPEC.md, M18). The limit, balance,
+statement cycle and points all carry over:
+
+```sh
+go run . replace card-1 card-1b    # card-1 now declines (Reason Replaced); card-1b authorizes
+temporal workflow execute-update-with-start --update-name authorize \
+  --task-queue card-auth --type AuthorizeWorkflow --id-conflict-policy UseExisting \
+  --workflow-id auth-2 --input '{"CardID":"card-1b","Amount":1000,"Merchant":"shell"}'
+```
+
+Auths already placed on the old number still capture, refund and dispute as usual. The account keeps
+the ID it was created with, here `card-1`: `statement:card-1`, the ledger's `card:card-1:*` accounts,
+and the `CardID` every auth is tagged with. Admin commands accept any of a card's numbers.
 
 ## Deploy
 

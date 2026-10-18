@@ -52,6 +52,7 @@ const (
 	DeclineUnknownCard = "UnknownCard"
 	DeclineFrozen      = "Frozen"
 	DeclineClosed      = "Closed"
+	DeclineReplaced    = "Replaced" // a number its card has been given a replacement for (M18)
 )
 
 // Decision is the authorize update's answer.
@@ -125,14 +126,38 @@ func AuthorizeWorkflow(ctx workflow.Context, req AuthRequest) (AuthResult, error
 	s := &authState{req: req, root: ctx, phase: phaseDeciding, held: req.Amount, seen: map[string]bool{}, increments: map[string]bool{}, disputes: map[string]*disputeState{}}
 	// Runs started before multiple captures replay on the single-capture path.
 	s.v = workflow.GetVersion(ctx, "multi-capture", workflow.DefaultVersion, 1)
+	// Handlers first: an update that arrives with the start must find its
+	// handler when the workflow first blocks. Registering records nothing, so
+	// runs that registered after tagging replay the same.
+	if err := errors.Join(s.registerUpdates(ctx), s.registerDisputes(ctx)); err != nil {
+		return AuthResult{}, err
+	}
+	// The decision waits on these steps alone, so they run in the workflow
+	// worker: no round trip through the activity task queue.
+	lctx := workflow.WithLocalActivityOptions(ctx, workflow.LocalActivityOptions{
+		StartToCloseTimeout: activityTimeout,
+		RetryPolicy:         &temporal.RetryPolicy{MaximumAttempts: 5},
+	})
+	// A replacement number authorizes on its card's account: from here on,
+	// req.CardID is the account, so every step below posts there (ADR 0009).
+	var number CardNumber
+	if workflow.GetVersion(ctx, "card-replacement", workflow.DefaultVersion, 1) != workflow.DefaultVersion {
+		if err := workflow.ExecuteLocalActivity(lctx, s.a.ResolveCard, req.CardID).Get(ctx, &number); err != nil {
+			s.holdErr, s.phase = err, phaseFailed
+			return AuthResult{}, err
+		}
+		req.CardID = number.Account
+		s.req = req
+	}
 	// Tag the auth with its card, so card-scoped visibility queries find it.
 	if workflow.GetVersion(ctx, "card-id-attribute", workflow.DefaultVersion, 1) != workflow.DefaultVersion {
 		if err := workflow.UpsertTypedSearchAttributes(ctx, CardIDAttribute.ValueSet(req.CardID)); err != nil {
 			return AuthResult{}, err
 		}
 	}
-	if err := errors.Join(s.registerUpdates(ctx), s.registerDisputes(ctx)); err != nil {
-		return AuthResult{}, err
+	if number.Replaced { // no attempt recorded: a thief on the old number can't trip the new one's velocity
+		s.phase, s.reason = StatusDeclined, DeclineReplaced
+		return AuthResult{Status: StatusDeclined, Reason: s.reason}, nil
 	}
 
 	// Waiting authorize updates run in the same workflow task that ends
@@ -141,12 +166,6 @@ func AuthorizeWorkflow(ctx workflow.Context, req AuthRequest) (AuthResult, error
 	if workflow.GetVersion(ctx, "local-place-hold", workflow.DefaultVersion, 1) == workflow.DefaultVersion {
 		s.holdErr = workflow.ExecuteActivity(ctx, s.a.PlaceHold, req).Get(ctx, &held)
 	} else {
-		// The decision waits on this step alone, so run it in the workflow
-		// worker: no round trip through the activity task queue.
-		lctx := workflow.WithLocalActivityOptions(ctx, workflow.LocalActivityOptions{
-			StartToCloseTimeout: activityTimeout,
-			RetryPolicy:         &temporal.RetryPolicy{MaximumAttempts: 5},
-		})
 		s.holdErr = workflow.ExecuteLocalActivity(lctx, s.a.PlaceHold, req).Get(ctx, &held)
 	}
 	var declined *temporal.ApplicationError
@@ -457,6 +476,18 @@ type Activities struct {
 
 func stepKey(ctx context.Context, step string) string {
 	return activity.GetInfo(ctx).WorkflowExecution.ID + ":" + step
+}
+
+// CardNumber is ResolveCard's answer: the account a number authorizes on.
+type CardNumber struct {
+	Account  string
+	Replaced bool // the card has a newer number; this one declines
+}
+
+// ResolveCard maps the number an auth presents to its card's account.
+func (a *Activities) ResolveCard(ctx context.Context, number string) (CardNumber, error) {
+	account, replaced, err := a.Config.CardAccount(ctx, number)
+	return CardNumber{account, replaced}, err
 }
 
 // PlaceHold moves the amount from open-to-buy into holds if holds + posted stay

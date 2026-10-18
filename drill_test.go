@@ -25,6 +25,7 @@ import (
 	enumspb "go.temporal.io/api/enums/v1"
 	historypb "go.temporal.io/api/history/v1"
 	"go.temporal.io/api/temporalproto"
+	"go.temporal.io/api/workflowservice/v1"
 	"go.temporal.io/sdk/client"
 	"go.temporal.io/sdk/testsuite"
 	"go.temporal.io/sdk/worker"
@@ -485,6 +486,84 @@ func TestDrills(t *testing.T) {
 		}
 		if !done || err != nil {
 			t.Errorf("CardDone after the last auth ended = %v, %v; want true", done, err)
+		}
+	})
+
+	t.Run("card replacement", func(t *testing.T) {
+		dsn := os.Getenv("CAS_MYSQL_DSN")
+		if dsn == "" {
+			t.Skip("card numbers live in MySQL; set CAS_MYSQL_DSN")
+		}
+		d := newDrill(t, c, "replace", nil)
+		d.startWorker()
+		ctx := context.Background()
+		env := envOf(map[string]string{"CAS_MYSQL_DSN": dsn, "TEMPORAL_ADDRESS": srv.FrontendHostPort()})
+		old, replacement := d.card, d.card+"-new"
+		ask := func(id, number string, amount int64) Decision { // what the network sends: the number on the card
+			t.Helper()
+			start := c.NewWithStartWorkflowOperation(client.StartWorkflowOptions{ID: id, TaskQueue: TaskQueue,
+				WorkflowIDConflictPolicy: enumspb.WORKFLOW_ID_CONFLICT_POLICY_USE_EXISTING},
+				AuthorizeWorkflow, AuthRequest{CardID: number, Amount: amount, Merchant: d.merchant, RefundWindow: time.Second})
+			h, err := c.UpdateWithStartWorkflow(ctx, client.UpdateWithStartWorkflowOptions{StartWorkflowOperation: start,
+				UpdateOptions: client.UpdateWorkflowOptions{UpdateName: AuthorizeUpdate, WaitForStage: client.WorkflowUpdateStageCompleted}})
+			var dec Decision
+			if err == nil {
+				err = h.Get(ctx, &dec)
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			return dec
+		}
+		capture := func(id string, amount int64) {
+			t.Helper()
+			h, err := c.UpdateWorkflow(ctx, client.UpdateWorkflowOptions{WorkflowID: id, UpdateName: CaptureSignal,
+				Args: []any{Capture{Amount: amount}}, WaitForStage: client.WorkflowUpdateStageCompleted})
+			if err == nil {
+				err = h.Get(ctx, nil)
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+		}
+
+		// Held on the old number when the card is reported lost.
+		if !ask(old+"-a1", old, 30_000).Approved {
+			t.Fatal("auth on the card before replacement: want approved")
+		}
+		if err := run(ctx, []string{"replace", old, replacement}, env); err != nil {
+			t.Fatal(err)
+		}
+		if dec := ask(old+"-a2", old, 1_000); dec.Approved || dec.Reason != DeclineReplaced {
+			t.Errorf("old number after replacement = %+v, want declined %s", dec, DeclineReplaced)
+		}
+		if !ask(old+"-a3", replacement, 40_000).Approved { // 30,000 still held: the limit is shared
+			t.Fatal("new number: want approved")
+		}
+		if dec := ask(old+"-a4", replacement, 40_000); dec.Approved || dec.Reason != DeclineOverLimit {
+			t.Errorf("new number past the shared limit = %+v, want declined %s", dec, DeclineOverLimit)
+		}
+		capture(old+"-a1", 30_000)
+		capture(old+"-a3", 40_000)
+		d.expect(c.GetWorkflow(ctx, old+"-a1", ""), AuthResult{Status: StatusCaptured, Captured: 30_000, Points: 300})
+		d.expect(c.GetWorkflow(ctx, old+"-a2", ""), AuthResult{Status: StatusDeclined, Reason: DeclineReplaced})
+		d.expect(c.GetWorkflow(ctx, old+"-a3", ""), AuthResult{Status: StatusCaptured, Captured: 40_000, Points: 400})
+		d.expectBalances(0, 70_000, 700) // one account: both numbers' spend and points
+		if b := balance(t, d.l, postedAccount(replacement)); b != 0 {
+			t.Errorf("the new number has ledger accounts of its own: posted %d", b)
+		}
+		// Every auth is tagged with the account, so the audit and the statement's
+		// end-of-life check see them all on one card.
+		deadline := time.Now().Add(10 * time.Second)
+		for {
+			n, err := c.CountWorkflow(ctx, &workflowservice.CountWorkflowExecutionsRequest{Query: fmt.Sprintf("CardID = %q", old)})
+			if err == nil && n.GetCount() == 4 {
+				break
+			}
+			if time.Now().After(deadline) {
+				t.Fatalf("auths tagged %s: %d (%v), want all 4", old, n.GetCount(), err)
+			}
+			time.Sleep(200 * time.Millisecond)
 		}
 	})
 

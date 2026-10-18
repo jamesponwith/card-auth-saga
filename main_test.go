@@ -30,6 +30,11 @@ func TestAdminArgs(t *testing.T) {
 		{[]string{"close", "card-1"}, ""},
 		{[]string{"close"}, "usage"},
 		{[]string{"close", "card-1", "now"}, "usage"},
+		{[]string{"replace", "card-1", "card-2"}, ""},
+		{[]string{"replace", "card-1"}, "usage"},
+		{[]string{"replace", "card-1", ""}, "usage"},
+		{[]string{"replace", "card-1", "card:2"}, "can't contain"},
+		{[]string{"replace", "card-1", "o'brien"}, "can't contain"},
 	}
 	for _, tt := range tests {
 		t.Run(strings.Join(tt.args, " "), func(t *testing.T) {
@@ -75,11 +80,24 @@ func TestAdminCommands(t *testing.T) {
 		t.Errorf("set-limit with Temporal down: %v, want a rerun hint", err)
 	}
 
+	// After a replacement, the new number and the old one both name the account.
+	for _, args := range [][]string{{"replace", "card-1", "card-2"}, {"set-apr", "card-2", "1777"}, {"freeze", "card-1"}, {"unfreeze", "card-2"}} {
+		if err := run(ctx, args, env); err != nil {
+			t.Fatalf("run %q: %v", args, err)
+		}
+	}
+	if err := run(ctx, []string{"replace", "card-1", "card-3"}, env); err == nil {
+		t.Error("replaced card-1 twice")
+	}
+	if status, _, _ := l.CardStatus(ctx, "card-1"); status != CardActive {
+		t.Errorf("card-1 status = %q after freeze and unfreeze by its two numbers, want active", status)
+	}
+
 	if limit, ok, err := l.CreditLimit(ctx, "card-1"); err != nil || !ok || limit != 250_000 {
 		t.Errorf("CreditLimit = %d, %v, %v; want 250000", limit, ok, err)
 	}
-	if bps, ok, err := l.APR(ctx, "card-1"); err != nil || !ok || bps != 1_999 {
-		t.Errorf("APR = %d, %v, %v; want 1999", bps, ok, err)
+	if bps, ok, err := l.APR(ctx, "card-1"); err != nil || !ok || bps != 1_777 {
+		t.Errorf("APR = %d, %v, %v; want 1777, set through card-1's new number", bps, ok, err)
 	}
 	if rate, ok, err := l.RewardRate(ctx, "shell"); err != nil || !ok || rate != 4 {
 		t.Errorf("RewardRate = %d, %v, %v; want 4", rate, ok, err)

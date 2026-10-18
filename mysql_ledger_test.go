@@ -124,6 +124,11 @@ func TestMigrate(t *testing.T) {
 		{"adopts the schema with velocity attempts", append(slices.Clone(preVersioningLedger), preVersioningAttempts,
 			`INSERT INTO accounts (id, balance) VALUES ('a', 700), ('b', -700)`,
 			`INSERT INTO postings (idem_key) VALUES ('k')`)},
+		{"backfills the numbers of cards made before replacement", append(slices.Clone(preVersioningLedger),
+			`INSERT INTO accounts (id, balance) VALUES ('a', 700), ('b', -700)`,
+			`INSERT INTO postings (idem_key) VALUES ('k')`,
+			`CREATE TABLE cards (id VARCHAR(191) PRIMARY KEY, credit_limit BIGINT NOT NULL)`,
+			`INSERT INTO cards (id, credit_limit) VALUES ('old-card', 100)`)},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -155,6 +160,14 @@ func TestMigrate(t *testing.T) {
 			}
 			if err := l.SetRewardRate(ctx, "shop", 2); err != nil {
 				t.Error(err)
+			}
+			if err := l.ReplaceCard(ctx, "card", "card-new"); err != nil {
+				t.Error(err)
+			}
+			if strings.Contains(fmt.Sprint(tt.before), "old-card") { // its number is taken, though it predates the table
+				if err := l.ReplaceCard(ctx, "card-new", "old-card"); err == nil {
+					t.Error("replaced a card with the number of a card made before migration 7")
+				}
 			}
 		})
 	}
@@ -362,5 +375,62 @@ func TestCardStatusTransitions(t *testing.T) {
 	}
 	if err := l.SetCardStatus(ctx, "card-2", "lost"); err == nil { // not a status: the CHECK rejects it
 		t.Error("set an active card's status to \"lost\"")
+	}
+}
+
+// Replacing a card gives its account a new number; every number maps to one
+// account, ever (SPEC M18).
+func TestReplaceCard(t *testing.T) {
+	l := open(t, freshDB(t))
+	ctx := context.Background()
+	for _, c := range []string{"card-1", "card-5", "card-7"} {
+		if err := l.SetCreditLimit(ctx, c, 100_000); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := l.SetCardStatus(ctx, "card-7", CardClosed); err != nil {
+		t.Fatal(err)
+	}
+	steps := []struct {
+		number, replacement string
+		wantErr             string // substring; empty for success
+	}{
+		{"card-1", "card-2", ""},
+		{"card-1", "card-3", "already replaced"},
+		{"card-2", "card-3", ""}, // a replacement can itself be replaced
+		{"card-3", "card-1", "in use"},
+		{"card-3", "card-5", "in use"}, // another card's number
+		{"card-3", "card-3", "in use"},
+		{"card-7", "card-8", "closed"},
+		{"no-such-card", "card-9", "no card"},
+	}
+	for _, st := range steps {
+		err := l.ReplaceCard(ctx, st.number, st.replacement)
+		if (err == nil) != (st.wantErr == "") || err != nil && !strings.Contains(err.Error(), st.wantErr) {
+			t.Errorf("ReplaceCard(%s, %s) = %v, want error containing %q", st.number, st.replacement, err, st.wantErr)
+		}
+	}
+	for _, tt := range []struct {
+		number, account string
+		replaced        bool
+	}{
+		{"card-1", "card-1", true},
+		{"card-2", "card-1", true},
+		{"card-3", "card-1", false},
+		{"card-5", "card-5", false},
+		{"card-8", "card-8", false}, // never created: its own account, unknown to CreditLimit
+		{"unknown", "unknown", false},
+	} {
+		account, replaced, err := l.CardAccount(ctx, tt.number)
+		if err != nil || account != tt.account || replaced != tt.replaced {
+			t.Errorf("CardAccount(%s) = %q, %v, %v; want %q, %v", tt.number, account, replaced, err, tt.account, tt.replaced)
+		}
+	}
+	// A number that belongs to an account can't become an account of its own.
+	if err := l.SetCreditLimit(ctx, "card-3", 1); err == nil || !strings.Contains(err.Error(), "card-1") {
+		t.Errorf("SetCreditLimit on card-1's number card-3: %v, want a refusal naming card-1", err)
+	}
+	if limit, _, _ := l.CreditLimit(ctx, "card-1"); limit != 100_000 {
+		t.Errorf("card-1 limit = %d after the refused set-limit, want 100000", limit)
 	}
 }

@@ -1,6 +1,9 @@
 package main
 
-import "context"
+import (
+	"cmp"
+	"context"
+)
 
 // Config is the per-card and per-partner configuration the activities read.
 // The MySQL ledger serves it from the cards and partners tables.
@@ -14,6 +17,10 @@ type Config interface {
 	APR(ctx context.Context, card string) (bps int64, ok bool, err error)
 	// CardStatus is CardActive, CardFrozen or CardClosed; ok is false for an unknown card.
 	CardStatus(ctx context.Context, card string) (status string, ok bool, err error)
+	// CardAccount is the account a card number belongs to, and whether that
+	// number has been replaced (SPEC M18). A number with no record is its own
+	// account, so an unknown number reaches the limit check and declines there.
+	CardAccount(ctx context.Context, number string) (account string, replaced bool, err error)
 }
 
 // Card statuses (SPEC M16). Closed is final.
@@ -29,6 +36,12 @@ type StaticConfig struct {
 	Rates    map[string]int64  // merchant → points per $1
 	APRs     map[string]int64  // card → APR, basis points
 	Statuses map[string]string // card → status; missing is active
+	Numbers  map[string]string // replacement number → account; missing is its own account
+	Replaced map[string]bool   // numbers that have been replaced
+}
+
+func (c StaticConfig) CardAccount(_ context.Context, number string) (string, bool, error) {
+	return cmp.Or(c.Numbers[number], number), c.Replaced[number], nil
 }
 
 func (c StaticConfig) CreditLimit(_ context.Context, card string) (int64, bool, error) {

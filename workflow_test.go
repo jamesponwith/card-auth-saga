@@ -404,6 +404,9 @@ func (brokenConfig) APR(context.Context, string) (int64, bool, error) {
 func (brokenConfig) CardStatus(context.Context, string) (string, bool, error) {
 	return "", false, errors.New("config store down")
 }
+func (brokenConfig) CardAccount(context.Context, string) (string, bool, error) {
+	return "", false, errors.New("config store down")
+}
 
 // A config store outage must fail the auth, not decline the card as unknown.
 func TestConfigOutageIsNotADecline(t *testing.T) {
@@ -493,6 +496,85 @@ func TestCardStatus(t *testing.T) {
 			}
 			if res != tt.want {
 				t.Errorf("result = %+v, want %+v", res, tt.want)
+			}
+		})
+	}
+}
+
+// A replacement number authorizes on its account; the number it replaced
+// declines without counting as an attempt; an auth already running on the old
+// number still settles on the account (SPEC M18).
+func TestCardReplacement(t *testing.T) {
+	tests := []struct {
+		name      string
+		number    string        // presented at authorization
+		replaceAt time.Duration // card-1 is replaced by card-9 then; 0: before the auth
+		steps     []step
+		want      AuthResult
+	}{
+		{"new number authorizes on the account", "card-9", 0, []step{upd(capture(hr, 40_000), "ok")},
+			AuthResult{Status: StatusCaptured, Captured: 40_000, Points: 400}},
+		{"replaced number declines", "card-1", 0, nil, AuthResult{Status: StatusDeclined, Reason: DeclineReplaced}},
+		{"unknown number declines as unknown", "card-x", 0, nil, AuthResult{Status: StatusDeclined, Reason: DeclineUnknownCard}},
+		{"auth placed before the replacement still settles", "card-1", hr / 2, []step{upd(capture(hr, 40_000), "ok")},
+			AuthResult{Status: StatusCaptured, Captured: 40_000, Points: 400}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var s testsuite.WorkflowTestSuite
+			env := s.NewTestWorkflowEnvironment()
+			cfg := card1()
+			cfg.Numbers, cfg.Replaced = map[string]string{}, map[string]bool{}
+			replace := func() { cfg.Numbers["card-9"], cfg.Replaced["card-1"] = "card-1", true }
+			if tt.replaceAt == 0 {
+				replace()
+			} else {
+				env.RegisterDelayedCallback(replace, tt.replaceAt)
+			}
+			l := NewMemLedger()
+			env.RegisterActivity(&Activities{Ledger: l, Config: cfg})
+			var tagged []string
+			env.OnUpsertTypedSearchAttributes(mock.Anything).Run(func(args mock.Arguments) {
+				card, _ := args.Get(0).(temporal.SearchAttributes).GetKeyword(CardIDAttribute)
+				tagged = append(tagged, card)
+			}).Return(nil)
+			got := sendSteps(env, tt.steps)
+
+			env.ExecuteWorkflow(AuthorizeWorkflow, auth(tt.number, 40_000))
+
+			checkSteps(t, tt.steps, got)
+			var res AuthResult
+			if err := env.GetWorkflowResult(&res); err != nil {
+				t.Fatal(err)
+			}
+			if res != tt.want {
+				t.Errorf("result = %+v, want %+v", res, tt.want)
+			}
+			account := "card-1"
+			if tt.number == "card-x" {
+				account = "card-x"
+			}
+			if fmt.Sprint(tagged) != "["+account+"]" {
+				t.Errorf("CardID upserts = %v, want [%s]: auths are tagged with the account", tagged, account)
+			}
+			if p := balance(t, l, postedAccount("card-1")); p != tt.want.Captured {
+				t.Errorf("card-1 posted = %d, want %d", p, tt.want.Captured)
+			}
+			accounts, err := l.Accounts(context.Background())
+			if err != nil {
+				t.Fatal(err)
+			}
+			for id := range accounts {
+				if strings.Contains(id, "card-9") {
+					t.Errorf("ledger account %s: a replacement number must post to its account", id)
+				}
+			}
+			// The decline recorded no attempt: five more on the new number all pass velocity.
+			if tt.want.Reason == DeclineReplaced {
+				n, err := l.RecordAttempt(context.Background(), "card-1", "probe", time.Now(), VelocityWindow)
+				if err != nil || n != 1 {
+					t.Errorf("attempts on card-1 after the decline = %d (%v), want only the probe's 1", n, err)
+				}
 			}
 		})
 	}
