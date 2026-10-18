@@ -30,6 +30,19 @@ func startAuth(c client.Client, id string, req AuthRequest) client.WithStartWork
 	}, AuthorizeWorkflow, req)
 }
 
+// decide sends auth id's authorize, starting the auth if need be, and waits for the decision.
+func decide(ctx context.Context, c client.Client, id string, req AuthRequest) (Decision, error) {
+	var dec Decision
+	h, err := c.UpdateWithStartWorkflow(ctx, client.UpdateWithStartWorkflowOptions{
+		StartWorkflowOperation: startAuth(c, id, req),
+		UpdateOptions:          client.UpdateWorkflowOptions{UpdateName: AuthorizeUpdate, WaitForStage: client.WorkflowUpdateStageCompleted},
+	})
+	if err == nil {
+		err = h.Get(ctx, &dec)
+	}
+	return dec, err
+}
+
 // authorizeWithin asks for a decision and waits at most deadline. Without an
 // answer, for any reason, it sends a timeout reversal, as a network does, so
 // whatever the auth decides later no hold of it stands (SPEC M20). It reports
@@ -37,14 +50,7 @@ func startAuth(c client.Client, id string, req AuthRequest) client.WithStartWork
 func authorizeWithin(ctx context.Context, c client.Client, id string, req AuthRequest, deadline time.Duration) (Decision, error) {
 	dctx, cancel := context.WithTimeout(ctx, deadline)
 	defer cancel()
-	var dec Decision
-	h, err := c.UpdateWithStartWorkflow(dctx, client.UpdateWithStartWorkflowOptions{
-		StartWorkflowOperation: startAuth(c, id, req),
-		UpdateOptions:          client.UpdateWorkflowOptions{UpdateName: AuthorizeUpdate, WaitForStage: client.WorkflowUpdateStageCompleted},
-	})
-	if err == nil {
-		err = h.Get(dctx, &dec)
-	}
+	dec, err := decide(dctx, c, id, req)
 	if err == nil {
 		return dec, nil
 	}
@@ -87,14 +93,7 @@ func reverseAuth(ctx context.Context, c client.Client, id string, req AuthReques
 // decided is how long the decision took, the latency a network waits on.
 func authorizeAndCapture(ctx context.Context, c client.Client, id string, req AuthRequest) (dec Decision, decided time.Duration, err error) {
 	began := time.Now()
-	h, err := c.UpdateWithStartWorkflow(ctx, client.UpdateWithStartWorkflowOptions{
-		StartWorkflowOperation: startAuth(c, id, req),
-		UpdateOptions:          client.UpdateWorkflowOptions{UpdateName: AuthorizeUpdate, WaitForStage: client.WorkflowUpdateStageCompleted},
-	})
-	if err != nil {
-		return dec, 0, err
-	}
-	err = h.Get(ctx, &dec)
+	dec, err = decide(ctx, c, id, req)
 	decided = time.Since(began)
 	if err != nil || !dec.Approved {
 		return dec, decided, err

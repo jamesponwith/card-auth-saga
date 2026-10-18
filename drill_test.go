@@ -659,17 +659,6 @@ func TestDrills(t *testing.T) {
 		req := func(amount int64) AuthRequest {
 			return AuthRequest{CardID: d.card, Merchant: d.merchant, Amount: amount, RefundWindow: time.Second}
 		}
-		result := func(id string) AuthResult {
-			t.Helper()
-			wctx, cancel := context.WithTimeout(ctx, 30*time.Second) // a hold left standing would wait 7 days
-			defer cancel()
-			var res AuthResult
-			if err := c.GetWorkflow(ctx, id, "").Get(wctx, &res); err != nil {
-				t.Fatal(err)
-			}
-			d.replay(c.GetWorkflow(ctx, id, ""))
-			return res
-		}
 		runs := func(id string) int {
 			r, err := c.ListWorkflow(ctx, &workflowservice.ListWorkflowExecutionsRequest{Query: fmt.Sprintf("WorkflowId = %q", id)})
 			if err != nil {
@@ -712,27 +701,21 @@ func TestDrills(t *testing.T) {
 		if dec := <-answer; dec != (Decision{Reason: DeclineReversed}) {
 			t.Errorf("decision = %+v, want declined %s: the hold doesn't stand", dec, DeclineReversed)
 		}
-		if res := result(a); res != (AuthResult{Status: StatusReversed}) {
-			t.Errorf("a: %+v, want reversed", res)
-		}
+		d.expect(c.GetWorkflow(ctx, a, ""), AuthResult{Status: StatusReversed})
 
 		// b: the network times out and reverses; the late hold is released.
 		b := d.card + "-b"
 		if dec, err := authorizeWithin(ctx, c, b, req(40_000), 300*time.Millisecond); err != nil || dec != (Decision{Reason: DeclineTimeout}) {
 			t.Errorf("b: %+v, %v; want declined %s", dec, err, DeclineTimeout)
 		}
-		if res := result(b); res != (AuthResult{Status: StatusReversed}) {
-			t.Errorf("b: %+v, want reversed", res)
-		}
+		d.expect(c.GetWorkflow(ctx, b, ""), AuthResult{Status: StatusReversed})
 
 		// c: a slow decline times out too; its reversal has nothing to undo.
 		cc := d.card + "-c"
 		if dec, err := authorizeWithin(ctx, c, cc, req(100_001), 300*time.Millisecond); err != nil || dec != (Decision{Reason: DeclineTimeout}) {
 			t.Errorf("c: %+v, %v; want declined %s", dec, err, DeclineTimeout)
 		}
-		if res := result(cc); res != (AuthResult{Status: StatusDeclined, Reason: DeclineOverLimit}) {
-			t.Errorf("c: %+v, want declined OverLimit", res)
-		}
+		d.expect(c.GetWorkflow(ctx, cc, ""), AuthResult{Status: StatusDeclined, Reason: DeclineOverLimit})
 
 		// d: the reversal gets there first; the network's own request, arriving
 		// late, finds the auth finished and places nothing.
@@ -740,9 +723,7 @@ func TestDrills(t *testing.T) {
 		if err := reverseAuth(ctx, c, dd, req(40_000)); err != nil {
 			t.Fatal(err)
 		}
-		if res := result(dd); res != (AuthResult{Status: StatusReversed}) {
-			t.Errorf("d: %+v, want reversed", res)
-		}
+		d.expect(c.GetWorkflow(ctx, dd, ""), AuthResult{Status: StatusReversed})
 		if dec, err := authorizeWithin(ctx, c, dd, req(40_000), time.Minute); err != nil || dec.Approved {
 			t.Errorf("d: the late request = %+v, %v; want no approval (and, below, no second run)", dec, err)
 		}
