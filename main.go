@@ -12,6 +12,8 @@
 //	card-auth-saga freeze|unfreeze|close <card>   decline new auths; closing is final (MySQL)
 //	card-auth-saga replace <card> <new-number>    a new number on the same account; the old one declines (MySQL)
 //	card-auth-saga audit                          run the ledger audit now; exits non-zero on findings
+//	card-auth-saga subscribe <id> <card> <merchant> <cents>   charge the card every 30 days, from now
+//	card-auth-saga unsubscribe <id>               stop a subscription's future charges
 package main
 
 import (
@@ -50,6 +52,9 @@ func run(ctx context.Context, args []string, env func(string) string) error {
 	temporalOptions := client.Options{HostPort: env("TEMPORAL_ADDRESS")} // empty: localhost:7233
 	if len(args) == 1 && args[0] == "audit" {
 		return audit(ctx, temporalOptions)
+	}
+	if len(args) > 0 && (args[0] == "subscribe" || args[0] == "unsubscribe") {
+		return subscriptionCmd(ctx, args, temporalOptions)
 	}
 	var cmd adminCmd
 	if len(args) > 0 {
@@ -120,6 +125,7 @@ func run(ctx context.Context, args []string, env func(string) string) error {
 	w.RegisterWorkflow(AuthorizeWorkflow)
 	w.RegisterWorkflow(StatementWorkflow)
 	w.RegisterWorkflow(AuditWorkflow)
+	w.RegisterWorkflow(SubscriptionWorkflow)
 	acts.Temporal = c
 	w.RegisterActivity(acts)
 	if err := ensureCardIDAttribute(ctx, c, temporalOptions.Namespace); err != nil {
@@ -133,7 +139,7 @@ func run(ctx context.Context, args []string, env func(string) string) error {
 	return w.Run(stopped) // until ctx is cancelled: SIGINT or SIGTERM in main
 }
 
-var errUsage = errors.New("usage: card-auth-saga [set-limit <card> <cents> | set-apr <card> <basis-points> | set-rate <merchant> <points-per-dollar> | freeze|unfreeze|close <card> | replace <card> <new-number> | audit]")
+var errUsage = errors.New("usage: card-auth-saga [set-limit <card> <cents> | set-apr <card> <basis-points> | set-rate <merchant> <points-per-dollar> | freeze|unfreeze|close <card> | replace <card> <new-number> | subscribe <id> <card> <merchant> <cents> | unsubscribe <id> | audit]")
 
 // adminCmd applies a parsed admin command. Temporal options reach set-limit,
 // which also starts the card's statements.
@@ -154,7 +160,6 @@ func admin(args []string) (adminCmd, error) {
 		return nil, errUsage
 	}
 	id := args[1]
-	// Account IDs are card:<id>:<kind>, and the audit quotes card IDs in visibility queries.
 	cardIDs := args[1:2]
 	switch args[0] {
 	case "set-rate": // merchants aren't card IDs
@@ -163,8 +168,8 @@ func admin(args []string) (adminCmd, error) {
 		cardIDs = args[1:]
 	}
 	for _, c := range cardIDs {
-		if strings.ContainsAny(c, `:'"\`) {
-			return nil, fmt.Errorf("%s: card ID %q can't contain : ' \" or \\", args[0], c)
+		if err := checkCardID(args[0], c); err != nil {
+			return nil, err
 		}
 	}
 	if args[0] == "replace" {
@@ -192,6 +197,15 @@ func admin(args []string) (adminCmd, error) {
 		return func(ctx context.Context, l *MySQLLedger, _ client.Options) error { return l.SetRewardRate(ctx, id, n) }, nil
 	}
 	return nil, errUsage
+}
+
+// checkCardID refuses what a card ID can't hold: account IDs are
+// card:<id>:<kind>, and the audit quotes card IDs in visibility queries.
+func checkCardID(cmd, id string) error {
+	if strings.ContainsAny(id, `:'"\`) {
+		return fmt.Errorf("%s: card ID %q can't contain : ' \" or \\", cmd, id)
+	}
+	return nil
 }
 
 // onAccount runs f on the account a card number belongs to. A new ID is its
@@ -253,6 +267,49 @@ func audit(ctx context.Context, opts client.Options) error {
 		lines[i] = fmt.Sprintf("  %s %s: %s", f.Check, f.Subject, f.Detail)
 	}
 	return fmt.Errorf("audit: %d findings\n%s", len(report.Findings), strings.Join(lines, "\n"))
+}
+
+// subscriptionCmd starts a subscription, which charges at once and then every
+// cycle, or cancels one. A subscription ID is used once, ever.
+func subscriptionCmd(ctx context.Context, args []string, opts client.Options) error {
+	subscribe := args[0] == "subscribe" && len(args) == 5
+	if !subscribe && !(args[0] == "unsubscribe" && len(args) == 2) || slices.Contains(args[1:], "") {
+		return errUsage
+	}
+	var terms SubscriptionTerms
+	if subscribe {
+		terms = SubscriptionTerms{ID: args[1], CardID: args[2], Merchant: args[3]}
+		var err error
+		if terms.Amount, err = strconv.ParseInt(args[4], 10, 64); err != nil || terms.Amount <= 0 {
+			return fmt.Errorf("subscribe: %q is not a positive number of cents", args[4])
+		}
+		if err := checkCardID(args[0], terms.CardID); err != nil {
+			return err
+		}
+	}
+	c, err := client.Dial(opts)
+	if err != nil {
+		return fmt.Errorf("dial temporal: %w", err)
+	}
+	defer c.Close()
+	id := SubscriptionWorkflowID(args[1])
+	if subscribe {
+		// Without ErrorWhenAlreadyStarted the client hands back the existing run, and a reused ID looks like success.
+		_, err = c.ExecuteWorkflow(ctx, client.StartWorkflowOptions{ID: id, TaskQueue: TaskQueue,
+			WorkflowIDReusePolicy: enumspb.WORKFLOW_ID_REUSE_POLICY_REJECT_DUPLICATE, WorkflowExecutionErrorWhenAlreadyStarted: true},
+			SubscriptionWorkflow, terms, Subscription{})
+	} else {
+		var h client.WorkflowUpdateHandle
+		h, err = c.UpdateWorkflow(ctx, client.UpdateWorkflowOptions{WorkflowID: id, UpdateName: CancelUpdate, WaitForStage: client.WorkflowUpdateStageCompleted})
+		if err == nil {
+			err = h.Get(ctx, nil)
+		}
+	}
+	if err != nil {
+		return fmt.Errorf("%s %s: %w", args[0], args[1], err)
+	}
+	fmt.Println("ok:", strings.Join(args, " "))
+	return nil
 }
 
 // ensureCardIDAttribute registers the CardID search attribute, which every

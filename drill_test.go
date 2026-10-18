@@ -549,6 +549,106 @@ func TestDrills(t *testing.T) {
 		}
 	})
 
+	t.Run("subscriptions", func(t *testing.T) {
+		dsn := os.Getenv("CAS_MYSQL_DSN")
+		if dsn == "" {
+			t.Skip("replacement and status changes live in MySQL; set CAS_MYSQL_DSN")
+		}
+		d := newDrill(t, c, "sub", nil)
+		d.acts.Temporal = c // charges authorize through the client, as a network does
+		d.startWorker()
+		ctx := context.Background()
+		env := envOf(map[string]string{"CAS_MYSQL_DSN": dsn, "TEMPORAL_ADDRESS": srv.FrontendHostPort()})
+		admin := func(args ...string) {
+			t.Helper()
+			if err := run(ctx, args, env); err != nil {
+				t.Fatal(err)
+			}
+		}
+		// waitFor polls a subscription's query until ok, and returns what it saw last.
+		waitFor := func(id string, ok func(Subscription) bool) Subscription {
+			t.Helper()
+			var sub Subscription
+			for deadline := time.Now().Add(20 * time.Second); time.Now().Before(deadline); time.Sleep(100 * time.Millisecond) {
+				if v, err := c.QueryWorkflow(ctx, SubscriptionWorkflowID(id), "", SubscriptionQuery); err == nil && v.Get(&sub) == nil && ok(sub) {
+					return sub
+				}
+			}
+			t.Fatalf("subscription %s stuck at %+v", id, sub)
+			return sub
+		}
+
+		// From the CLI: charged at signup, cancelled, and its ID never reused.
+		cli := d.card + "-cli"
+		admin("set-limit", cli, "100000")                 // a card of its own, so the life below stays under velocity's 5 a minute
+		admin("subscribe", cli, cli, cli+"-shop", "1000") // and a merchant: the points checks below are per merchant
+		waitFor(cli, func(s Subscription) bool { return s.Charged == 1_000 })
+		admin("unsubscribe", cli)
+		var res Subscription
+		if err := c.GetWorkflow(ctx, SubscriptionWorkflowID(cli), "").Get(ctx, &res); err != nil || res.Status != SubCancelled {
+			t.Errorf("after unsubscribe: %+v, %v; want cancelled", res, err)
+		}
+		if err := run(ctx, []string{"subscribe", cli, cli, cli + "-shop", "1000"}, env); err == nil {
+			t.Error("a subscription ID was used twice")
+		}
+
+		// A life on a 3s cycle: the card replaced, frozen past a charge and back,
+		// then closed. Four charge attempts reach the velocity count; the frozen
+		// and closed declines come before it.
+		life := d.card + "-life"
+		if _, err := c.ExecuteWorkflow(ctx, client.StartWorkflowOptions{ID: SubscriptionWorkflowID(life), TaskQueue: TaskQueue}, SubscriptionWorkflow,
+			SubscriptionTerms{ID: life, CardID: d.card, Merchant: d.merchant, Amount: 1_000, Cycle: 3 * time.Second,
+				Retries: []time.Duration{time.Second, time.Second, 5 * time.Second}}, Subscription{}); err != nil {
+			t.Fatal(err)
+		}
+		waitFor(life, func(s Subscription) bool { return s.Charged >= 1_000 })
+		admin("replace", d.card, d.card+"-new") // the account updater: no re-signup
+		at := waitFor(life, func(s Subscription) bool { return s.Charged >= 3_000 }).Charged
+		admin("freeze", d.card+"-new")
+		waitFor(life, func(s Subscription) bool { return s.Status == SubPastDue && s.LastReason == DeclineFrozen })
+		admin("unfreeze", d.card+"-new")
+		waitFor(life, func(s Subscription) bool { return s.Status == SubActive && s.Charged > at })
+		admin("close", d.card)
+		if err := c.GetWorkflow(ctx, SubscriptionWorkflowID(life), "").Get(ctx, &res); err != nil || res.Status != SubEnded || res.LastReason != DeclineClosed {
+			t.Fatalf("after close: %+v, %v; want ended, Closed", res, err)
+		}
+
+		// Every charge settled on the one account, at 1 point per $1.
+		charged := res.Charged
+		deadline := time.Now().Add(20 * time.Second) // the last capture's rewards may still be posting
+		for time.Now().Before(deadline) && balance(t, d.l, pointsAccount(d.card)) != charged/100 {
+			time.Sleep(100 * time.Millisecond)
+		}
+		d.expectBalances(0, charged, charged/100)
+		d.replay(c.GetWorkflow(ctx, SubscriptionWorkflowID(life), ""))
+
+		// A retried charge attempt never charges twice, approved or declined.
+		admin("set-limit", d.card+"-retry", "100000")
+		for _, tt := range []struct {
+			name   string
+			before func()
+			want   Decision
+		}{
+			{"approved", func() {}, Decision{Approved: true}},
+			{"declined", func() { admin("freeze", d.card+"-retry") }, Decision{Reason: DeclineFrozen}},
+		} {
+			tt.before()
+			ch := Charge{AuthID: d.card + "-retry-" + tt.name, Number: d.card + "-retry", Merchant: d.merchant, Amount: 1_000}
+			for range 2 {
+				if got, err := d.acts.ChargeCard(ctx, ch); err != nil || got != tt.want {
+					t.Errorf("%s: ChargeCard = %+v, %v; want %+v", tt.name, got, err, tt.want)
+				}
+			}
+			runs, err := c.ListWorkflow(ctx, &workflowservice.ListWorkflowExecutionsRequest{Query: fmt.Sprintf("WorkflowId = %q", ch.AuthID)})
+			if err != nil || len(runs.GetExecutions()) != 1 {
+				t.Errorf("%s: %d runs of %s (%v), want 1", tt.name, len(runs.GetExecutions()), ch.AuthID, err)
+			}
+		}
+		if p := balance(t, d.l, postedAccount(d.card+"-retry")); p != 1_000 {
+			t.Errorf("posted after retried charges = %d, want one 1000 charge", p)
+		}
+	})
+
 	t.Run("update with start declined", func(t *testing.T) {
 		d := newDrill(t, c, "uws-decline", nil)
 		d.startWorker()
@@ -601,6 +701,7 @@ func (d *drill) startWorker() worker.Worker {
 	w.RegisterWorkflow(AuthorizeWorkflow)
 	w.RegisterWorkflow(StatementWorkflow)
 	w.RegisterWorkflow(AuditWorkflow)
+	w.RegisterWorkflow(SubscriptionWorkflow)
 	w.RegisterActivity(d.acts)
 	if err := w.Start(); err != nil {
 		d.t.Fatal(err)
@@ -759,6 +860,7 @@ func (d *drill) replay(run client.WorkflowRun) {
 	r.RegisterWorkflow(AuthorizeWorkflow)
 	r.RegisterWorkflow(StatementWorkflow)
 	r.RegisterWorkflow(AuditWorkflow)
+	r.RegisterWorkflow(SubscriptionWorkflow)
 	if err := r.ReplayWorkflowHistory(nil, &h); err != nil {
 		d.t.Errorf("replay: %v", err)
 	}
@@ -831,6 +933,7 @@ func TestReplayGoldenHistories(t *testing.T) {
 			r.RegisterWorkflow(AuthorizeWorkflow)
 			r.RegisterWorkflow(StatementWorkflow)
 			r.RegisterWorkflow(AuditWorkflow)
+			r.RegisterWorkflow(SubscriptionWorkflow)
 			if err := r.ReplayWorkflowHistoryFromJSONFile(nil, f); err != nil {
 				t.Error(err)
 			}

@@ -17,7 +17,6 @@ import (
 	"testing"
 	"time"
 
-	enumspb "go.temporal.io/api/enums/v1"
 	"go.temporal.io/sdk/client"
 	"go.temporal.io/sdk/testsuite"
 	"go.temporal.io/sdk/worker"
@@ -69,7 +68,7 @@ func TestLoad(t *testing.T) {
 					for i := range jobs {
 						card := fmt.Sprintf("%s-c%d", prefix, i%sc.cards)
 						id := fmt.Sprintf("%s-auth%d", prefix, i)
-						dec, decided, err := authorizeAndSettle(ctx, c, id, AuthRequest{CardID: card, Amount: amount, Merchant: "shop", RefundWindow: time.Millisecond})
+						dec, decided, err := authorizeAndCapture(ctx, c, id, AuthRequest{CardID: card, Amount: amount, Merchant: "shop", RefundWindow: time.Millisecond})
 						latencies[i] = decided
 						if err != nil {
 							t.Error(err)
@@ -157,31 +156,4 @@ func loadTarget(t *testing.T) (client.Client, *MySQLLedger) {
 	}
 	t.Cleanup(w.Stop)
 	return c, l
-}
-
-// authorizeAndSettle asks for a decision and, if approved, captures in full.
-// decided is how long the decision took, the latency a network waits on.
-func authorizeAndSettle(ctx context.Context, c client.Client, id string, req AuthRequest) (dec Decision, decided time.Duration, err error) {
-	began := time.Now()
-	h, err := c.UpdateWithStartWorkflow(ctx, client.UpdateWithStartWorkflowOptions{
-		StartWorkflowOperation: c.NewWithStartWorkflowOperation(client.StartWorkflowOptions{
-			ID: id, TaskQueue: TaskQueue, WorkflowIDConflictPolicy: enumspb.WORKFLOW_ID_CONFLICT_POLICY_USE_EXISTING,
-		}, AuthorizeWorkflow, req),
-		UpdateOptions: client.UpdateWorkflowOptions{UpdateName: AuthorizeUpdate, WaitForStage: client.WorkflowUpdateStageCompleted},
-	})
-	if err != nil {
-		return dec, 0, err
-	}
-	err = h.Get(ctx, &dec)
-	decided = time.Since(began)
-	if err != nil || !dec.Approved {
-		return dec, decided, err
-	}
-	ch, err := c.UpdateWorkflow(ctx, client.UpdateWorkflowOptions{
-		WorkflowID: id, UpdateName: CaptureSignal, Args: []any{Capture{Amount: req.Amount}}, WaitForStage: client.WorkflowUpdateStageCompleted,
-	})
-	if err != nil {
-		return dec, decided, err
-	}
-	return dec, decided, ch.Get(ctx, nil)
 }

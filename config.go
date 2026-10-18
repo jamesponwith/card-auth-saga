@@ -21,6 +21,9 @@ type Config interface {
 	// number has been replaced (SPEC M18). A number with no record is its own
 	// account, so an unknown number reaches the limit check and declines there.
 	CardAccount(ctx context.Context, number string) (account string, replaced bool, err error)
+	// CurrentNumber is the number its card carries now: the number itself, or
+	// the one that replaced it (SPEC M19's account updater).
+	CurrentNumber(ctx context.Context, number string) (string, error)
 }
 
 // Card statuses (SPEC M16). Closed is final.
@@ -42,6 +45,16 @@ type StaticConfig struct {
 
 func (c StaticConfig) CardAccount(_ context.Context, number string) (string, bool, error) {
 	return cmp.Or(c.Numbers[number], number), c.Replaced[number], nil
+}
+
+func (c StaticConfig) CurrentNumber(_ context.Context, number string) (string, error) {
+	account := cmp.Or(c.Numbers[number], number)
+	for n, a := range c.Numbers {
+		if a == account && !c.Replaced[n] {
+			return n, nil
+		}
+	}
+	return number, nil // never replaced
 }
 
 func (c StaticConfig) CreditLimit(_ context.Context, card string) (int64, bool, error) {

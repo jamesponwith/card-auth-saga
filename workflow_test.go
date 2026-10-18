@@ -407,6 +407,9 @@ func (brokenConfig) CardStatus(context.Context, string) (string, bool, error) {
 func (brokenConfig) CardAccount(context.Context, string) (string, bool, error) {
 	return "", false, errors.New("config store down")
 }
+func (brokenConfig) CurrentNumber(context.Context, string) (string, error) {
+	return "", errors.New("config store down")
+}
 
 // A config store outage must fail the auth, not decline the card as unknown.
 func TestConfigOutageIsNotADecline(t *testing.T) {

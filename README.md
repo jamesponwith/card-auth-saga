@@ -146,6 +146,19 @@ Auths already placed on the old number still capture, refund and dispute as usua
 the ID it was created with, here `card-1`: `statement:card-1`, the ledger's `card:card-1:*` accounts,
 and the `CardID` every auth is tagged with. Admin commands accept any of a card's numbers.
 
+A subscription charges a card every 30 days without the cardholder there (SPEC.md, M19). Each
+charge is an ordinary auth and capture, so limits, velocity, rewards and refunds all apply:
+
+```sh
+go run . subscribe streaming-1 card-1b shell 1599   # $15.99 now, then every 30 days
+temporal workflow query --workflow-id subscription:streaming-1 --name subscription
+go run . unsubscribe streaming-1
+```
+
+A declined charge makes the subscription `past-due` and is retried on days 1, 3 and 7. If the last
+retry declines too, the subscription is `lapsed`. A closed card ends it (`ended`). Each charge goes to the
+card's current number, so subscriptions survive `replace` with no re-signup.
+
 ## Deploy
 
 Pushing a `v*` tag releases and deploys (ADR 0007). `release.yml` runs goreleaser, then
