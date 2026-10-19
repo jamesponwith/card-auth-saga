@@ -754,6 +754,38 @@ func TestDrills(t *testing.T) {
 		fast.expectBalances(0, 0, 0)
 	})
 
+	t.Run("points redemption", func(t *testing.T) {
+		d := newDrill(t, c, "redeem", nil)
+		d.startWorker()
+		ctx := context.Background()
+		if err := d.l.Post(ctx, d.card+":seed-points", Entry{pointsAccount(d.card), 3_000}, Entry{partnerPointsAccount(d.merchant), -3_000}); err != nil {
+			t.Fatal(err)
+		}
+		id := StatementWorkflowID(d.card)
+		if _, err := c.ExecuteWorkflow(ctx, client.StartWorkflowOptions{ID: id, TaskQueue: TaskQueue}, StatementWorkflow, StatementTerms{CardID: d.card}, Statement{}); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = c.TerminateWorkflow(ctx, id, "", "drill done") })
+		send := func(updateID string, r Redemption) error {
+			h, err := c.UpdateWorkflow(ctx, client.UpdateWorkflowOptions{WorkflowID: id, UpdateID: updateID, UpdateName: RedeemUpdate,
+				Args: []any{r}, WaitForStage: client.WorkflowUpdateStageCompleted})
+			if err == nil {
+				err = h.Get(ctx, nil)
+			}
+			return err
+		}
+		if err := send("u1", Redemption{ID: "r1", Points: 2_000}); err != nil {
+			t.Fatal(err)
+		}
+		if err := send("u2", Redemption{ID: "r2", Points: 1_500}); err == nil || !strings.Contains(err.Error(), "1000 points to redeem") {
+			t.Errorf("redeeming 1500 of 1000 points: %v, want refused", err)
+		}
+		d.expectBalances(0, -2_000, 1_000) // a $20 credit on a card that owed nothing
+		if got := balance(t, d.l, redeemedAccount(d.card)); got != 2_000 {
+			t.Errorf("redeemed = %d, want 2000", got)
+		}
+	})
+
 	t.Run("update with start declined", func(t *testing.T) {
 		d := newDrill(t, c, "uws-decline", nil)
 		d.startWorker()
@@ -945,7 +977,7 @@ func (d *drill) expectBalances(holds, posted, points int64) {
 	if sum := b(holdsAccount(d.card)) + b(postedAccount(d.card)) + b(openToBuyAccount(d.card)); sum != 0 {
 		d.t.Errorf("card money nets to %d, want 0", sum)
 	}
-	if sum := b(pointsAccount(d.card)) + b(partnerPointsAccount(d.merchant)); sum != 0 {
+	if sum := b(pointsAccount(d.card)) + b(redeemedAccount(d.card)) + b(partnerPointsAccount(d.merchant)); sum != 0 {
 		d.t.Errorf("points net to %d, want 0", sum)
 	}
 }

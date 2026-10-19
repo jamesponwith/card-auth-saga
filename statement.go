@@ -13,6 +13,7 @@ import (
 
 const (
 	PayUpdate      = "pay"       // a card payment; see Payment
+	RedeemUpdate   = "redeem"    // points for a statement credit; see Redemption
 	StatementQuery = "statement" // the current Statement
 
 	DefaultCycle  = 30 * 24 * time.Hour // statement cycle length
@@ -51,6 +52,17 @@ type Payment struct {
 	ID     string
 	Amount int64 // cents
 }
+
+// Redemption is the payload of the redeem update: points for a statement
+// credit, 1 point per cent (SPEC M21). ID makes a resend credit once.
+type Redemption struct {
+	ID     string
+	Points int64
+}
+
+// redeemedAccount holds the points a card has redeemed, the other half of
+// each redemption's points entry.
+func redeemedAccount(card string) string { return "card:" + card + ":points-redeemed" }
 
 // StatementWorkflow runs one cycle per run. Each day it samples the card's
 // posted balance; on the due day it charges a late fee if the last statement's
@@ -96,6 +108,31 @@ func StatementWorkflow(ctx workflow.Context, terms StatementTerms, last Statemen
 				return fmt.Errorf("payment ID %q empty or already used", p.ID)
 			case p.Amount <= 0:
 				return fmt.Errorf("payment %d not positive", p.Amount)
+			}
+			return nil
+		}},
+	); err != nil {
+		return err
+	}
+
+	// One redemption at a time, so two can't spend the same points.
+	redeeming, redeemed := false, map[string]bool{}
+	if err := workflow.SetUpdateHandlerWithOptions(ctx, RedeemUpdate,
+		func(ctx workflow.Context, r Redemption) error {
+			redeeming, redeemed[r.ID] = true, true
+			defer func() { redeeming = false }()
+			return workflow.ExecuteActivity(withLedger(ctx), a.RedeemPoints, terms.CardID, r).Get(ctx, nil)
+		},
+		workflow.UpdateHandlerOptions{Validator: func(_ workflow.Context, r Redemption) error {
+			switch {
+			case closing:
+				return errors.New("statement closing; retry shortly")
+			case redeeming:
+				return errors.New("a redemption is in progress; retry shortly")
+			case r.ID == "" || redeemed[r.ID]:
+				return fmt.Errorf("redemption ID %q empty or already used", r.ID)
+			case r.Points <= 0:
+				return fmt.Errorf("redemption of %d points not positive", r.Points)
 			}
 			return nil
 		}},
@@ -275,4 +312,31 @@ func (a *Activities) CardAPR(ctx context.Context, card string) (int64, error) {
 // PostedBalance is the card's posted balance, which a statement closes on.
 func (a *Activities) PostedBalance(ctx context.Context, card string) (int64, error) {
 	return a.Ledger.Balance(ctx, postedAccount(card))
+}
+
+// RedeemPoints turns points into a statement credit, 1 point per cent: points
+// to the card's redeemed account, and the credit from posted to open-to-buy,
+// in one posting. A resend, even in a later cycle, credits nothing more.
+// ponytail: check-then-post, safe because the statement runs one redemption
+// at a time; a clawback landing between them can take points below zero, as
+// any refund after a redemption can. Make it one conditional posting if
+// anything else ever spends points.
+func (a *Activities) RedeemPoints(ctx context.Context, card string, r Redemption) error {
+	key := stepKey(ctx, "redeem:"+r.ID)
+	if done, err := a.Ledger.Posted(ctx, key); err != nil || done { // a retry after it posted reports success, not "too few"
+		return err
+	}
+	have, err := a.Ledger.Balance(ctx, pointsAccount(card))
+	if err != nil {
+		return err
+	}
+	if have < r.Points {
+		return temporal.NewNonRetryableApplicationError(fmt.Sprintf("%d points to redeem, %d asked", have, r.Points), "InsufficientPoints", nil)
+	}
+	return a.Ledger.Post(ctx, key,
+		Entry{pointsAccount(card), -r.Points},
+		Entry{redeemedAccount(card), r.Points},
+		Entry{postedAccount(card), -r.Points},
+		Entry{openToBuyAccount(card), r.Points},
+	)
 }

@@ -199,7 +199,7 @@ on demand with `go run . audit`. It reports findings rather than fixing anything
 |---|---|
 | Card money | holds + posted + open-to-buy nets to 0, per card |
 | Holds | never negative, per card |
-| Points | a card's points are never negative; card points + partner points-issued net to 0 |
+| Points | a card's points plus those it redeemed are never negative (a refund after a redemption can take points below 0, never past what was earned); card points + redeemed + partner points-issued net to 0 |
 | Payment memos | each card's `paid:s<N>` accounts + `payments` net to 0 |
 | Whole ledger | every account sums to 0 |
 | Stuck auths | no `AuthorizeWorkflow` running past its longest life (hold + refunds + both dispute deadlines: 120 days) |
@@ -314,6 +314,29 @@ does the same from the command line.
 No `GetVersion` is needed. The new paths start only from a `reverse` update accepted while deciding,
 which runs from before M20 rejected. Rejected updates never reach history.
 
+## Points redemption (M21)
+
+Points become a statement credit, 1 point per cent, through the card's statement workflow: the `redeem`
+update (`{ID, Points}`).
+
+| Step | card points | points-redeemed | posted | open-to-buy |
+|------|------------:|----------------:|-------:|------------:|
+| Redeem P | −P | +P | −P | +P |
+
+- **One posting**, keyed by the redemption ID, once per card ever. A resend, even in a later cycle,
+  credits nothing more. A retry after the posting landed reports success, not "too few points"
+  (`Posted` checks the key first).
+- **A credit, not a payment.** It lowers the balance the next statement closes on, but doesn't count
+  toward the minimum due, so a card that only redeems still pays a late fee.
+- **Refused:** more points than the card holds (an update error), a used or empty ID, non-positive
+  points, and a redemption while the statement is closing or while another is posting. Redemptions
+  run one at a time, so two can't spend the same points.
+- **Clawback after redeeming.** A refund that lands after a redemption claws its points back as usual,
+  and can take the card below 0. The audit's points check is therefore points + redeemed ≥ 0: never
+  clawed back more than was earned.
+- Old statement runs replay unchanged. Registering a handler records nothing, and only a `redeem`
+  update reaches the new activity.
+
 ## Non-goals
 
 - Real card networks (ISO 8583), PCI scope, or real money.
@@ -343,6 +366,7 @@ which runs from before M20 rejected. Rejected updates never reach history.
 - **M18**: Card replacement: a new number on the same account (ADR 0009).
 - **M19**: Recurring charges: subscriptions with retries, lapse, cancel and account updater (ADR 0010).
 - **M20**: Decision deadline: timeout reversals that leave no hold, whenever they land.
+- **M21**: Points redemption for statement credit.
 
 ## Success criteria
 

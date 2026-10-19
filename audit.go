@@ -101,9 +101,10 @@ func (a *Activities) AuditLedger(ctx context.Context) ([]Finding, error) {
 }
 
 // auditLedger checks the invariants that every posting keeps (SPEC M15):
-// per card, money nets to zero and holds and points never go negative; payment
-// memos net to zero; points net to zero against the partners; and the whole
-// ledger sums to zero.
+// per card, money nets to zero, holds never go negative, and points plus those
+// redeemed never do (a refund after a redemption can take points below zero,
+// but never claw back more than was earned, M21); payment memos net to zero;
+// points net to zero against the partners; and the whole ledger sums to zero.
 func auditLedger(accounts map[string]int64) []Finding {
 	type card struct{ money, holds, points, memos int64 }
 	cards := map[string]*card{}
@@ -133,7 +134,7 @@ func auditLedger(accounts map[string]int64) []Finding {
 			c.holds += b
 		case kind == "posted" || kind == "open-to-buy":
 			c.money += b
-		case kind == "points":
+		case kind == "points" || kind == "points-redeemed":
 			c.points += b
 			pointsNet += b
 		case kind == "payments" || strings.HasPrefix(kind, "paid:"):
@@ -151,14 +152,14 @@ func auditLedger(accounts map[string]int64) []Finding {
 			findings = append(findings, Finding{CheckHolds, id, fmt.Sprintf("holds = %d", c.holds)})
 		}
 		if c.points < 0 {
-			findings = append(findings, Finding{CheckPoints, id, fmt.Sprintf("points = %d", c.points)})
+			findings = append(findings, Finding{CheckPoints, id, fmt.Sprintf("points + redeemed = %d", c.points)})
 		}
 		if c.memos != 0 {
 			findings = append(findings, Finding{CheckPaymentMemos, id, fmt.Sprintf("paid + payments = %d", c.memos)})
 		}
 	}
 	if pointsNet != 0 {
-		findings = append(findings, Finding{CheckPointsNet, "", fmt.Sprintf("card points + partner points-issued = %d", pointsNet)})
+		findings = append(findings, Finding{CheckPointsNet, "", fmt.Sprintf("card points + redeemed + partner points-issued = %d", pointsNet)})
 	}
 	if total != 0 {
 		findings = append(findings, Finding{CheckLedgerTotal, "", fmt.Sprintf("all accounts = %d", total)})

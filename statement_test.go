@@ -312,3 +312,74 @@ func continuedAs(t *testing.T, env *testsuite.TestWorkflowEnvironment) (Statemen
 	}
 	return terms, next
 }
+
+func redeem(at time.Duration, id string, points int64) signal {
+	return signal{at, RedeemUpdate, Redemption{ID: id, Points: points}}
+}
+
+// withPoints is seeded's ledger with points the card earned at shop.
+func withPoints(t *testing.T, cents, points int64) *MemLedger {
+	t.Helper()
+	l := seeded(t, cents)
+	if err := l.Post(t.Context(), "seed-points", Entry{pointsAccount("card-1"), points}, Entry{partnerPointsAccount("shop"), -points}); err != nil {
+		t.Fatal(err)
+	}
+	return l
+}
+
+// Points redeem 1:1 for a statement credit (SPEC M21). A credit isn't a
+// payment: it lowers the balance but doesn't count toward the minimum due.
+func TestRedeemPoints(t *testing.T) {
+	var s testsuite.WorkflowTestSuite
+	env := s.NewTestWorkflowEnvironment()
+	l := withPoints(t, 50_000, 3_000)
+	env.RegisterActivity(&Activities{Ledger: l, Config: StaticConfig{}})
+	steps := []step{
+		upd(redeem(day, "r1", 2_000), "ok"),
+		upd(redeem(day, "r1b", 2_000), "rejected"), // r1 is still posting: one at a time
+		upd(redeem(2*day, "r2", 1_500), "error"),   // 1,000 left
+		upd(redeem(3*day, "r1", 100), "rejected"),
+		upd(redeem(3*day, "r3", 0), "rejected"),
+		upd(redeem(4*day, "r4", 1_000), "ok"),
+	}
+	got := sendSteps(env, steps)
+
+	env.ExecuteWorkflow(StatementWorkflow, StatementTerms{CardID: "card-1"}, Statement{})
+
+	checkSteps(t, steps, got)
+	_, next := continuedAs(t, env)
+	if want := (Statement{N: 1, Balance: 47_000, MinDue: 2_500}); next != want {
+		t.Errorf("statement = %+v, want %+v: credited, not paid", next, want)
+	}
+	for account, want := range map[string]int64{pointsAccount("card-1"): 0, redeemedAccount("card-1"): 3_000, postedAccount("card-1"): 47_000} {
+		if got := balance(t, l, account); got != want {
+			t.Errorf("%s = %d, want %d", account, got, want)
+		}
+	}
+	accounts, err := l.Accounts(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if findings := auditLedger(accounts); findings != nil {
+		t.Errorf("audit after redemptions: %v", findings)
+	}
+}
+
+// A redemption resent after the statement closed credits nothing more.
+func TestRedemptionResentNextCycle(t *testing.T) {
+	l := withPoints(t, 50_000, 3_000)
+	for cycle := range 2 {
+		var s testsuite.WorkflowTestSuite
+		env := s.NewTestWorkflowEnvironment() // same workflow ID every run, as after ContinueAsNew
+		env.RegisterActivity(&Activities{Ledger: l, Config: StaticConfig{}})
+		steps := []step{upd(redeem(day, "r1", 2_000), "ok")}
+		got := sendSteps(env, steps)
+
+		env.ExecuteWorkflow(StatementWorkflow, StatementTerms{CardID: "card-1"}, Statement{N: cycle})
+
+		checkSteps(t, steps, got)
+		if p := balance(t, l, pointsAccount("card-1")); p != 1_000 {
+			t.Errorf("cycle %d: points = %d, want 1000: r1 redeems once", cycle, p)
+		}
+	}
+}
