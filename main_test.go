@@ -35,6 +35,13 @@ func TestAdminArgs(t *testing.T) {
 		{[]string{"replace", "card-1", ""}, "usage"},
 		{[]string{"replace", "card-1", "card:2"}, "can't contain"},
 		{[]string{"replace", "card-1", "o'brien"}, "can't contain"},
+		{[]string{"block", "card-1", "shop"}, ""},
+		{[]string{"unblock", "card-1", "shop"}, ""},
+		{[]string{"block", "card-1"}, "usage"},
+		{[]string{"block", "card-1", ""}, "usage"},
+		{[]string{"block", "card:1", "shop"}, "can't contain"},
+		{[]string{"subscriptions", "card-1"}, ""},
+		{[]string{"subscriptions"}, "usage"},
 	}
 	for _, tt := range tests {
 		t.Run(strings.Join(tt.args, " "), func(t *testing.T) {

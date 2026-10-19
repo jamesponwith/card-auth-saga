@@ -55,6 +55,8 @@ const (
 	DeclineReplaced    = "Replaced" // a number its card has been given a replacement for (M18)
 	DeclineTimeout     = "Timeout"  // the network's: no decision in time, so it reversed (M20)
 	DeclineReversed    = "Reversed" // a timeout reversal beat the decision; no hold stands
+	// The cardholder blocked the merchant (M22); a subscription it charges ends.
+	DeclineMerchantBlocked = "MerchantBlocked"
 )
 
 // Decision is the authorize update's answer.
@@ -178,7 +180,7 @@ func AuthorizeWorkflow(ctx workflow.Context, req AuthRequest) (AuthResult, error
 		s.holdErr = workflow.ExecuteLocalActivity(lctx, s.a.PlaceHold, req).Get(ctx, &held)
 	}
 	var declined *temporal.ApplicationError
-	if errors.As(s.holdErr, &declined) && slices.Contains([]string{DeclineVelocity, DeclineUnknownCard, DeclineFrozen, DeclineClosed}, declined.Type()) {
+	if errors.As(s.holdErr, &declined) && slices.Contains([]string{DeclineVelocity, DeclineUnknownCard, DeclineFrozen, DeclineClosed, DeclineMerchantBlocked}, declined.Type()) {
 		s.holdErr, s.reason = nil, declined.Type()
 	} else if s.holdErr == nil && !held {
 		s.reason = DeclineOverLimit
@@ -550,6 +552,12 @@ func (a *Activities) PlaceHold(ctx context.Context, req AuthRequest) (bool, erro
 	case status == CardClosed:
 		return false, temporal.NewNonRetryableApplicationError("card closed", DeclineClosed, nil)
 	}
+	// The cardholder's choice, not fraud: decline before velocity counts it.
+	if blocked, err := a.Config.MerchantBlocked(ctx, req.CardID, req.Merchant); err != nil {
+		return false, err
+	} else if blocked {
+		return false, temporal.NewNonRetryableApplicationError("merchant blocked", DeclineMerchantBlocked, nil)
+	}
 	// Velocity first: card testing makes many small auths, each under the limit.
 	// The store counts a card's attempts one at a time, so a burst is exact.
 	n, err := a.Ledger.RecordAttempt(ctx, req.CardID, activity.GetInfo(ctx).WorkflowExecution.ID, time.Now(), VelocityWindow)
@@ -571,6 +579,9 @@ func (a *Activities) IncreaseHold(ctx context.Context, req AuthRequest, i Increm
 	}
 	status, _, err := a.Config.CardStatus(ctx, req.CardID)
 	if err != nil || status != CardActive { // frozen or closed since the auth: no new credit
+		return false, err
+	}
+	if blocked, err := a.Config.MerchantBlocked(ctx, req.CardID, req.Merchant); err != nil || blocked {
 		return false, err
 	}
 	return a.hold(ctx, "hold:"+i.ID, req.CardID, i.Amount, limit)

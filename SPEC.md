@@ -337,6 +337,25 @@ update (`{ID, Points}`).
 - Old statement runs replay unchanged. Registering a handler records nothing, and only a `redeem`
   update reaches the new activity.
 
+## Subscription controls (M22)
+
+A cardholder can see their subscriptions and stop one from their own side, without the merchant's help.
+
+- **Listing:** `go run . subscriptions <card>` lists the account's running subscriptions with merchant,
+  amount and status, whichever of its numbers each was signed up on, then the blocked merchants. Each
+  `SubscriptionWorkflow` resolves its signup number's account once (`GetVersion("subscription-card-id")`),
+  carries it in its terms, and tags every run with it as `CardID`. Merchant and amount ride in the
+  workflow memo, set at `subscribe`, which continue-as-new keeps. The audit's and statements' `CardID`
+  queries all filter on `AuthorizeWorkflow`, so the tag doesn't touch them.
+- **Blocking:** `go run . block|unblock <card> <merchant>` (migration 8, `merchant_blocks`, per account
+  so it survives replacement). The merchant's new auths decline with `Reason: MerchantBlocked` before
+  the velocity check, so a block spends none of the card's velocity, and its increments decline too.
+  Holds already placed still capture, refund and dispute.
+- **A blocked merchant's subscription ends** at its next charge (`MerchantBlocked`, like `Closed`). Blocking
+  is how a cardholder stops a subscription, and unblocking doesn't restart it: they sign up again.
+- Old runs replay unchanged. Subscription runs from before the tag skip it, `PlaceHold`'s old results
+  were only ever the existing reasons, and the subscription golden history from before is kept.
+
 ## Non-goals
 
 - Real card networks (ISO 8583), PCI scope, or real money.
@@ -367,6 +386,7 @@ update (`{ID, Points}`).
 - **M19**: Recurring charges: subscriptions with retries, lapse, cancel and account updater (ADR 0010).
 - **M20**: Decision deadline: timeout reversals that leave no hold, whenever they land.
 - **M21**: Points redemption for statement credit.
+- **M22**: Subscription controls: list a card's subscriptions, block a merchant.
 
 ## Success criteria
 

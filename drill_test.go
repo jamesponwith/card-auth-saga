@@ -13,6 +13,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"os"
@@ -565,24 +566,11 @@ func TestDrills(t *testing.T) {
 				t.Fatal(err)
 			}
 		}
-		// waitFor polls a subscription's query until ok, and returns what it saw last.
-		waitFor := func(id string, ok func(Subscription) bool) Subscription {
-			t.Helper()
-			var sub Subscription
-			for deadline := time.Now().Add(20 * time.Second); time.Now().Before(deadline); time.Sleep(100 * time.Millisecond) {
-				if v, err := c.QueryWorkflow(ctx, SubscriptionWorkflowID(id), "", SubscriptionQuery); err == nil && v.Get(&sub) == nil && ok(sub) {
-					return sub
-				}
-			}
-			t.Fatalf("subscription %s stuck at %+v", id, sub)
-			return sub
-		}
-
 		// From the CLI: charged at signup, cancelled, and its ID never reused.
 		cli := d.card + "-cli"
 		admin("set-limit", cli, "100000")                 // a card of its own, so the life below stays under velocity's 5 a minute
 		admin("subscribe", cli, cli, cli+"-shop", "1000") // and a merchant: the points checks below are per merchant
-		waitFor(cli, func(s Subscription) bool { return s.Charged == 1_000 })
+		d.waitSub(cli, func(s Subscription) bool { return s.Charged == 1_000 })
 		admin("unsubscribe", cli)
 		var res Subscription
 		if err := c.GetWorkflow(ctx, SubscriptionWorkflowID(cli), "").Get(ctx, &res); err != nil || res.Status != SubCancelled {
@@ -601,13 +589,13 @@ func TestDrills(t *testing.T) {
 				Retries: []time.Duration{time.Second, time.Second, 5 * time.Second}}, Subscription{}); err != nil {
 			t.Fatal(err)
 		}
-		waitFor(life, func(s Subscription) bool { return s.Charged >= 1_000 })
+		d.waitSub(life, func(s Subscription) bool { return s.Charged >= 1_000 })
 		admin("replace", d.card, d.card+"-new") // the account updater: no re-signup
-		at := waitFor(life, func(s Subscription) bool { return s.Charged >= 3_000 }).Charged
+		at := d.waitSub(life, func(s Subscription) bool { return s.Charged >= 3_000 }).Charged
 		admin("freeze", d.card+"-new")
-		waitFor(life, func(s Subscription) bool { return s.Status == SubPastDue && s.LastReason == DeclineFrozen })
+		d.waitSub(life, func(s Subscription) bool { return s.Status == SubPastDue && s.LastReason == DeclineFrozen })
 		admin("unfreeze", d.card+"-new")
-		waitFor(life, func(s Subscription) bool { return s.Status == SubActive && s.Charged > at })
+		d.waitSub(life, func(s Subscription) bool { return s.Status == SubActive && s.Charged > at })
 		admin("close", d.card)
 		if err := c.GetWorkflow(ctx, SubscriptionWorkflowID(life), "").Get(ctx, &res); err != nil || res.Status != SubEnded || res.LastReason != DeclineClosed {
 			t.Fatalf("after close: %+v, %v; want ended, Closed", res, err)
@@ -786,6 +774,83 @@ func TestDrills(t *testing.T) {
 		}
 	})
 
+	t.Run("subscription controls", func(t *testing.T) {
+		dsn := os.Getenv("CAS_MYSQL_DSN")
+		if dsn == "" {
+			t.Skip("blocks and card numbers live in MySQL; set CAS_MYSQL_DSN")
+		}
+		d := newDrill(t, c, "subctl", nil)
+		d.acts.Temporal = c
+		d.startWorker()
+		ctx := context.Background()
+		env := envOf(map[string]string{"CAS_MYSQL_DSN": dsn, "TEMPORAL_ADDRESS": srv.FrontendHostPort()})
+		admin := func(args ...string) string {
+			t.Helper()
+			r, w, err := os.Pipe()
+			if err != nil {
+				t.Fatal(err)
+			}
+			stdout := os.Stdout
+			os.Stdout = w
+			err = run(ctx, args, env)
+			os.Stdout = stdout
+			_ = w.Close()
+			out, _ := io.ReadAll(r)
+			if err != nil {
+				t.Fatalf("%v: %v", args, err)
+			}
+			return string(out)
+		}
+		// Listing: by account, whichever number each was signed up on.
+		admin("replace", d.card, d.card+"-new")
+		music, video := d.card+"-music", d.card+"-video"
+		admin("subscribe", music, d.card+"-new", "tunes", "999")
+		admin("subscribe", video, d.card, "flix", "1599") // the old number: the account updater charges the new one
+		d.waitSub(music, func(s Subscription) bool { return s.Charged == 999 })
+		d.waitSub(video, func(s Subscription) bool { return s.Charged == 1_599 })
+		want := fmt.Sprintf("%s\ttunes\t$9.99\tactive\n%s\tflix\t$15.99\tactive\n", music, video)
+		var listed string
+		for deadline := time.Now().Add(10 * time.Second); listed != want && time.Now().Before(deadline); time.Sleep(200 * time.Millisecond) {
+			listed = admin("subscriptions", d.card+"-new") // visibility catches up with the CardID tags
+		}
+		if listed != want {
+			t.Errorf("subscriptions =\n%s\nwant\n%s", listed, want)
+		}
+
+		// Blocking a merchant ends its subscription at the next charge and
+		// declines its auths.
+		b := d.card + "-b"
+		admin("set-limit", b, "100000")
+		gym := b + "-gym"
+		if _, err := c.ExecuteWorkflow(ctx, client.StartWorkflowOptions{ID: SubscriptionWorkflowID(gym), TaskQueue: TaskQueue}, SubscriptionWorkflow,
+			SubscriptionTerms{ID: gym, CardID: b, Merchant: "gym", Amount: 1_000, Cycle: 2 * time.Second}, Subscription{}); err != nil {
+			t.Fatal(err)
+		}
+		d.waitSub(gym, func(s Subscription) bool { return s.Cycle >= 2 && s.Charged == 2_000 })
+		if got := admin("subscriptions", b); !strings.Contains(got, gym+"\tgym\t$10.00\t") {
+			t.Errorf("after continue-as-new, subscriptions = %q, want gym's merchant and amount", got)
+		}
+		admin("block", b, "gym")
+		var res Subscription
+		if err := c.GetWorkflow(ctx, SubscriptionWorkflowID(gym), "").Get(ctx, &res); err != nil || res.Status != SubEnded || res.LastReason != DeclineMerchantBlocked {
+			t.Errorf("after block: %+v, %v; want ended, MerchantBlocked", res, err)
+		}
+		if got := admin("subscriptions", b); got != "no subscriptions\nblocked: gym\n" {
+			t.Errorf("subscriptions after block = %q", got)
+		}
+		if dec, err := authorizeWithin(ctx, c, b+"-a1", AuthRequest{CardID: b, Merchant: "gym", Amount: 1_000}, DecisionDeadline); err != nil || dec.Reason != DeclineMerchantBlocked {
+			t.Errorf("auth at a blocked merchant = %+v, %v; want declined MerchantBlocked", dec, err)
+		}
+		admin("unblock", b, "gym")
+		if dec, err := authorizeWithin(ctx, c, b+"-a2", AuthRequest{CardID: b, Merchant: "gym", Amount: 1_000}, DecisionDeadline); err != nil || !dec.Approved {
+			t.Errorf("auth after unblocking = %+v, %v; want approved", dec, err)
+		}
+		_ = reverseAuth(ctx, c, b+"-a2", AuthRequest{}) // leave no hold for the audit drills
+		for _, id := range []string{music, video} {
+			admin("unsubscribe", id)
+		}
+	})
+
 	t.Run("update with start declined", func(t *testing.T) {
 		d := newDrill(t, c, "uws-decline", nil)
 		d.startWorker()
@@ -898,6 +963,19 @@ func (d *drill) updateOn(workflowID, name, id string, arg, result any) error {
 		return err
 	}
 	return h.Get(context.Background(), result)
+}
+
+// waitSub polls a subscription's query until ok, and returns what it saw last.
+func (d *drill) waitSub(id string, ok func(Subscription) bool) Subscription {
+	d.t.Helper()
+	var sub Subscription
+	for deadline := time.Now().Add(20 * time.Second); time.Now().Before(deadline); time.Sleep(100 * time.Millisecond) {
+		if v, err := d.c.QueryWorkflow(context.Background(), SubscriptionWorkflowID(id), "", SubscriptionQuery); err == nil && v.Get(&sub) == nil && ok(sub) {
+			return sub
+		}
+	}
+	d.t.Fatalf("subscription %s stuck at %+v", id, sub)
+	return sub
 }
 
 // waitStatement polls the statement query until statement n has closed. Each

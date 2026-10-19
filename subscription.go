@@ -30,7 +30,7 @@ const (
 	SubPastDue   = "past-due"  // the cycle's charge declined; retrying
 	SubLapsed    = "lapsed"    // every retry declined
 	SubCancelled = "cancelled" // the cancel update
-	SubEnded     = "ended"     // the card is closed or unknown
+	SubEnded     = "ended"     // the card is closed or unknown, or blocked the merchant
 )
 
 // SubscriptionWorkflowID is the ID of a subscription's workflow.
@@ -44,6 +44,15 @@ type SubscriptionTerms struct {
 	Amount   int64 // cents per cycle
 	Cycle    time.Duration
 	Retries  []time.Duration // waits between a declined charge's attempts
+}
+
+// SubscriptionView is the subscription query's answer: where the subscription
+// stands, plus its terms. Its JSON decodes into a Subscription alone, too. The
+// terms are a named field: both types have a Cycle, and embedding both would
+// make encoding/json drop it silently.
+type SubscriptionView struct {
+	Subscription
+	Terms SubscriptionTerms
 }
 
 // Subscription is where a subscription stands, carried from cycle to cycle.
@@ -62,13 +71,25 @@ func SubscriptionWorkflow(ctx workflow.Context, terms SubscriptionTerms, sub Sub
 	var a *Activities
 	sub.Cycle++
 	cancelled := false
-	if err := workflow.SetQueryHandler(ctx, SubscriptionQuery, func() (Subscription, error) { return sub, nil }); err != nil {
+	if err := workflow.SetQueryHandler(ctx, SubscriptionQuery, func() (SubscriptionView, error) { return SubscriptionView{sub, terms}, nil }); err != nil {
 		return sub, err
 	}
 	if err := workflow.SetUpdateHandler(ctx, CancelUpdate, func(workflow.Context) error { cancelled = true; return nil }); err != nil {
 		return sub, err
 	}
 	nextCycle := workflow.NewTimer(ctx, cmp.Or(terms.Cycle, DefaultSubscriptionCycle))
+	// Tagged with the card's account, so a card's subscriptions can be listed (M22).
+	if workflow.GetVersion(ctx, "subscription-card-id", workflow.DefaultVersion, 1) != workflow.DefaultVersion {
+		lctx := workflow.WithLocalActivityOptions(ctx, workflow.LocalActivityOptions{StartToCloseTimeout: activityTimeout,
+			RetryPolicy: &temporal.RetryPolicy{}}) // resolving has nothing to compensate: retry until it answers
+		var number CardNumber
+		if err := workflow.ExecuteLocalActivity(lctx, a.ResolveCard, terms.CardID).Get(ctx, &number); err != nil {
+			return sub, err
+		}
+		if err := workflow.UpsertTypedSearchAttributes(ctx, CardIDAttribute.ValueSet(number.Account)); err != nil {
+			return sub, err
+		}
+	}
 	// A charge attempt always has an answer, and a retry finds the same auth,
 	// so the activity retries until it gets one.
 	actx := workflow.WithActivityOptions(ctx, workflow.ActivityOptions{StartToCloseTimeout: time.Minute, RetryPolicy: &temporal.RetryPolicy{}})
@@ -87,7 +108,7 @@ func SubscriptionWorkflow(ctx workflow.Context, terms SubscriptionTerms, sub Sub
 		}
 		sub.Failures, sub.LastReason = sub.Failures+1, dec.Reason
 		switch {
-		case slices.Contains([]string{DeclineClosed, DeclineUnknownCard}, dec.Reason):
+		case slices.Contains([]string{DeclineClosed, DeclineUnknownCard, DeclineMerchantBlocked}, dec.Reason):
 			sub.Status = SubEnded
 			return sub, nil
 		case attempt == len(terms.Retries):

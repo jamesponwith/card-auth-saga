@@ -410,6 +410,9 @@ func (brokenConfig) CardAccount(context.Context, string) (string, bool, error) {
 func (brokenConfig) CurrentNumber(context.Context, string) (string, error) {
 	return "", errors.New("config store down")
 }
+func (brokenConfig) MerchantBlocked(context.Context, string, string) (bool, error) {
+	return false, errors.New("config store down")
+}
 
 // A config store outage must fail the auth, not decline the card as unknown.
 func TestConfigOutageIsNotADecline(t *testing.T) {
@@ -601,6 +604,57 @@ func TestReversalBeforeTheHold(t *testing.T) {
 	}
 	if n, err := l.RecordAttempt(context.Background(), "card-1", "probe", time.Now(), VelocityWindow); err != nil || n != 1 {
 		t.Errorf("attempts = %d (%v), want only the probe: no hold was tried", n, err)
+	}
+}
+
+// A cardholder can block a merchant (SPEC M22): its new auths and increments
+// decline, without spending the card's velocity, and holds already placed settle.
+func TestMerchantBlocked(t *testing.T) {
+	tests := []struct {
+		name     string
+		merchant string
+		blockAt  time.Duration // card-1 blocks "shop" then; 0: before the auth
+		steps    []step
+		want     AuthResult
+	}{
+		{"blocked merchant declines", "shop", 0, nil, AuthResult{Status: StatusDeclined, Reason: DeclineMerchantBlocked}},
+		{"other merchants still authorize", "cafe", 0, []step{upd(capture(hr, 40_000), "ok")}, AuthResult{Status: StatusCaptured, Captured: 40_000, Points: 400}},
+		{"blocked after the hold: it settles, but grows no more", "shop", hr / 2,
+			[]step{upd(increment(hr, "i1", 1_000), "declined"), upd(capture(2*hr, 40_000), "ok")},
+			AuthResult{Status: StatusCaptured, Captured: 40_000, Points: 400}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var s testsuite.WorkflowTestSuite
+			env := s.NewTestWorkflowEnvironment()
+			cfg := card1()
+			cfg.Blocked = map[[2]string]bool{}
+			block := func() { cfg.Blocked[[2]string{"card-1", "shop"}] = true }
+			if tt.blockAt == 0 {
+				block()
+			} else {
+				env.RegisterDelayedCallback(block, tt.blockAt)
+			}
+			l := NewMemLedger()
+			env.RegisterActivity(&Activities{Ledger: l, Config: cfg})
+			got := sendSteps(env, tt.steps)
+
+			env.ExecuteWorkflow(AuthorizeWorkflow, AuthRequest{CardID: "card-1", Amount: 40_000, Merchant: tt.merchant})
+
+			checkSteps(t, tt.steps, got)
+			var res AuthResult
+			if err := env.GetWorkflowResult(&res); err != nil {
+				t.Fatal(err)
+			}
+			if res != tt.want {
+				t.Errorf("result = %+v, want %+v", res, tt.want)
+			}
+			if tt.want.Reason == DeclineMerchantBlocked {
+				if n, err := l.RecordAttempt(context.Background(), "card-1", "probe", time.Now(), VelocityWindow); err != nil || n != 1 {
+					t.Errorf("attempts = %d (%v), want only the probe: a blocked merchant spends no velocity", n, err)
+				}
+			}
+		})
 	}
 }
 

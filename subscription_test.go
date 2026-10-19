@@ -9,6 +9,7 @@ import (
 
 	"github.com/stretchr/testify/mock"
 	"go.temporal.io/sdk/converter"
+	"go.temporal.io/sdk/temporal"
 	"go.temporal.io/sdk/testsuite"
 	"go.temporal.io/sdk/workflow"
 )
@@ -42,6 +43,8 @@ func TestSubscriptionCycle(t *testing.T) {
 			[]time.Duration{0, day, 3 * day, 7 * day}, Subscription{Cycle: 1, Status: SubLapsed, Failures: 4, LastReason: DeclineOverLimit}, false, 7 * day},
 		{"a closed card ends it", 0, Subscription{}, []Decision{decline(DeclineClosed)}, 0,
 			[]time.Duration{0}, Subscription{Cycle: 1, Status: SubEnded, Failures: 1, LastReason: DeclineClosed}, false, 0},
+		{"a blocked merchant ends it", 0, Subscription{}, []Decision{decline(DeclineMerchantBlocked)}, 0,
+			[]time.Duration{0}, Subscription{Cycle: 1, Status: SubEnded, Failures: 1, LastReason: DeclineMerchantBlocked}, false, 0},
 		{"an unknown card ends it", 0, Subscription{}, []Decision{decline(DeclineUnknownCard)}, 0,
 			[]time.Duration{0}, Subscription{Cycle: 1, Status: SubEnded, Failures: 1, LastReason: DeclineUnknownCard}, false, 0},
 		{"cancelled between charges", 0, Subscription{}, []Decision{approve()}, 5 * day,
@@ -117,4 +120,50 @@ func TestCurrentNumber(t *testing.T) {
 			t.Errorf("CurrentNumber(%s) = %q, %v; want %q", number, got, err, want)
 		}
 	}
+}
+
+// A subscription tags itself with its card's account, even when signed up on
+// a replacement number, so a card's subscriptions can be listed (SPEC M22).
+func TestSubscriptionTagsAccount(t *testing.T) {
+	var s testsuite.WorkflowTestSuite
+	env := s.NewTestWorkflowEnvironment()
+	cfg := card1()
+	cfg.Numbers = map[string]string{"card-9": "card-1"}
+	env.RegisterActivity(&Activities{Ledger: NewMemLedger(), Config: cfg})
+	env.OnActivity("ChargeCard", mock.Anything, mock.Anything, mock.Anything).Return(approve(), nil)
+	var tagged []string
+	env.OnUpsertTypedSearchAttributes(mock.Anything).Run(func(args mock.Arguments) {
+		card, _ := args.Get(0).(temporal.SearchAttributes).GetKeyword(CardIDAttribute)
+		tagged = append(tagged, card)
+	}).Return(nil)
+
+	env.ExecuteWorkflow(SubscriptionWorkflow, SubscriptionTerms{ID: "s1", CardID: "card-9", Merchant: "streamer", Amount: 1_000}, Subscription{})
+
+	if fmt.Sprint(tagged) != "[card-1]" {
+		t.Errorf("CardID upserts = %v, want [card-1]", tagged)
+	}
+}
+
+// The query answers with the terms and the state, and still decodes into a
+// Subscription alone. Both types have a Cycle: neither may be dropped.
+func TestSubscriptionQuery(t *testing.T) {
+	var s testsuite.WorkflowTestSuite
+	env := s.NewTestWorkflowEnvironment()
+	env.RegisterActivity(&Activities{Ledger: NewMemLedger(), Config: card1()})
+	env.OnActivity("ChargeCard", mock.Anything, mock.Anything, mock.Anything).Return(approve(), nil)
+	terms := SubscriptionTerms{ID: "s1", CardID: "card-1", Merchant: "streamer", Amount: 1_000, Cycle: 2 * day}
+	env.RegisterDelayedCallback(func() {
+		v, err := env.QueryWorkflow(SubscriptionQuery)
+		var view SubscriptionView
+		var sub Subscription
+		if err == nil {
+			err = errors.Join(v.Get(&view), v.Get(&sub))
+		}
+		want := Subscription{Cycle: 4, Status: SubActive, Charged: 4_000}
+		if err != nil || view.Subscription != want || view.Terms.Merchant != "streamer" || view.Terms.Cycle != 2*day || sub != want {
+			t.Errorf("query = %+v and %+v, %v; want %+v with the terms", view, sub, err, want)
+		}
+	}, day)
+
+	env.ExecuteWorkflow(SubscriptionWorkflow, terms, Subscription{Cycle: 3, Status: SubActive, Charged: 3_000})
 }

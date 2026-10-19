@@ -439,3 +439,43 @@ func TestReplaceCard(t *testing.T) {
 		t.Errorf("card-1 limit = %d after the refused set-limit, want 100000", limit)
 	}
 }
+
+// A card's merchant blocks: per account, so every number of the card shares
+// them, and idempotent both ways (SPEC M22).
+func TestMerchantBlocks(t *testing.T) {
+	l := open(t, freshDB(t))
+	ctx := context.Background()
+	if err := l.SetCreditLimit(ctx, "card-1", 100_000); err != nil {
+		t.Fatal(err)
+	}
+	blocked := func(merchant string) bool {
+		t.Helper()
+		ok, err := l.MerchantBlocked(ctx, "card-1", merchant)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return ok
+	}
+	for range 2 {
+		if err := l.SetMerchantBlocked(ctx, "card-1", "shop", true); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if !blocked("shop") || blocked("cafe") {
+		t.Errorf("blocked shop, cafe = %v, %v; want true, false", blocked("shop"), blocked("cafe"))
+	}
+	if got, err := l.BlockedMerchants(ctx, "card-1"); err != nil || fmt.Sprint(got) != "[shop]" {
+		t.Errorf("BlockedMerchants = %v, %v; want [shop]", got, err)
+	}
+	for range 2 {
+		if err := l.SetMerchantBlocked(ctx, "card-1", "shop", false); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if blocked("shop") {
+		t.Error("shop still blocked after unblocking")
+	}
+	if err := l.SetMerchantBlocked(ctx, "no-such-card", "shop", true); err == nil || !strings.Contains(err.Error(), "no card") {
+		t.Errorf("blocking for an unknown card: %v, want a refusal", err)
+	}
+}
