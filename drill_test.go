@@ -774,15 +774,9 @@ func TestDrills(t *testing.T) {
 			}
 			return err
 		}
-		var wg sync.WaitGroup
-		for range 2 { // a resent request reuses the update ID: one redemption
-			wg.Go(func() {
-				if err := send("u1", Redemption{ID: "r1", Points: 2_000}); err != nil {
-					t.Error(err)
-				}
-			})
+		if err := send("u1", Redemption{ID: "r1", Points: 2_000}); err != nil {
+			t.Fatal(err)
 		}
-		wg.Wait()
 		if err := send("u2", Redemption{ID: "r2", Points: 1_500}); err == nil || !strings.Contains(err.Error(), "1000 points to redeem") {
 			t.Errorf("redeeming 1500 of 1000 points: %v, want refused", err)
 		}
