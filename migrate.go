@@ -73,6 +73,14 @@ var migrations = [][]string{
 		)`,
 		`INSERT IGNORE INTO card_numbers (number, account) SELECT id, id FROM cards`,
 	},
+	{ // 8: merchants a cardholder has blocked, per account (SPEC M22)
+		`CREATE TABLE IF NOT EXISTS merchant_blocks (
+			account  VARCHAR(191) NOT NULL,
+			merchant VARCHAR(191) NOT NULL,
+			PRIMARY KEY (account, merchant),
+			FOREIGN KEY (account) REFERENCES cards (id)
+		)`,
+	},
 }
 
 // mysqlDupColumn is ADD COLUMN on a column that exists: MySQL has no

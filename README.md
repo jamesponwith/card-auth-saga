@@ -173,6 +173,14 @@ A declined charge makes the subscription `past-due` and is retried on days 1, 3 
 retry declines too, the subscription is `lapsed`. A closed card ends it (`ended`). Each charge goes to the
 card's current number, so subscriptions survive `replace` with no re-signup.
 
+The cardholder can see a card's subscriptions and stop one by blocking its merchant (SPEC.md, M22):
+
+```sh
+go run . subscriptions card-1b     # id, merchant, amount, status; then any blocked merchants
+go run . block card-1b shell       # shell's auths decline (MerchantBlocked); its subscriptions end at their next charge
+go run . unblock card-1b shell
+```
+
 ## Deploy
 
 Pushing a `v*` tag releases and deploys (ADR 0007). `release.yml` runs goreleaser, then

@@ -11,10 +11,12 @@
 //	card-auth-saga set-rate <merchant> <points>   set a partner's points per $1 (MySQL)
 //	card-auth-saga freeze|unfreeze|close <card>   decline new auths; closing is final (MySQL)
 //	card-auth-saga replace <card> <new-number>    a new number on the same account; the old one declines (MySQL)
+//	card-auth-saga block|unblock <card> <merchant>   decline the merchant's new auths, ending its subscriptions (MySQL)
 //	card-auth-saga audit                          run the ledger audit now; exits non-zero on findings
 //	card-auth-saga authorize <auth-id> <card> <merchant> <cents>   play the network: decide in 2s, or reverse
 //	card-auth-saga subscribe <id> <card> <merchant> <cents>   charge the card every 30 days, from now
 //	card-auth-saga unsubscribe <id>               stop a subscription's future charges
+//	card-auth-saga subscriptions <card>           list the card's live subscriptions and blocked merchants (MySQL)
 package main
 
 import (
@@ -36,7 +38,9 @@ import (
 	enumspb "go.temporal.io/api/enums/v1"
 	"go.temporal.io/api/operatorservice/v1"
 	"go.temporal.io/api/serviceerror"
+	"go.temporal.io/api/workflowservice/v1"
 	"go.temporal.io/sdk/client"
+	"go.temporal.io/sdk/converter"
 	"go.temporal.io/sdk/worker"
 )
 
@@ -87,7 +91,9 @@ func run(ctx context.Context, args []string, env func(string) string) error {
 			if err := cmd(ctx, l, temporalOptions); err != nil {
 				return err
 			}
-			fmt.Println("ok:", strings.Join(args, " ")) // a silent success reads as nothing happened
+			if args[0] != "subscriptions" { // a listing is its own answer
+				fmt.Println("ok:", strings.Join(args, " ")) // a silent success reads as nothing happened
+			}
 			return nil
 		}
 		acts = &Activities{Ledger: l, Config: l}
@@ -143,7 +149,7 @@ func run(ctx context.Context, args []string, env func(string) string) error {
 	return w.Run(stopped) // until ctx is cancelled: SIGINT or SIGTERM in main
 }
 
-var errUsage = errors.New("usage: card-auth-saga [set-limit <card> <cents> | set-apr <card> <basis-points> | set-rate <merchant> <points-per-dollar> | freeze|unfreeze|close <card> | replace <card> <new-number> | authorize <auth-id> <card> <merchant> <cents> | subscribe <id> <card> <merchant> <cents> | unsubscribe <id> | audit]")
+var errUsage = errors.New("usage: card-auth-saga [set-limit <card> <cents> | set-apr <card> <basis-points> | set-rate <merchant> <points-per-dollar> | freeze|unfreeze|close <card> | replace <card> <new-number> | block|unblock <card> <merchant> | authorize <auth-id> <card> <merchant> <cents> | subscribe <id> <card> <merchant> <cents> | unsubscribe <id> | subscriptions <card> | audit]")
 
 // adminCmd applies a parsed admin command. Temporal options reach set-limit,
 // which also starts the card's statements.
@@ -153,6 +159,9 @@ type adminCmd func(context.Context, *MySQLLedger, client.Options) error
 // to the tables' CHECK constraints. A card may be named by any of its numbers:
 // the command acts on its account (SPEC M18).
 func admin(args []string) (adminCmd, error) {
+	if args[0] == "subscriptions" && len(args) == 2 && args[1] != "" {
+		return onAccount(args[1], listSubscriptions), nil
+	}
 	statuses := map[string]string{"freeze": CardFrozen, "unfreeze": CardActive, "close": CardClosed}
 	if status, ok := statuses[args[0]]; ok && len(args) == 2 && args[1] != "" {
 		id := args[1]
@@ -160,7 +169,7 @@ func admin(args []string) (adminCmd, error) {
 			return l.SetCardStatus(ctx, account, status)
 		}), nil
 	}
-	if len(args) != 3 || args[1] == "" || args[2] == "" || !slices.Contains([]string{"set-limit", "set-apr", "set-rate", "replace"}, args[0]) {
+	if len(args) != 3 || args[1] == "" || args[2] == "" || !slices.Contains([]string{"set-limit", "set-apr", "set-rate", "replace", "block", "unblock"}, args[0]) {
 		return nil, errUsage
 	}
 	id := args[1]
@@ -176,10 +185,15 @@ func admin(args []string) (adminCmd, error) {
 			return nil, err
 		}
 	}
-	if args[0] == "replace" {
+	switch args[0] {
+	case "replace":
 		return func(ctx context.Context, l *MySQLLedger, _ client.Options) error {
 			return l.ReplaceCard(ctx, id, args[2])
 		}, nil
+	case "block", "unblock": // the merchant isn't a card ID
+		return onAccount(id, func(ctx context.Context, l *MySQLLedger, _ client.Options, account string) error {
+			return l.SetMerchantBlocked(ctx, account, args[2], args[0] == "block")
+		}), nil
 	}
 	n, err := strconv.ParseInt(args[2], 10, 64)
 	if err != nil {
@@ -328,7 +342,9 @@ func subscriptionCmd(ctx context.Context, args []string, opts client.Options) er
 	id := SubscriptionWorkflowID(args[1])
 	if subscribe {
 		// Without ErrorWhenAlreadyStarted the client hands back the existing run, and a reused ID looks like success.
+		// The memo is what subscriptions <card> lists; continue-as-new keeps it.
 		_, err = c.ExecuteWorkflow(ctx, client.StartWorkflowOptions{ID: id, TaskQueue: TaskQueue,
+			Memo:                  map[string]any{"merchant": terms.Merchant, "amount": terms.Amount},
 			WorkflowIDReusePolicy: enumspb.WORKFLOW_ID_REUSE_POLICY_REJECT_DUPLICATE, WorkflowExecutionErrorWhenAlreadyStarted: true},
 			SubscriptionWorkflow, terms, Subscription{})
 	} else {
@@ -342,6 +358,50 @@ func subscriptionCmd(ctx context.Context, args []string, opts client.Options) er
 		return fmt.Errorf("%s %s: %w", args[0], args[1], err)
 	}
 	fmt.Println("ok:", strings.Join(args, " "))
+	return nil
+}
+
+// listSubscriptions prints an account's running subscriptions, whichever of
+// its numbers each was signed up on, and the merchants it has blocked.
+// ponytail: one page of visibility results (1,000); page on when a card has more.
+func listSubscriptions(ctx context.Context, l *MySQLLedger, opts client.Options, account string) error {
+	c, err := client.Dial(opts)
+	if err != nil {
+		return fmt.Errorf("dial temporal: %w", err)
+	}
+	defer c.Close()
+	res, err := c.ListWorkflow(ctx, &workflowservice.ListWorkflowExecutionsRequest{Query: fmt.Sprintf(
+		"WorkflowType = 'SubscriptionWorkflow' AND ExecutionStatus = 'Running' AND %s = '%s'", CardIDAttribute.GetName(), account)})
+	if err != nil {
+		return err
+	}
+	var lines []string
+	for _, w := range res.GetExecutions() {
+		var merchant string
+		var amount int64
+		memo := w.GetMemo().GetFields()
+		_ = converter.GetDefaultDataConverter().FromPayload(memo["merchant"], &merchant) // started without a memo: blank
+		_ = converter.GetDefaultDataConverter().FromPayload(memo["amount"], &amount)
+		status := "?"
+		if v, err := c.QueryWorkflow(ctx, w.GetExecution().GetWorkflowId(), "", SubscriptionQuery); err == nil {
+			var sub Subscription
+			if v.Get(&sub) == nil {
+				status = sub.Status
+			}
+		}
+		lines = append(lines, fmt.Sprintf("%s\t%s\t$%d.%02d\t%s",
+			strings.TrimPrefix(w.GetExecution().GetWorkflowId(), SubscriptionWorkflowID("")), merchant, amount/100, amount%100, status))
+	}
+	slices.Sort(lines)
+	if len(lines) == 0 {
+		lines = []string{"no subscriptions"}
+	}
+	fmt.Println(strings.Join(lines, "\n"))
+	if blocked, err := l.BlockedMerchants(ctx, account); err != nil {
+		return err
+	} else if len(blocked) > 0 {
+		fmt.Println("blocked:", strings.Join(blocked, ", "))
+	}
 	return nil
 }
 

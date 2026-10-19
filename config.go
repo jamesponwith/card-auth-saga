@@ -24,6 +24,8 @@ type Config interface {
 	// CurrentNumber is the number its card carries now: the number itself, or
 	// the one that replaced it (SPEC M19's account updater).
 	CurrentNumber(ctx context.Context, number string) (string, error)
+	// MerchantBlocked reports whether the card's account has blocked the merchant (SPEC M22).
+	MerchantBlocked(ctx context.Context, account, merchant string) (bool, error)
 }
 
 // Card statuses (SPEC M16). Closed is final.
@@ -35,12 +37,17 @@ const (
 
 // StaticConfig is a fixed Config, for tests and the in-memory worker.
 type StaticConfig struct {
-	Limits   map[string]int64  // card → credit limit, cents
-	Rates    map[string]int64  // merchant → points per $1
-	APRs     map[string]int64  // card → APR, basis points
-	Statuses map[string]string // card → status; missing is active
-	Numbers  map[string]string // replacement number → account; missing is its own account
-	Replaced map[string]bool   // numbers that have been replaced
+	Limits   map[string]int64   // card → credit limit, cents
+	Rates    map[string]int64   // merchant → points per $1
+	APRs     map[string]int64   // card → APR, basis points
+	Statuses map[string]string  // card → status; missing is active
+	Numbers  map[string]string  // replacement number → account; missing is its own account
+	Replaced map[string]bool    // numbers that have been replaced
+	Blocked  map[[2]string]bool // {account, merchant} pairs the cardholder blocked
+}
+
+func (c StaticConfig) MerchantBlocked(_ context.Context, account, merchant string) (bool, error) {
+	return c.Blocked[[2]string{account, merchant}], nil
 }
 
 func (c StaticConfig) CardAccount(_ context.Context, number string) (string, bool, error) {

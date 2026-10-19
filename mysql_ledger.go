@@ -263,6 +263,46 @@ func (l *MySQLLedger) CurrentNumber(ctx context.Context, number string) (string,
 	return current, err
 }
 
+func (l *MySQLLedger) MerchantBlocked(ctx context.Context, account, merchant string) (bool, error) {
+	var n int
+	err := l.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM merchant_blocks WHERE account = ? AND merchant = ?`, account, merchant).Scan(&n)
+	return n > 0, err
+}
+
+// SetMerchantBlocked blocks or unblocks a merchant for an account. Both are
+// idempotent.
+func (l *MySQLLedger) SetMerchantBlocked(ctx context.Context, account, merchant string, blocked bool) error {
+	if _, ok, err := l.CardStatus(ctx, account); err != nil {
+		return err
+	} else if !ok {
+		return fmt.Errorf("no card %q", account)
+	}
+	q := `DELETE FROM merchant_blocks WHERE account = ? AND merchant = ?`
+	if blocked {
+		q = `INSERT IGNORE INTO merchant_blocks (account, merchant) VALUES (?, ?)`
+	}
+	_, err := l.db.ExecContext(ctx, q, account, merchant)
+	return err
+}
+
+// BlockedMerchants lists an account's blocked merchants, sorted.
+func (l *MySQLLedger) BlockedMerchants(ctx context.Context, account string) ([]string, error) {
+	rows, err := l.db.QueryContext(ctx, `SELECT merchant FROM merchant_blocks WHERE account = ? ORDER BY merchant`, account)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+	var merchants []string
+	for rows.Next() {
+		var m string
+		if err := rows.Scan(&m); err != nil {
+			return nil, err
+		}
+		merchants = append(merchants, m)
+	}
+	return merchants, rows.Err()
+}
+
 // ReplaceCard retires number and gives its account the replacement number.
 // Only a card's current number can be replaced, and not on a closed card;
 // a number already in use anywhere is refused by card_numbers' primary key.

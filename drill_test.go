@@ -13,6 +13,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"os"
@@ -783,6 +784,101 @@ func TestDrills(t *testing.T) {
 		d.expectBalances(0, -2_000, 1_000) // a $20 credit on a card that owed nothing
 		if got := balance(t, d.l, redeemedAccount(d.card)); got != 2_000 {
 			t.Errorf("redeemed = %d, want 2000", got)
+		}
+	})
+
+	t.Run("subscription controls", func(t *testing.T) {
+		dsn := os.Getenv("CAS_MYSQL_DSN")
+		if dsn == "" {
+			t.Skip("blocks and card numbers live in MySQL; set CAS_MYSQL_DSN")
+		}
+		d := newDrill(t, c, "subctl", nil)
+		d.acts.Temporal = c
+		d.startWorker()
+		ctx := context.Background()
+		env := envOf(map[string]string{"CAS_MYSQL_DSN": dsn, "TEMPORAL_ADDRESS": srv.FrontendHostPort()})
+		admin := func(args ...string) string {
+			t.Helper()
+			r, w, err := os.Pipe()
+			if err != nil {
+				t.Fatal(err)
+			}
+			stdout := os.Stdout
+			os.Stdout = w
+			err = run(ctx, args, env)
+			os.Stdout = stdout
+			_ = w.Close()
+			out, _ := io.ReadAll(r)
+			if err != nil {
+				t.Fatalf("%v: %v", args, err)
+			}
+			return string(out)
+		}
+		sub := func(id string) Subscription {
+			t.Helper()
+			var s Subscription
+			if v, err := c.QueryWorkflow(ctx, SubscriptionWorkflowID(id), "", SubscriptionQuery); err != nil || v.Get(&s) != nil {
+				t.Fatalf("query %s: %v", id, err)
+			}
+			return s
+		}
+		waitFor := func(id string, ok func(Subscription) bool) {
+			t.Helper()
+			for deadline := time.Now().Add(20 * time.Second); !ok(sub(id)); time.Sleep(100 * time.Millisecond) {
+				if time.Now().After(deadline) {
+					t.Fatalf("%s stuck at %+v", id, sub(id))
+				}
+			}
+		}
+
+		// Listing: by account, whichever number each was signed up on.
+		admin("replace", d.card, d.card+"-new")
+		music, video := d.card+"-music", d.card+"-video"
+		admin("subscribe", music, d.card+"-new", "tunes", "999")
+		admin("subscribe", video, d.card, "flix", "1599") // the old number: the account updater charges the new one
+		waitFor(music, func(s Subscription) bool { return s.Charged == 999 })
+		waitFor(video, func(s Subscription) bool { return s.Charged == 1_599 })
+		want := fmt.Sprintf("%s\ttunes\t$9.99\tactive\n%s\tflix\t$15.99\tactive\n", music, video)
+		var listed string
+		for deadline := time.Now().Add(10 * time.Second); listed != want && time.Now().Before(deadline); time.Sleep(200 * time.Millisecond) {
+			listed = admin("subscriptions", d.card+"-new") // visibility catches up with the CardID tags
+		}
+		if listed != want {
+			t.Errorf("subscriptions =\n%s\nwant\n%s", listed, want)
+		}
+
+		// Blocking a merchant ends its subscription at the next charge and
+		// declines its auths; the memo survived continue-as-new.
+		b := d.card + "-b"
+		admin("set-limit", b, "100000")
+		gym := b + "-gym"
+		if _, err := c.ExecuteWorkflow(ctx, client.StartWorkflowOptions{ID: SubscriptionWorkflowID(gym), TaskQueue: TaskQueue,
+			Memo: map[string]any{"merchant": "gym", "amount": 1_000}}, SubscriptionWorkflow,
+			SubscriptionTerms{ID: gym, CardID: b, Merchant: "gym", Amount: 1_000, Cycle: 2 * time.Second}, Subscription{}); err != nil {
+			t.Fatal(err)
+		}
+		waitFor(gym, func(s Subscription) bool { return s.Cycle >= 2 && s.Charged == 2_000 })
+		if got := admin("subscriptions", b); !strings.Contains(got, gym+"\tgym\t$10.00\t") {
+			t.Errorf("after continue-as-new, subscriptions = %q, want the memo's merchant and amount", got)
+		}
+		admin("block", b, "gym")
+		var res Subscription
+		if err := c.GetWorkflow(ctx, SubscriptionWorkflowID(gym), "").Get(ctx, &res); err != nil || res.Status != SubEnded || res.LastReason != DeclineMerchantBlocked {
+			t.Errorf("after block: %+v, %v; want ended, MerchantBlocked", res, err)
+		}
+		if got := admin("subscriptions", b); got != "no subscriptions\nblocked: gym\n" {
+			t.Errorf("subscriptions after block = %q", got)
+		}
+		if dec, err := authorizeWithin(ctx, c, b+"-a1", AuthRequest{CardID: b, Merchant: "gym", Amount: 1_000}, DecisionDeadline); err != nil || dec.Reason != DeclineMerchantBlocked {
+			t.Errorf("auth at a blocked merchant = %+v, %v; want declined MerchantBlocked", dec, err)
+		}
+		admin("unblock", b, "gym")
+		if dec, err := authorizeWithin(ctx, c, b+"-a2", AuthRequest{CardID: b, Merchant: "gym", Amount: 1_000}, DecisionDeadline); err != nil || !dec.Approved {
+			t.Errorf("auth after unblocking = %+v, %v; want approved", dec, err)
+		}
+		_ = reverseAuth(ctx, c, b+"-a2", AuthRequest{}) // leave no hold for the audit drills
+		for _, id := range []string{music, video} {
+			admin("unsubscribe", id)
 		}
 	})
 

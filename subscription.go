@@ -30,7 +30,7 @@ const (
 	SubPastDue   = "past-due"  // the cycle's charge declined; retrying
 	SubLapsed    = "lapsed"    // every retry declined
 	SubCancelled = "cancelled" // the cancel update
-	SubEnded     = "ended"     // the card is closed or unknown
+	SubEnded     = "ended"     // the card is closed or unknown, or blocked the merchant
 )
 
 // SubscriptionWorkflowID is the ID of a subscription's workflow.
@@ -40,6 +40,7 @@ func SubscriptionWorkflowID(id string) string { return "subscription:" + id }
 type SubscriptionTerms struct {
 	ID       string
 	CardID   string // the number given at signup; charges go to its card's current number
+	Account  string // CardID's account, resolved in the first cycle and tagged on every run
 	Merchant string
 	Amount   int64 // cents per cycle
 	Cycle    time.Duration
@@ -69,6 +70,21 @@ func SubscriptionWorkflow(ctx workflow.Context, terms SubscriptionTerms, sub Sub
 		return sub, err
 	}
 	nextCycle := workflow.NewTimer(ctx, cmp.Or(terms.Cycle, DefaultSubscriptionCycle))
+	// Tagged with the card's account, so a card's subscriptions can be listed (M22).
+	if workflow.GetVersion(ctx, "subscription-card-id", workflow.DefaultVersion, 1) != workflow.DefaultVersion {
+		if terms.Account == "" {
+			lctx := workflow.WithLocalActivityOptions(ctx, workflow.LocalActivityOptions{StartToCloseTimeout: activityTimeout,
+				RetryPolicy: &temporal.RetryPolicy{}}) // resolving has nothing to compensate: retry until it answers
+			var number CardNumber
+			if err := workflow.ExecuteLocalActivity(lctx, a.ResolveCard, terms.CardID).Get(ctx, &number); err != nil {
+				return sub, err
+			}
+			terms.Account = number.Account
+		}
+		if err := workflow.UpsertTypedSearchAttributes(ctx, CardIDAttribute.ValueSet(terms.Account)); err != nil {
+			return sub, err
+		}
+	}
 	// A charge attempt always has an answer, and a retry finds the same auth,
 	// so the activity retries until it gets one.
 	actx := workflow.WithActivityOptions(ctx, workflow.ActivityOptions{StartToCloseTimeout: time.Minute, RetryPolicy: &temporal.RetryPolicy{}})
@@ -87,7 +103,7 @@ func SubscriptionWorkflow(ctx workflow.Context, terms SubscriptionTerms, sub Sub
 		}
 		sub.Failures, sub.LastReason = sub.Failures+1, dec.Reason
 		switch {
-		case slices.Contains([]string{DeclineClosed, DeclineUnknownCard}, dec.Reason):
+		case slices.Contains([]string{DeclineClosed, DeclineUnknownCard, DeclineMerchantBlocked}, dec.Reason):
 			sub.Status = SubEnded
 			return sub, nil
 		case attempt == len(terms.Retries):
