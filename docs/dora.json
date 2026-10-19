@@ -8,44 +8,44 @@
       "opened": 0
     },
     "final_gate_pass": {
-      "green": 37,
+      "green": 44,
       "measurable": true,
       "note": "state of checks at merge, not the first attempt: /check-runs returns filter=latest, so a failed-then-rerun PR counts as green. Structurally near 1.0 — do not read it as first-pass.",
       "rate": 1,
-      "total": 37
+      "total": 44
     },
     "review_round_trips": {
       "measurable": false,
       "median": 0,
-      "samples": 37,
+      "samples": 44,
       "why": "review happens locally (ADR 0002/0013); GitHub review events do not exist in this workflow"
     },
     "rework_commits_after_open": {
       "measurable": false,
       "median": 0,
-      "samples": 37,
+      "samples": 44,
       "why": "squash-merge workflow: commit dates precede PR creation, so this is structurally 0"
     }
   },
   "change_failure_rate": {
-    "attempts": 1,
+    "attempts": 3,
     "failed_deploys": 0,
     "incidents": 0,
     "rate": 0,
-    "releases": 1
+    "releases": 3
   },
   "deploy_frequency": {
-    "last_30d": 1,
-    "per_week": 0,
-    "releases_last_30d": 1,
-    "releases_total": 1,
+    "last_30d": 3,
+    "per_week": 13.809007363433986,
+    "releases_last_30d": 3,
+    "releases_total": 3,
     "source": "deployments",
-    "total": 1
+    "total": 3
   },
-  "generated_at": "2026-10-16T23:41:48Z",
+  "generated_at": "2026-10-19T11:19:38Z",
   "lead_time_hours": {
-    "median": 0,
-    "samples": 0
+    "median": 20.14666666666667,
+    "samples": 2
   },
   "mttr_hours": {
     "median": 0,
