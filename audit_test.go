@@ -47,9 +47,19 @@ func TestAuditLedger(t *testing.T) {
 		{"negative holds", with(healthyCard("c1"), map[string]int64{"card:c1:holds": -500, "card:c1:open-to-buy": 500}),
 			[]Finding{{CheckHolds, "c1", "holds = -500"}}},
 		{"negative points", with(healthyCard("c1"), map[string]int64{"card:c1:points": -300, "partner:shop:points-issued": 300}),
-			[]Finding{{CheckPoints, "c1", "points = -50"}}},
+			[]Finding{{CheckPoints, "c1", "points + redeemed = -50"}}},
+		// 250 earned, all redeemed, then a refund claws back 100: below zero, but
+		// never below what was earned (SPEC M21).
+		{"a clawback after a redemption", with(healthyCard("c1"), map[string]int64{
+			"card:c1:points": -350, "card:c1:points-redeemed": 250, "partner:shop:points-issued": 100,
+		}), nil},
+		{"clawed back past what was earned", with(healthyCard("c1"), map[string]int64{
+			"card:c1:points": -550, "card:c1:points-redeemed": 250, "partner:shop:points-issued": 300,
+		}), []Finding{{CheckPoints, "c1", "points + redeemed = -50"}}},
 		{"points that don't net to zero", with(healthyCard("c1"), map[string]int64{"card:c1:points": 10, "suspense": -10}),
-			[]Finding{{CheckPointsNet, "", "card points + partner points-issued = 10"}}},
+			[]Finding{{CheckPointsNet, "", "card points + redeemed + partner points-issued = 10"}}},
+		{"a redemption that lost its other half", with(healthyCard("c1"), map[string]int64{"card:c1:points": -250, "suspense": 250}),
+			[]Finding{{CheckPointsNet, "", "card points + redeemed + partner points-issued = -250"}}},
 		{"payment memo off", with(healthyCard("c1"), map[string]int64{"card:c1:paid:s1": 5_000, "card:c1:payments": -4_000, "suspense": -1_000}),
 			[]Finding{{CheckPaymentMemos, "c1", "paid + payments = 1000"}}},
 		{"ledger doesn't sum to zero", with(healthyCard("c1"), map[string]int64{"suspense": 7}),

@@ -28,6 +28,8 @@ type Ledger interface {
 	// It reports whether the posting is in the ledger (true for a replayed key).
 	PostWithin(ctx context.Context, key string, capped []string, limit int64, entries ...Entry) (bool, error)
 	Balance(ctx context.Context, account string) (int64, error)
+	// Posted reports whether key's posting is in the ledger.
+	Posted(ctx context.Context, key string) (bool, error)
 	// Accounts is every account with its balance, for the audit.
 	// ponytail: loads them all at once; page by ID when the ledger outgrows memory.
 	Accounts(ctx context.Context) (map[string]int64, error)
@@ -138,6 +140,12 @@ func (l *MemLedger) Balance(_ context.Context, account string) (int64, error) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	return l.balances[account], nil
+}
+
+func (l *MemLedger) Posted(_ context.Context, key string) (bool, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.posted[key], nil
 }
 
 func (l *MemLedger) Accounts(context.Context) (map[string]int64, error) {

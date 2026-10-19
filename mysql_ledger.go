@@ -165,6 +165,12 @@ func (l *MySQLLedger) Accounts(ctx context.Context) (map[string]int64, error) {
 	return out, rows.Err()
 }
 
+func (l *MySQLLedger) Posted(ctx context.Context, key string) (bool, error) {
+	var n int
+	err := l.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM postings WHERE idem_key = ?`, key).Scan(&n)
+	return n > 0, err
+}
+
 func (l *MySQLLedger) Balance(ctx context.Context, account string) (int64, error) {
 	var b int64
 	err := l.db.QueryRowContext(ctx, `SELECT balance FROM accounts WHERE id = ?`, account).Scan(&b)

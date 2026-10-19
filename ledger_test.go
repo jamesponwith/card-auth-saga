@@ -92,6 +92,36 @@ func TestLedgerPostIsIdempotent(t *testing.T) {
 	})
 }
 
+// Posted reports whether a key is in the ledger: posted, not just tried.
+func TestLedgerPosted(t *testing.T) {
+	forEachLedger(t, func(t *testing.T, l Ledger, n func(string) string) {
+		ctx := context.Background()
+		posted := func(key string) bool {
+			t.Helper()
+			ok, err := l.Posted(ctx, key)
+			if err != nil {
+				t.Fatal(err)
+			}
+			return ok
+		}
+		if posted(n("k")) {
+			t.Error("Posted before posting")
+		}
+		if err := l.Post(ctx, n("k"), Entry{n("a"), 1}, Entry{n("b"), -1}); err != nil {
+			t.Fatal(err)
+		}
+		if !posted(n("k")) {
+			t.Error("not Posted after posting")
+		}
+		if ok, err := l.PostWithin(ctx, n("over"), []string{n("a")}, 0, Entry{n("a"), 5}, Entry{n("b"), -5}); err != nil || ok {
+			t.Fatalf("PostWithin over the limit = %v, %v; want declined", ok, err)
+		}
+		if posted(n("over")) {
+			t.Error("a declined PostWithin counts as Posted")
+		}
+	})
+}
+
 func TestLedgerPostWithin(t *testing.T) {
 	tests := []struct {
 		name   string

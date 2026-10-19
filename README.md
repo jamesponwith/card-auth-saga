@@ -135,7 +135,11 @@ go run . unfreeze card-1
 go run . close card-1              # final: declines (Closed); statements end once nothing is owed or held
 temporal workflow update execute --workflow-id statement:card-1 --name pay --input '{"ID":"p1","Amount":2500}'
 temporal workflow query --workflow-id statement:card-1 --name statement
+temporal workflow update execute --workflow-id statement:card-1 --name redeem --input '{"ID":"r1","Points":500}'
 ```
+
+`redeem` turns points into a statement credit at 1 point per cent (SPEC.md, M21). It's a credit, not
+a payment, so it doesn't count toward the minimum due.
 
 Each cycle samples the card's balance at the end of every day. It charges a $25 late fee if the
 minimum isn't paid by the due date, and at close charges interest on the average daily balance
@@ -232,7 +236,8 @@ failures, and closes the issue on the next green run. Test it with
 ## Audit
 
 Every 24 hours a Temporal Schedule (`ledger-audit`, created by the worker on boot) runs `AuditWorkflow`
-(SPEC.md, M15). It checks each card's money nets to zero, that holds and points are never negative,
+(SPEC.md, M15). It checks each card's money nets to zero, that holds are never negative and points
+never clawed back past what was earned,
 that payment memos and points net to zero, and that the whole ledger sums to zero. It also checks that
 no auth or statement run is stuck, that no workflow failed since the last audit, and that no card
 holds money with no auth running on it. Findings are the
