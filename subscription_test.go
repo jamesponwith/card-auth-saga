@@ -124,7 +124,6 @@ func TestCurrentNumber(t *testing.T) {
 
 // A subscription tags itself with its card's account, even when signed up on
 // a replacement number, so a card's subscriptions can be listed (SPEC M22).
-// The account is resolved once and carried into the next cycle.
 func TestSubscriptionTagsAccount(t *testing.T) {
 	var s testsuite.WorkflowTestSuite
 	env := s.NewTestWorkflowEnvironment()
@@ -143,15 +142,28 @@ func TestSubscriptionTagsAccount(t *testing.T) {
 	if fmt.Sprint(tagged) != "[card-1]" {
 		t.Errorf("CardID upserts = %v, want [card-1]", tagged)
 	}
-	var can *workflow.ContinueAsNewError
-	if !errors.As(env.GetWorkflowError(), &can) {
-		t.Fatalf("want continue-as-new, got %v", env.GetWorkflowError())
-	}
-	var terms SubscriptionTerms
-	if err := converter.GetDefaultDataConverter().FromPayloads(can.Input, &terms); err != nil {
-		t.Fatal(err)
-	}
-	if terms.Account != "card-1" || terms.CardID != "card-9" {
-		t.Errorf("terms carried = %+v, want account card-1 and the signup number kept", terms)
-	}
+}
+
+// The query answers with the terms and the state, and still decodes into a
+// Subscription alone. Both types have a Cycle: neither may be dropped.
+func TestSubscriptionQuery(t *testing.T) {
+	var s testsuite.WorkflowTestSuite
+	env := s.NewTestWorkflowEnvironment()
+	env.RegisterActivity(&Activities{Ledger: NewMemLedger(), Config: card1()})
+	env.OnActivity("ChargeCard", mock.Anything, mock.Anything, mock.Anything).Return(approve(), nil)
+	terms := SubscriptionTerms{ID: "s1", CardID: "card-1", Merchant: "streamer", Amount: 1_000, Cycle: 2 * day}
+	env.RegisterDelayedCallback(func() {
+		v, err := env.QueryWorkflow(SubscriptionQuery)
+		var view SubscriptionView
+		var sub Subscription
+		if err == nil {
+			err = errors.Join(v.Get(&view), v.Get(&sub))
+		}
+		want := Subscription{Cycle: 4, Status: SubActive, Charged: 4_000}
+		if err != nil || view.Subscription != want || view.Terms.Merchant != "streamer" || view.Terms.Cycle != 2*day || sub != want {
+			t.Errorf("query = %+v and %+v, %v; want %+v with the terms", view, sub, err, want)
+		}
+	}, day)
+
+	env.ExecuteWorkflow(SubscriptionWorkflow, terms, Subscription{Cycle: 3, Status: SubActive, Charged: 3_000})
 }

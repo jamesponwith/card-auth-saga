@@ -40,7 +40,6 @@ import (
 	"go.temporal.io/api/serviceerror"
 	"go.temporal.io/api/workflowservice/v1"
 	"go.temporal.io/sdk/client"
-	"go.temporal.io/sdk/converter"
 	"go.temporal.io/sdk/worker"
 )
 
@@ -342,9 +341,7 @@ func subscriptionCmd(ctx context.Context, args []string, opts client.Options) er
 	id := SubscriptionWorkflowID(args[1])
 	if subscribe {
 		// Without ErrorWhenAlreadyStarted the client hands back the existing run, and a reused ID looks like success.
-		// The memo is what subscriptions <card> lists; continue-as-new keeps it.
 		_, err = c.ExecuteWorkflow(ctx, client.StartWorkflowOptions{ID: id, TaskQueue: TaskQueue,
-			Memo:                  map[string]any{"merchant": terms.Merchant, "amount": terms.Amount},
 			WorkflowIDReusePolicy: enumspb.WORKFLOW_ID_REUSE_POLICY_REJECT_DUPLICATE, WorkflowExecutionErrorWhenAlreadyStarted: true},
 			SubscriptionWorkflow, terms, Subscription{})
 	} else {
@@ -377,20 +374,15 @@ func listSubscriptions(ctx context.Context, l *MySQLLedger, opts client.Options,
 	}
 	var lines []string
 	for _, w := range res.GetExecutions() {
-		var merchant string
-		var amount int64
-		memo := w.GetMemo().GetFields()
-		_ = converter.GetDefaultDataConverter().FromPayload(memo["merchant"], &merchant) // started without a memo: blank
-		_ = converter.GetDefaultDataConverter().FromPayload(memo["amount"], &amount)
-		status := "?"
-		if v, err := c.QueryWorkflow(ctx, w.GetExecution().GetWorkflowId(), "", SubscriptionQuery); err == nil {
-			var sub Subscription
-			if v.Get(&sub) == nil {
-				status = sub.Status
-			}
+		var v SubscriptionView
+		q, err := c.QueryWorkflow(ctx, w.GetExecution().GetWorkflowId(), "", SubscriptionQuery)
+		if err == nil {
+			err = q.Get(&v)
 		}
-		lines = append(lines, fmt.Sprintf("%s\t%s\t$%d.%02d\t%s",
-			strings.TrimPrefix(w.GetExecution().GetWorkflowId(), SubscriptionWorkflowID("")), merchant, amount/100, amount%100, status))
+		if err != nil {
+			return fmt.Errorf("query %s: %w", w.GetExecution().GetWorkflowId(), err)
+		}
+		lines = append(lines, fmt.Sprintf("%s\t%s\t$%d.%02d\t%s", v.Terms.ID, v.Terms.Merchant, v.Terms.Amount/100, v.Terms.Amount%100, v.Status))
 	}
 	slices.Sort(lines)
 	if len(lines) == 0 {

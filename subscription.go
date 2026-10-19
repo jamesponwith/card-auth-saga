@@ -40,11 +40,19 @@ func SubscriptionWorkflowID(id string) string { return "subscription:" + id }
 type SubscriptionTerms struct {
 	ID       string
 	CardID   string // the number given at signup; charges go to its card's current number
-	Account  string // CardID's account, resolved in the first cycle and tagged on every run
 	Merchant string
 	Amount   int64 // cents per cycle
 	Cycle    time.Duration
 	Retries  []time.Duration // waits between a declined charge's attempts
+}
+
+// SubscriptionView is the subscription query's answer: where the subscription
+// stands, plus its terms. Its JSON decodes into a Subscription alone, too. The
+// terms are a named field: both types have a Cycle, and embedding both would
+// make encoding/json drop it silently.
+type SubscriptionView struct {
+	Subscription
+	Terms SubscriptionTerms
 }
 
 // Subscription is where a subscription stands, carried from cycle to cycle.
@@ -63,7 +71,7 @@ func SubscriptionWorkflow(ctx workflow.Context, terms SubscriptionTerms, sub Sub
 	var a *Activities
 	sub.Cycle++
 	cancelled := false
-	if err := workflow.SetQueryHandler(ctx, SubscriptionQuery, func() (Subscription, error) { return sub, nil }); err != nil {
+	if err := workflow.SetQueryHandler(ctx, SubscriptionQuery, func() (SubscriptionView, error) { return SubscriptionView{sub, terms}, nil }); err != nil {
 		return sub, err
 	}
 	if err := workflow.SetUpdateHandler(ctx, CancelUpdate, func(workflow.Context) error { cancelled = true; return nil }); err != nil {
@@ -72,16 +80,13 @@ func SubscriptionWorkflow(ctx workflow.Context, terms SubscriptionTerms, sub Sub
 	nextCycle := workflow.NewTimer(ctx, cmp.Or(terms.Cycle, DefaultSubscriptionCycle))
 	// Tagged with the card's account, so a card's subscriptions can be listed (M22).
 	if workflow.GetVersion(ctx, "subscription-card-id", workflow.DefaultVersion, 1) != workflow.DefaultVersion {
-		if terms.Account == "" {
-			lctx := workflow.WithLocalActivityOptions(ctx, workflow.LocalActivityOptions{StartToCloseTimeout: activityTimeout,
-				RetryPolicy: &temporal.RetryPolicy{}}) // resolving has nothing to compensate: retry until it answers
-			var number CardNumber
-			if err := workflow.ExecuteLocalActivity(lctx, a.ResolveCard, terms.CardID).Get(ctx, &number); err != nil {
-				return sub, err
-			}
-			terms.Account = number.Account
+		lctx := workflow.WithLocalActivityOptions(ctx, workflow.LocalActivityOptions{StartToCloseTimeout: activityTimeout,
+			RetryPolicy: &temporal.RetryPolicy{}}) // resolving has nothing to compensate: retry until it answers
+		var number CardNumber
+		if err := workflow.ExecuteLocalActivity(lctx, a.ResolveCard, terms.CardID).Get(ctx, &number); err != nil {
+			return sub, err
 		}
-		if err := workflow.UpsertTypedSearchAttributes(ctx, CardIDAttribute.ValueSet(terms.Account)); err != nil {
+		if err := workflow.UpsertTypedSearchAttributes(ctx, CardIDAttribute.ValueSet(number.Account)); err != nil {
 			return sub, err
 		}
 	}
