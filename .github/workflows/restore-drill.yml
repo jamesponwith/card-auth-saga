@@ -1,8 +1,6 @@
 # Restore drill: once a month, restore the latest snapshot of each production
 # volume into throwaway apps, check the data, and tear them down (ADR 0007).
-# A backup nobody has restored isn't one. Run by hand with upgrade=true, it
-# also rehearses this commit as the next release on that copy (ADR 0011):
-# gh workflow run restore-drill -f upgrade=true
+# A backup nobody has restored isn't one.
 name: restore-drill
 
 on:

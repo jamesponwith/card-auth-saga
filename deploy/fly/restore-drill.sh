@@ -84,12 +84,11 @@ on() { # app, command
   echo "could not run on $1: $2" >&2
   return 1
 }
+# enc base64-encodes a remote command, so its quotes survive flyctl ssh's own
+# command parsing and the remote shell.
+enc() { printf %s "$1" | base64 | tr -d '\n'; }
 sql() { # app, query: one value, no headers
-  # The query rides base64-encoded, so its quotes survive flyctl ssh's own
-  # command parsing and the remote shell.
-  local q
-  q=$(printf %s "$2" | base64 | tr -d '\n')
-  on "$1" "env MYSQL_PWD=$CAS_MYSQL_PASSWORD sh -c \"echo $q | base64 -d | mysql -uroot -N -B cas\"" | tail -1 | tr -d '[:space:]'
+  on "$1" "env MYSQL_PWD=$CAS_MYSQL_PASSWORD sh -c \"echo $(enc "$2") | base64 -d | mysql -uroot -N -B cas\"" | tail -1 | tr -d '[:space:]'
 }
 
 restore "$mysql" mysql_data 3 mysql.toml "$drill-mysql"
@@ -144,11 +143,7 @@ check "every card has its number" "$(sql "$drill-mysql" 'SELECT COUNT(*) FROM ca
 
 # Every workflow production has running replays on the new code: a stack
 # query replays the whole history, and nondeterminism fails it.
-tsh() { # run a shell script on the drill's Temporal machine; base64 keeps its quotes intact
-  local q
-  q=$(printf %s "$1" | base64 | tr -d '\n')
-  on "$drill-temporal" "sh -c \"echo $q | base64 -d | sh\""
-}
+tsh() { on "$drill-temporal" "sh -c \"echo $(enc "$1") | base64 -d | sh\""; } # a shell script on the drill's Temporal
 running=$(tsh "temporal workflow list --address localhost:7233 --query \"ExecutionStatus='Running'\" --output json" | jq -r '.[].execution.workflowId' 2>/dev/null || true)
 replayed=0 stuck=""
 for id in $running; do
