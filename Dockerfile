@@ -1,7 +1,7 @@
 # The worker image for the Fly deployment (ADR 0007). VERSION is the release
 # tag without its "v", as goreleaser stamps it, so /healthz reports the release.
 # The toolchain go.mod pins, so the binary links a patched standard library.
-FROM golang:1.26.9 AS build
+FROM golang:1.26.10 AS build
 WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download

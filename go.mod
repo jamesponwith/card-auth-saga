@@ -2,7 +2,7 @@ module github.com/jamesponwith/card-auth-saga
 
 go 1.26.0
 
-toolchain go1.26.9
+toolchain go1.26.10
 
 require (
 	github.com/go-sql-driver/mysql v1.10.1
