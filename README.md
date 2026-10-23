@@ -218,6 +218,17 @@ production's exact images, checks that the ledger balances, that the schema matc
 that Temporal still holds its workflows, then destroys the throwaway apps. Run it any time with
 `gh workflow run restore-drill`.
 
+Before a release, rehearse it on that copy (ADR 0011):
+
+```sh
+gh workflow run restore-drill -f upgrade=true --ref <branch>   # this commit, as the next release, on production's data
+```
+
+The rehearsal builds the commit as a release and runs it as a worker on the restored Temporal and
+MySQL. It then checks health at the new version, the migrated schema, that every workflow production
+has running replays on the new code, a clean audit, and a replace-authorize-subscribe round trip.
+Nothing it runs reaches production.
+
 ## Operate
 
 The worker serves the flywheel's Operate contract on `CAS_HTTP_ADDR` (default `:8080`, ADR 0006):
