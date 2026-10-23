@@ -51,6 +51,7 @@ echo "{\"status\":\"$status\",\"uptime_s\":3,\"version\":\"$v\"}"
 
 // writeStubs writes stand-in commands into a temporary bin directory, returning
 // the directory their state lives in ($STUB) and the bin directory to put first on PATH.
+// Each test's stubs are its own, so the script tests run in parallel.
 func writeStubs(t *testing.T, stubs ...map[string]string) (stub, bin string) {
 	stub = t.TempDir()
 	bin = filepath.Join(stub, "bin")
@@ -69,6 +70,7 @@ func writeStubs(t *testing.T, stubs ...map[string]string) (stub, bin string) {
 
 // deploy/fly/deploy.sh against deployStubs.
 func TestDeployScript(t *testing.T) {
+	t.Parallel()
 	for _, tool := range []string{"bash", "jq"} {
 		if _, err := osexec.LookPath(tool); err != nil {
 			t.Skip("needs " + tool)
@@ -160,6 +162,7 @@ func TestDeployScript(t *testing.T) {
 // flag (deploy --region) that flyctl doesn't have. Skipped where flyctl isn't
 // installed, such as CI; run it after bumping the pinned version.
 func TestDeployScriptFlyctlFlags(t *testing.T) {
+	t.Parallel()
 	if _, err := osexec.LookPath("flyctl"); err != nil {
 		t.Skip("flyctl not installed")
 	}
@@ -199,6 +202,7 @@ func TestDeployScriptFlyctlFlags(t *testing.T) {
 // checks: it passes on a good restore, fails on a broken one, takes a snapshot
 // when a volume has none, and always destroys the drill apps and only those.
 func TestRestoreDrillScript(t *testing.T) {
+	t.Parallel()
 	for _, tool := range []string{"bash", "jq"} {
 		if _, err := osexec.LookPath(tool); err != nil {
 			t.Skip("needs " + tool)
@@ -214,16 +218,24 @@ case "$1 $2" in
       create) touch "$STUB/snap-$4" ;;
     esac ;;
   "image show") echo "[{\"Registry\":\"registry.fly.io\",\"Repository\":\"$4\",\"Digest\":\"sha256:abc\"}]" ;;
+  "ips list") echo '[{"Type":"shared_v4","Address":"66.0.0.9"}]' ;;
+  "deploy -a") [[ "$*" == *worker.toml* ]] && touch "$STUB/upgraded" ;;
   "ssh console")
     cmd=${*: -1}
     if [[ "$cmd" == *"base64 -d"* ]]; then # a query sent base64-encoded, as sql() does
       q=${cmd#*echo }; cmd=$(echo "${q%% *}" | base64 -d)
-      [[ "$cmd" == *"'card:%'"* || "$cmd" != *card* ]] || { echo "quotes lost in: $cmd" >&2; exit 1; }
+      [[ "$cmd" == *"'card:%'"* || "$cmd" != *LIKE* ]] || { echo "quotes lost in: $cmd" >&2; exit 1; }
     fi
     case "$cmd" in
       *"COALESCE(SUM(balance)"*) echo "${LEDGER_SUM:-0}" ;;
       *"HAVING s <> 0"*) echo 0 ;;
-      *"MAX(version)"*) echo 6 ;;
+      *"MAX(version)"*) [[ -e "$STUB/upgraded" && "$*" == *-drill-* ]] && echo 8 || echo 6 ;; # migrated by the rehearsal
+      *"NOT IN (SELECT number"*) echo 0 ;;
+      *"workflow list"*"ExecutionStatus='Running'"*) echo '[{"execution":{"workflowId":"statement:smoke-1"}},{"execution":{"workflowId":"auth-9"}}]' ;;
+      *"workflow stack"*) [[ "$cmd" == *"'${BAD_REPLAY:-none}'"* ]] && exit 1; echo "coroutine root" ;;
+      *"/card-auth-saga audit"*) echo "audit: clean" ;;
+      *"/card-auth-saga authorize"*) set -- $cmd; [[ "$4" == *-b ]] && echo "approved: $3" || echo "declined: $3 (Replaced)" ;;
+      *"/card-auth-saga "*) echo "ok: ${cmd#/card-auth-saga }" ;;
       *"COUNT(*) FROM accounts"*) echo 42 ;;
       *"workflow count"*) echo "Total: 7" ;;
       *"search-attribute list"*) echo "CardID  Keyword" ;;
@@ -231,12 +243,17 @@ case "$1 $2" in
 esac
 exit 0
 `
-	stub, bin := writeStubs(t, map[string]string{"flyctl": flyctl})
+	curl := `#!/usr/bin/env bash
+echo "curl $*" >> "$STUB/calls"
+echo "{\"status\":\"ok\",\"version\":\"$UPGRADE\"}"
+`
+	stub, bin := writeStubs(t, map[string]string{"flyctl": flyctl, "curl": curl})
 	drill := func(env ...string) (calls, out string, err error) {
 		_ = os.Remove(filepath.Join(stub, "calls"))
+		_ = os.Remove(filepath.Join(stub, "upgraded"))
 		cmd := osexec.Command("bash", "deploy/fly/restore-drill.sh")
 		cmd.Env = append([]string{"PATH=" + bin + ":" + os.Getenv("PATH"), "STUB=" + stub,
-			"FLY_API_TOKEN=x", "CAS_MYSQL_PASSWORD=pw", "SNAPSHOT_WAIT=2", "CHECK_TRIES=1"}, env...)
+			"FLY_API_TOKEN=x", "CAS_MYSQL_PASSWORD=pw", "SNAPSHOT_WAIT=2", "CHECK_TRIES=1", "CHECK_WAIT=0"}, env...)
 		o, err := cmd.CombinedOutput()
 		c, _ := os.ReadFile(filepath.Join(stub, "calls"))
 		return string(c), string(o), err
@@ -280,6 +297,32 @@ exit 0
 	if n := len(destroyed(calls)); n != 2 {
 		t.Errorf("after a failed drill, destroyed %d apps, want the 2 drill apps", n)
 	}
+	if strings.Contains(calls, "worker.toml") {
+		t.Errorf("a plain restore drill deployed a worker:\n%s", calls)
+	}
+
+	// The release rehearsal (ADR 0011): this checkout, as a worker on the copy.
+	calls, out, err = drill("UPGRADE=abc123")
+	if err != nil || !strings.Contains(out, "upgrade drill passed: abc123 on production's data, 2 running workflows replayed") {
+		t.Errorf("rehearsal: err %v:\n%s", err, out)
+	}
+	if !strings.Contains(calls, "--build-arg VERSION=abc123") || !strings.Contains(calls, "--resolve") {
+		t.Errorf("worker not built at the rehearsed version, or health not checked by IP:\n%s", calls)
+	}
+	if strings.Contains(calls, "cas-jamesponwith-temporal.internal") || strings.Contains(calls, "cas-jamesponwith-mysql.internal") {
+		t.Errorf("the rehearsal worker points at production's Temporal or MySQL:\n%s", calls)
+	}
+	if !regexp.MustCompile(`TEMPORAL_ADDRESS=cas-jamesponwith-drill-\d+-temporal\.internal:7233`).MatchString(calls) {
+		t.Errorf("the rehearsal worker doesn't point at the drill's Temporal:\n%s", calls)
+	}
+	if apps := destroyed(calls); len(apps) != 3 {
+		t.Errorf("rehearsal destroyed %v, want the 3 drill apps, worker included", apps)
+	}
+
+	_, out, err = drill("UPGRADE=abc123", "BAD_REPLAY=auth-9") // the new code can't replay a production run
+	if err == nil || !strings.Contains(out, "FAIL production's running workflows replay on abc123: got ' auth-9 (1 replayed)'") {
+		t.Errorf("a run that won't replay: err %v, want the rehearsal to fail naming it:\n%s", err, out)
+	}
 }
 
 // load-drill.sh against deployStubs, a stand-in go that records what TestLoad
@@ -287,6 +330,7 @@ exit 0
 // drill stack with a password of its own, and destroys that stack and only
 // that, whether the load passes, fails, or never starts.
 func TestLoadDrillScript(t *testing.T) {
+	t.Parallel()
 	for _, tool := range []string{"bash", "jq", "openssl"} {
 		if _, err := osexec.LookPath(tool); err != nil {
 			t.Skip("needs " + tool)

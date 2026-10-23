@@ -4,9 +4,15 @@
 # throwaway app, boot it on the exact image production runs, and check the
 # data; then destroy the throwaway apps. Run monthly by restore-drill.yml.
 #
+# With UPGRADE set it is also a release rehearsal (ADR 0011): this checkout,
+# built as a release at that version, runs as a worker on the restored copy,
+# so migrations meet production's data and production's running workflows
+# replay on the new code before a tag ever touches production.
+#
 #   FLY_API_TOKEN, CAS_MYSQL_PASSWORD   from GitHub Actions secrets
 #   FLY_APP_PREFIX, FLY_REGION          optional; as in deploy.sh
-#   SNAPSHOT_WAIT, CHECK_TRIES          test knobs: snapshot polls and check retries
+#   UPGRADE                             optional; the version to rehearse
+#   SNAPSHOT_WAIT, CHECK_TRIES, CHECK_WAIT   test knobs: snapshot polls, check retries and their wait
 set -euo pipefail
 : "${FLY_API_TOKEN:?}" "${CAS_MYSQL_PASSWORD:?}"
 prefix=${FLY_APP_PREFIX:-cas-jamesponwith}
@@ -73,17 +79,16 @@ on() { # app, command
       echo "$out"
       return 0
     fi
-    sleep 10
+    sleep "${CHECK_WAIT:-10}"
   done
   echo "could not run on $1: $2" >&2
   return 1
 }
+# enc base64-encodes a remote command, so its quotes survive flyctl ssh's own
+# command parsing and the remote shell.
+enc() { printf %s "$1" | base64 | tr -d '\n'; }
 sql() { # app, query: one value, no headers
-  # The query rides base64-encoded, so its quotes survive flyctl ssh's own
-  # command parsing and the remote shell.
-  local q
-  q=$(printf %s "$2" | base64 | tr -d '\n')
-  on "$1" "env MYSQL_PWD=$CAS_MYSQL_PASSWORD sh -c \"echo $q | base64 -d | mysql -uroot -N -B cas\"" | tail -1 | tr -d '[:space:]'
+  on "$1" "env MYSQL_PWD=$CAS_MYSQL_PASSWORD sh -c \"echo $(enc "$2") | base64 -d | mysql -uroot -N -B cas\"" | tail -1 | tr -d '[:space:]'
 }
 
 restore "$mysql" mysql_data 3 mysql.toml "$drill-mysql"
@@ -108,5 +113,63 @@ if [ "$failed" = 0 ]; then
   echo "restore drill passed: $accounts accounts, $workflows workflows restored"
 else
   echo "restore drill FAILED" >&2
+  exit 1
+fi
+[ -n "${UPGRADE:-}" ] || exit 0
+
+# The rehearsal: the next release, built from this checkout, on the copy. Its
+# Temporal and MySQL are the drill's, so nothing it runs reaches production.
+worker=$drill-worker
+echo "upgrading the copy to $UPGRADE" >&2
+flyctl apps create "$worker" --org personal >/dev/null
+made+=("$worker")
+flyctl secrets set -a "$worker" --stage >/dev/null \
+  TEMPORAL_ADDRESS="$drill-temporal.internal:7233" \
+  CAS_MYSQL_DSN="root:$CAS_MYSQL_PASSWORD@tcp($drill-mysql.internal:3306)/cas"
+flyctl deploy -a "$worker" -c "$root/deploy/fly/worker.toml" "$root" --dockerfile "$root/Dockerfile" \
+  --build-arg VERSION="$UPGRADE" --primary-region "$region" --ha=false --yes >/dev/null
+
+# Its public /healthz, by its own IP: a new app's hostname can be cached as missing.
+health=""
+for _ in $(seq 1 "${CHECK_TRIES:-30}"); do
+  ip=$(flyctl ips list -a "$worker" --json 2>/dev/null | jq -r 'first(.[] | select(.Type == "shared_v4" or .Type == "v4")) | .Address' 2>/dev/null || true)
+  health=$(curl -fsS --max-time 10 ${ip:+--resolve "$worker.fly.dev:443:$ip"} "https://$worker.fly.dev/healthz" || true)
+  echo "$health" | grep -q '"status":"ok"' && break
+  sleep "${CHECK_WAIT:-10}"
+done
+check "upgraded worker is healthy" "$(echo "$health" | jq -r '"\(.status) \(.version)"' 2>/dev/null)" "ok $UPGRADE"
+check "schema migrated to this checkout's" "$(sql "$drill-mysql" 'SELECT MAX(version) FROM schema_migrations')" "$(grep -cE '^	\{ // [0-9]+:' "$root/migrate.go")"
+check "every card has its number" "$(sql "$drill-mysql" 'SELECT COUNT(*) FROM cards WHERE id NOT IN (SELECT number FROM card_numbers)')" 0
+
+# Every workflow production has running replays on the new code: a stack
+# query replays the whole history, and nondeterminism fails it.
+tsh() { on "$drill-temporal" "sh -c \"echo $(enc "$1") | base64 -d | sh\""; } # a shell script on the drill's Temporal
+running=$(tsh "temporal workflow list --address localhost:7233 --query \"ExecutionStatus='Running'\" --output json" | jq -r '.[].execution.workflowId' 2>/dev/null || true)
+replayed=0 stuck=""
+for id in $running; do
+  if CHECK_TRIES=2 tsh "temporal workflow stack --address localhost:7233 --workflow-id '$id'" >/dev/null; then # a failure is an answer, not a boot
+    replayed=$((replayed + 1))
+  else
+    stuck="$stuck $id"
+  fi
+done
+check "production's running workflows replay on $UPGRADE" "${stuck:-none failed} ($replayed replayed)" "none failed ($replayed replayed)"
+check "audit on the upgraded copy" "$(on "$worker" "/card-auth-saga audit" | tail -1)" "audit: clean"
+
+# The new features, end to end on the copy.
+card=upgrade-drill-$(date -u +%H%M%S)
+cli() { on "$worker" "/card-auth-saga $*" | tail -1; }
+cli set-limit "$card" 100000 >/dev/null
+cli replace "$card" "$card-b" >/dev/null
+check "a replacement number authorizes" "$(cli authorize "$card-a1" "$card-b" shop 1000)" "approved: $card-a1"
+check "the old number declines" "$(cli authorize "$card-a2" "$card" shop 1000)" "declined: $card-a2 (Replaced)"
+cli subscribe "$card-s1" "$card-b" shop 500 >/dev/null
+sleep "${CHECK_WAIT:-5}" # the signup charge captures
+check "audit after the round trip" "$(on "$worker" "/card-auth-saga audit" | tail -1)" "audit: clean"
+
+if [ "$failed" = 0 ]; then
+  echo "upgrade drill passed: $UPGRADE on production's data, $replayed running workflows replayed"
+else
+  echo "upgrade drill FAILED" >&2
 fi
 exit "$failed"
