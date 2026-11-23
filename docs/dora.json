@@ -35,14 +35,14 @@
     "releases": 4
   },
   "deploy_frequency": {
-    "last_30d": 3,
+    "last_30d": 1,
     "per_week": 2.6798057495303254,
-    "releases_last_30d": 3,
+    "releases_last_30d": 1,
     "releases_total": 4,
     "source": "deployments",
     "total": 4
   },
-  "generated_at": "2026-11-16T14:03:37Z",
+  "generated_at": "2026-11-23T16:33:32Z",
   "lead_time_hours": {
     "median": 20.14666666666667,
     "samples": 3
